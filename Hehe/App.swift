@@ -1938,7 +1938,7 @@ struct DetailView: View {
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
         .fullScreenCover(item: $selected) { ep in
-            PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle, anime: vm.anime)
+            PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle, anime: vm.anime, episodes: vm.episodes)
         }
     }
 }
@@ -2231,14 +2231,18 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func load(episodeID: Int) async {
+        let prevTitle = current?.title
         isLoading = true; error = nil
+        detachObserver(); player?.pause(); player = nil
+        variants = []; current = nil; qualities = []; currentQuality = nil
+        showWeb = false; note = nil; debug = ""
         stopped = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
-            if let first = variants.first { select(first) }
+            if let first = variants.first { select(variants.first(where: { $0.title == prevTitle }) ?? first) }
         } catch {
             self.error = error.localizedDescription
             let a = await AnimelibAPI.shared.rawText("/episodes/\(episodeID)")
@@ -2339,11 +2343,97 @@ final class PlayerViewModel: ObservableObject {
 }
 
 struct PlayerScreen: View {
-    let episode: EpisodeShort
     let animeTitle: String
     var anime: Anime? = nil
+    let episodes: [EpisodeShort]
+    @State private var current: EpisodeShort
     @StateObject private var vm = PlayerViewModel()
     @Environment(\.dismiss) private var dismiss
+
+    init(episode: EpisodeShort, animeTitle: String, anime: Anime? = nil, episodes: [EpisodeShort] = []) {
+        self.animeTitle = animeTitle
+        self.anime = anime
+        self.episodes = episodes
+        _current = State(initialValue: episode)
+    }
+
+    private var index: Int? { episodes.firstIndex(where: { $0.id == current.id }) }
+    private var prevEpisode: EpisodeShort? {
+        guard let i = index, i > 0 else { return nil }
+        return episodes[i - 1]
+    }
+    private var nextEpisode: EpisodeShort? {
+        guard let i = index, i < episodes.count - 1 else { return nil }
+        return episodes[i + 1]
+    }
+
+    private func go(_ ep: EpisodeShort?) {
+        guard let ep = ep else { return }
+        vm.stop()
+        current = ep
+    }
+
+    private func pill(_ text: String) -> some View {
+        HStack(spacing: 6) {
+            Text(text).font(.subheadline.weight(.medium)).lineLimit(1)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private func arrow(_ name: String, _ ep: EpisodeShort?) -> some View {
+        Button { go(ep) } label: {
+            Image(systemName: name)
+                .font(.headline)
+                .frame(width: 42, height: 40)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(ep == nil)
+        .opacity(ep == nil ? 0.35 : 1)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 8) {
+            arrow("chevron.left", prevEpisode)
+            Menu {
+                ForEach(vm.variants) { v in
+                    Button { vm.select(v) } label: {
+                        if v.id == vm.current?.id { Label(v.title, systemImage: "checkmark") }
+                        else { Text(v.title) }
+                    }
+                }
+                if let v = vm.current, v.isWeb {
+                    Divider()
+                    if v.kodik && !vm.showWeb {
+                        Button { vm.forceWeb() } label: { Label("Веб-плеер вместо прямого", systemImage: "globe") }
+                    }
+                    Link(destination: v.url) { Label("Открыть в Safari", systemImage: "safari") }
+                }
+            } label: {
+                pill(vm.current?.title ?? (vm.isLoading ? "Загрузка…" : "Озвучка"))
+            }
+            .disabled(vm.variants.isEmpty)
+            if vm.qualities.count > 1 {
+                Menu {
+                    ForEach(vm.qualities) { q in
+                        Button { vm.pickQuality(q) } label: {
+                            if q.id == vm.currentQuality { Label(q.title, systemImage: "checkmark") }
+                            else { Text(q.title) }
+                        }
+                    }
+                } label: {
+                    pill(vm.qualities.first(where: { $0.id == vm.currentQuality })?.title ?? "Качество")
+                        .frame(maxWidth: 110)
+                }
+            }
+            arrow("chevron.right", nextEpisode)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+    }
 
     var body: some View {
         NavigationStack {
@@ -2362,6 +2452,8 @@ struct PlayerScreen: View {
                 }
                 .aspectRatio(16/9, contentMode: .fit)
 
+                controls
+
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         if !vm.debug.isEmpty {
@@ -2369,59 +2461,15 @@ struct PlayerScreen: View {
                                 .font(.system(size: 9, design: .monospaced))
                                 .textSelection(.enabled)
                         }
-                        if let n = vm.note {
-                            Text(n).font(.footnote).foregroundStyle(.orange)
-                        }
-                        if vm.qualities.count > 0 {
-                            Text("Качество").font(.headline).padding(.top, 4)
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack {
-                                    ForEach(vm.qualities) { q in
-                                        Button { vm.pickQuality(q) } label: {
-                                            Text(q.title)
-                                                .font(.subheadline.bold())
-                                                .padding(.horizontal, 14).padding(.vertical, 8)
-                                                .background(q.id == vm.currentQuality ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                        }
-                        if !vm.variants.isEmpty {
-                            Text("Озвучка").font(.headline).padding(.top, 8)
-                        }
-                        ForEach(vm.variants) { v in
-                            Button { vm.select(v) } label: {
-                                HStack {
-                                    Text(v.title).foregroundStyle(.primary).multilineTextAlignment(.leading)
-                                    Spacer()
-                                    if v.id == vm.current?.id {
-                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
-                                    }
-                                }
-                                .padding(12)
-                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        if let v = vm.current, v.isWeb {
-                            if v.kodik && !vm.showWeb {
-                                Button("Показать веб-плеер вместо прямого") { vm.forceWeb() }
-                                    .font(.footnote)
-                            }
-                            Link(destination: v.url) {
-                                Label("Открыть этот плеер в Safari", systemImage: "safari")
-                                    .font(.footnote)
-                            }
-                            .padding(.top, 6)
-                        }
+                        CommentsSection(postID: current.id, postType: "episode")
+                            .id(current.id)
                     }
-                    .padding(14)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 20)
                 }
             }
             .background(AppBackground())
-            .navigationTitle(episode.title)
+            .navigationTitle(current.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -2429,9 +2477,9 @@ struct PlayerScreen: View {
                 }
             }
         }
-        .task {
-            if let a = anime { HistoryStore.shared.record(anime: a, episode: episode) }
-            await vm.load(episodeID: episode.id)
+        .task(id: current.id) {
+            if let a = anime { HistoryStore.shared.record(anime: a, episode: current) }
+            await vm.load(episodeID: current.id)
         }
         .onDisappear { vm.stop() }
     }
@@ -2554,6 +2602,7 @@ struct CommentItem: Identifiable {
     let up: Int
     let down: Int
     let date: String
+    let created: String
     let replyCount: Int
     let replies: [CommentItem]
 
@@ -2569,6 +2618,7 @@ struct CommentItem: Identifiable {
         up = J.int(votes?["up"]) ?? J.int(d["likes_count"]) ?? J.int(d["likes"]) ?? J.int(d["votes_up"]) ?? 0
         down = J.int(votes?["down"]) ?? J.int(d["dislikes_count"]) ?? 0
         date = J.date(J.str(d["created_at"]) ?? J.str(d["date"]))
+        created = J.str(d["created_at"]) ?? J.str(d["date"]) ?? ""
         let rawReplies = (d["replies"] as? [[String: Any]])
             ?? (d["children"] as? [[String: Any]])
             ?? (d["comments"] as? [[String: Any]]) ?? []
@@ -2618,6 +2668,11 @@ enum CommentParser {
     }
 }
 
+enum CommentSort: String, CaseIterable {
+    case new = "Новые"
+    case popular = "Популярные"
+}
+
 @MainActor
 final class CommentsViewModel: ObservableObject {
     @Published var items: [CommentItem] = []
@@ -2628,26 +2683,46 @@ final class CommentsViewModel: ObservableObject {
     @Published var repliesLoaded: [Int: [CommentItem]] = [:]
     @Published var replyTarget: CommentItem?
 
+    @Published var sort: CommentSort = .new
     let animeID: Int
     let slug: String
+    let type: String
     private var page = 1
     private var finished = false
 
-    init(animeID: Int, slug: String) {
+    init(animeID: Int, slug: String, postType: String? = nil) {
         self.animeID = animeID
         self.slug = slug
+        self.type = postType ?? LibSite.current.postType
+    }
+
+    var sorted: [CommentItem] {
+        switch sort {
+        case .new:
+            return items.sorted { $0.created == $1.created ? $0.id > $1.id : $0.created > $1.created }
+        case .popular:
+            return items.sorted { $0.up == $1.up ? $0.created > $1.created : $0.up > $1.up }
+        }
+    }
+
+    func setSort(_ s: CommentSort) async {
+        sort = s
+        if s == .popular {
+            var n = 0
+            while !finished && n < 4 { await loadMore(); n += 1 }
+        }
     }
 
     private func q(_ n: String, _ v: String) -> URLQueryItem { URLQueryItem(name: n, value: v) }
 
     private func firstPageQuery() -> [URLQueryItem] {
-        [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", "1")]
+        [q("post_id", String(animeID)), q("post_type", type), q("page", "1")]
     }
 
     private func fetch(page: Int) async throws -> ([CommentItem], Bool?) {
         let attempts: [(String, [URLQueryItem])] = [
-            ("/comments", [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", String(page))]),
-            ("/comments", [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", String(page)),
+            ("/comments", [q("post_id", String(animeID)), q("post_type", type), q("page", String(page))]),
+            ("/comments", [q("post_id", String(animeID)), q("post_type", type), q("page", String(page)),
                            q("sort_by", "created_at"), q("sort_type", "desc")])
         ]
         var lastError: Error = APIError.badURL
@@ -2700,7 +2775,7 @@ final class CommentsViewModel: ObservableObject {
     /// Возвращает текст ошибки или nil при успехе.
     func send(_ text: String, parent: Int?) async -> String? {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
-        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": LibSite.current.postType]
+        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": type]
         if let p = parent { base["parent_comment"] = p }
         var alt = base
         alt["is_spoiler"] = false
@@ -2741,7 +2816,7 @@ final class CommentsViewModel: ObservableObject {
         defer { loadingReplies.remove(c.id) }
         let known = Set(items.map { $0.id })
         for key in ["parent_comment", "parent_id", "parent_comment_id"] {
-            let query = [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q(key, String(c.id))]
+            let query = [q("post_id", String(animeID)), q("post_type", type), q(key, String(c.id))]
             if let data = try? await AnimelibAPI.shared.rawData("/comments", query: query, token: AuthStore.shared.token),
                let root = J.obj(data) {
                 let list = CommentParser.parse(root).filter { $0.id != c.id && !known.contains($0.id) }
@@ -2875,6 +2950,93 @@ struct ComposeSheet: View {
     }
 }
 
+struct CommentSortMenu: View {
+    @ObservedObject var vm: CommentsViewModel
+
+    var body: some View {
+        Menu {
+            Picker("Сортировка", selection: Binding(get: { vm.sort }, set: { s in Task { await vm.setSort(s) } })) {
+                ForEach(CommentSort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+        } label: {
+            Label(vm.sort.rawValue, systemImage: "arrow.up.arrow.down")
+                .font(.subheadline)
+        }
+    }
+}
+
+struct CommentsList: View {
+    @ObservedObject var vm: CommentsViewModel
+
+    var body: some View {
+        LazyVStack(spacing: 10) {
+            ForEach(vm.sorted) { c in
+                CommentRow(c: c, vm: vm)
+                    .onAppear {
+                        if c.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                    }
+            }
+            if vm.isLoading { ProgressView().padding() }
+            if let e = vm.error {
+                Text(e).font(.footnote).foregroundStyle(.red).padding(.top, 30)
+            }
+            if vm.items.isEmpty && !vm.isLoading {
+                if vm.error == nil {
+                    Text("Комментариев пока нет").foregroundStyle(.secondary).padding(.top, 30)
+                }
+                if !vm.debug.isEmpty {
+                    Text(vm.debug)
+                        .font(.system(size: 9, design: .monospaced))
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+extension View {
+    func commentSheets(_ vm: CommentsViewModel, showCompose: Binding<Bool>) -> some View {
+        self
+            .sheet(isPresented: showCompose) {
+                ComposeSheet(title: "Новый комментарий",
+                             send: { await vm.send($0, parent: nil) },
+                             onSent: { Task { await vm.reload() } })
+            }
+            .sheet(item: Binding(get: { vm.replyTarget }, set: { vm.replyTarget = $0 })) { target in
+                ComposeSheet(title: "Ответ для \(target.username)",
+                             send: { await vm.send($0, parent: target.id) },
+                             onSent: { Task { await vm.reload() } })
+            }
+    }
+}
+
+/// Комментарии к серии: встраиваются под плеером.
+struct CommentsSection: View {
+    @StateObject private var vm: CommentsViewModel
+    @State private var showCompose = false
+
+    init(postID: Int, postType: String) {
+        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: postID, slug: "", postType: postType))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Комментарии").font(.headline)
+                Spacer()
+                CommentSortMenu(vm: vm)
+                Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                    .padding(.leading, 8)
+            }
+            CommentsList(vm: vm)
+        }
+        .padding(.top, 4)
+        .commentSheets(vm, showCompose: $showCompose)
+        .task { await vm.loadMore() }
+    }
+}
+
 struct CommentsView: View {
     let anime: Anime
     @StateObject private var vm: CommentsViewModel
@@ -2889,30 +3051,7 @@ struct CommentsView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(vm.items) { c in
-                        CommentRow(c: c, vm: vm)
-                            .onAppear {
-                                if c.id == vm.items.last?.id { Task { await vm.loadMore() } }
-                            }
-                    }
-                    if vm.isLoading { ProgressView().padding() }
-                    if let e = vm.error {
-                        Text(e).font(.footnote).foregroundStyle(.red).padding(.top, 30)
-                    }
-                    if vm.items.isEmpty && !vm.isLoading {
-                        if vm.error == nil {
-                            Text("Комментариев пока нет").foregroundStyle(.secondary).padding(.top, 30)
-                        }
-                        if !vm.debug.isEmpty {
-                            Text(vm.debug)
-                                .font(.system(size: 9, design: .monospaced))
-                                .textSelection(.enabled)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(14)
+                CommentsList(vm: vm).padding(14)
             }
             .background(AppBackground())
             .navigationTitle("Комментарии")
@@ -2920,19 +3059,13 @@ struct CommentsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                    HStack(spacing: 12) {
+                        CommentSortMenu(vm: vm)
+                        Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                    }
                 }
             }
-            .sheet(isPresented: $showCompose) {
-                ComposeSheet(title: "Новый комментарий",
-                             send: { await vm.send($0, parent: nil) },
-                             onSent: { Task { await vm.reload() } })
-            }
-            .sheet(item: $vm.replyTarget) { target in
-                ComposeSheet(title: "Ответ для \(target.username)",
-                             send: { await vm.send($0, parent: target.id) },
-                             onSent: { Task { await vm.reload() } })
-            }
+            .commentSheets(vm, showCompose: $showCompose)
             .task { await vm.loadMore() }
         }
     }
@@ -3517,10 +3650,11 @@ enum ReaderBlock: Identifiable {
     case quote(Int, String)
     case image(Int, URL)
     case rule(Int)
+    case rich(Int, AttributedString)
 
     var id: Int {
         switch self {
-        case .paragraph(let i, _), .heading(let i, _), .quote(let i, _), .image(let i, _): return i
+        case .paragraph(let i, _), .heading(let i, _), .quote(let i, _), .image(let i, _), .rich(let i, _): return i
         case .rule(let i): return i
         }
     }
@@ -3546,14 +3680,89 @@ enum ReaderParser {
             }
         }
         if let s = content as? String {
-            let text = J.stripHTML(s.replacingOccurrences(of: "</p>", with: "\n"))
-            for line in text.components(separatedBy: "\n") {
-                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !t.isEmpty { out.append(.paragraph(out.count, t)) }
-            }
+            out = parseHTML(s)
         } else if let d = content as? [String: Any] {
             walk(d, map: map, out: &out)
         }
+        return out
+    }
+
+    private static func decode(_ s: String) -> String {
+        var t = s
+        let pairs = [("&nbsp;", " "), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"),
+                     ("&laquo;", "«"), ("&raquo;", "»"), ("&mdash;", "—"), ("&ndash;", "–"),
+                     ("&hellip;", "…"), ("&amp;", "&")]
+        for (a, b) in pairs { t = t.replacingOccurrences(of: a, with: b) }
+        return t
+    }
+
+    /// Глава как HTML-строка: абзацы, заголовки, цитаты, <img>, курсив и жирный.
+    static func parseHTML(_ html: String) -> [ReaderBlock] {
+        var out: [ReaderBlock] = []
+        if !html.contains("<") {
+            for line in decode(html).components(separatedBy: "\n") {
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { out.append(.paragraph(out.count, t)) }
+            }
+            return out
+        }
+        var cur = AttributedString()
+        var bold = 0, italic = 0, kind = 0
+        func flush() {
+            while let l = cur.characters.last, l.isWhitespace || l.isNewline { cur.characters.removeLast() }
+            if !cur.characters.isEmpty {
+                let plain = String(cur.characters)
+                switch kind {
+                case 1: out.append(.heading(out.count, plain))
+                case 2: out.append(.quote(out.count, plain))
+                default: out.append(.rich(out.count, cur))
+                }
+            }
+            cur = AttributedString()
+        }
+        func addText(_ raw: String) {
+            var t = decode(raw).replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            if cur.characters.isEmpty { while t.hasPrefix(" ") { t.removeFirst() } }
+            if t.isEmpty { return }
+            var run = AttributedString(t)
+            if bold > 0 && italic > 0 { run.inlinePresentationIntent = [.stronglyEmphasized, .emphasized] }
+            else if bold > 0 { run.inlinePresentationIntent = .stronglyEmphasized }
+            else if italic > 0 { run.inlinePresentationIntent = .emphasized }
+            cur.append(run)
+        }
+        let ns = html as NSString
+        guard let re = try? NSRegularExpression(pattern: "<[^>]*>"),
+              let srcRe = try? NSRegularExpression(pattern: "(?:data-src|src)\\s*=\\s*[\"']([^\"']+)[\"']") else { return out }
+        var pos = 0
+        for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            if m.range.location > pos {
+                addText(ns.substring(with: NSRange(location: pos, length: m.range.location - pos)))
+            }
+            pos = m.range.location + m.range.length
+            let tag = ns.substring(with: m.range)
+            let low = tag.lowercased()
+            let closing = low.hasPrefix("</")
+            let name = String(low.dropFirst(closing ? 2 : 1).prefix { $0.isLetter || $0.isNumber })
+            switch name {
+            case "p", "div": flush()
+            case "br": cur.append(AttributedString("\n"))
+            case "h1", "h2", "h3", "h4", "h5", "h6": flush(); kind = closing ? 0 : 1
+            case "blockquote": flush(); kind = closing ? 0 : 2
+            case "strong", "b": bold = max(0, bold + (closing ? -1 : 1))
+            case "em", "i": italic = max(0, italic + (closing ? -1 : 1))
+            case "hr": flush(); out.append(.rule(out.count))
+            case "img":
+                flush()
+                let r = NSRange(location: 0, length: (tag as NSString).length)
+                if let sm = srcRe.firstMatch(in: tag, range: r) {
+                    let src = (tag as NSString).substring(with: sm.range(at: 1))
+                    if let u = absolute(decode(src)) { out.append(.image(out.count, u)) }
+                }
+            default: break
+            }
+        }
+        if pos < ns.length { addText(ns.substring(from: pos)) }
+        flush()
         return out
     }
 
@@ -3987,6 +4196,8 @@ struct NovelReaderView: View {
     @AppStorage("reader.font") private var fontSize = 18.0
     @AppStorage("reader.theme") private var theme = "dark"
     @AppStorage("reader.serif") private var serif = true
+    @AppStorage("reader.lh") private var lineGap = 0.4
+    @State private var chromeHidden = false
     @Environment(\.dismiss) private var dismiss
 
     init(novel: Anime, chapters: [NovelChapter], start: Int) {
@@ -3995,8 +4206,15 @@ struct NovelReaderView: View {
         _index = State(initialValue: min(max(start, 0), max(chapters.count - 1, 0)))
     }
 
+    private var activeTheme: String {
+        if theme == "auto" {
+            return UIScreen.main.traitCollection.userInterfaceStyle == .dark ? "dark" : "light"
+        }
+        return theme
+    }
+
     private var bg: Color {
-        switch theme {
+        switch activeTheme {
         case "sepia": return Color(red: 0.96, green: 0.93, blue: 0.85)
         case "light": return .white
         default: return Color(white: 0.07)
@@ -4004,7 +4222,7 @@ struct NovelReaderView: View {
     }
 
     private var fg: Color {
-        switch theme {
+        switch activeTheme {
         case "sepia": return Color(red: 0.23, green: 0.18, blue: 0.18)
         case "light": return Color(white: 0.1)
         default: return Color(white: 0.9)
@@ -4017,11 +4235,13 @@ struct NovelReaderView: View {
     private func blockView(_ b: ReaderBlock) -> some View {
         switch b {
         case .paragraph(_, let t):
-            Text(t).font(bodyFont).lineSpacing(fontSize * 0.35)
+            Text(t).font(bodyFont).lineSpacing(fontSize * lineGap)
+        case .rich(_, let t):
+            Text(t).font(bodyFont).lineSpacing(fontSize * lineGap)
         case .heading(_, let t):
             Text(t).font(.system(size: fontSize + 4, weight: .bold, design: serif ? .serif : .default))
         case .quote(_, let t):
-            Text(t).font(bodyFont.italic()).lineSpacing(fontSize * 0.3)
+            Text(t).font(bodyFont.italic()).lineSpacing(fontSize * lineGap)
                 .padding(.leading, 12)
                 .overlay(alignment: .leading) { Rectangle().fill(Theme.accent).frame(width: 3) }
         case .image(_, let u):
@@ -4035,7 +4255,7 @@ struct NovelReaderView: View {
         NavigationStack {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: fontSize * 0.7) {
+                    VStack(alignment: .leading, spacing: fontSize * (0.5 + lineGap)) {
                         Color.clear.frame(height: 1).id("top")
                         if chapters.indices.contains(index) {
                             Text(chapters[index].title)
@@ -4052,11 +4272,27 @@ struct NovelReaderView: View {
                                 .textSelection(.enabled)
                                 .opacity(0.6)
                         }
+                        if !loading, index < chapters.count - 1 {
+                            Button {
+                                index += 1
+                            } label: {
+                                Text("Следующая глава")
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(Theme.accent.opacity(0.25), in: Capsule())
+                            }
+                            .padding(.top, 16)
+                        }
                         Color.clear.frame(height: 90)
                     }
-                    .padding(.horizontal, 18)
+                    .frame(maxWidth: 700, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 20)
                     .padding(.top, 8)
                     .foregroundStyle(fg)
+                    .contentShape(Rectangle())
+                    .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
                 }
                 .background(bg.ignoresSafeArea())
                 .task(id: index) {
@@ -4065,6 +4301,7 @@ struct NovelReaderView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
+                if !chromeHidden {
                 HStack {
                     Button { index -= 1 } label: { Image(systemName: "chevron.left").frame(width: 44, height: 40) }
                         .disabled(index <= 0)
@@ -4077,10 +4314,14 @@ struct NovelReaderView: View {
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(.ultraThinMaterial, in: Capsule())
                 .padding(.horizontal, 24).padding(.bottom, 4)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
+            .toolbar(chromeHidden ? .hidden : .visible, for: .navigationBar)
+            .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(theme == "dark" ? .dark : .light, for: .navigationBar)
+            .toolbarColorScheme(activeTheme == "dark" ? .dark : .light, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -4088,7 +4329,13 @@ struct NovelReaderView: View {
                         Button { fontSize = min(fontSize + 2, 34) } label: { Label("Крупнее", systemImage: "textformat.size.larger") }
                         Button { fontSize = max(fontSize - 2, 12) } label: { Label("Мельче", systemImage: "textformat.size.smaller") }
                         Toggle("Шрифт с засечками", isOn: $serif)
+                        Picker("Интервал", selection: $lineGap) {
+                            Text("Плотный").tag(0.25)
+                            Text("Обычный").tag(0.4)
+                            Text("Свободный").tag(0.6)
+                        }
                         Picker("Тема", selection: $theme) {
+                            Text("Как в системе").tag("auto")
                             Text("Тёмная").tag("dark")
                             Text("Сепия").tag("sepia")
                             Text("Светлая").tag("light")
@@ -4097,7 +4344,7 @@ struct NovelReaderView: View {
                 }
             }
         }
-        .preferredColorScheme(theme == "dark" ? .dark : .light)
+        .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
     }
 
     private func load() async {
