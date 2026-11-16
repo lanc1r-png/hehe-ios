@@ -1117,6 +1117,8 @@ struct SettingsView: View {
     @AppStorage("manga.mode.default") private var mangaMode = "auto"
     @AppStorage("manga.tapzones") private var tapZones = true
     @AppStorage("manga.anim") private var mangaAnim = "slide"
+    @AppStorage("novel.mode") private var novelMode = "pages"
+    @AppStorage("novel.anim") private var novelAnim = "book"
     @AppStorage("off.wifi") private var offWifi = false
     @AppStorage("off.prefetch") private var offPrefetch = false
     @ObservedObject private var offline = OfflineStore.shared
@@ -1245,6 +1247,25 @@ struct SettingsView: View {
                         Toggle("Не гасить экран при чтении", isOn: $keepAwake)
                     }
                     .tint(Theme.accent)
+
+                    if platform == "ranobe" {
+                        card("Чтение ранобэ") {
+                            Picker("Режим", selection: $novelMode) {
+                                Text("Страницы").tag("pages")
+                                Text("Прокрутка").tag("scroll")
+                            }
+                            .pickerStyle(.segmented)
+                            Picker("Листание", selection: $novelAnim) {
+                                Text("Сдвиг").tag("slide")
+                                Text("Плавно").tag("fade")
+                                Text("Как в книге").tag("book")
+                            }
+                            .pickerStyle(.segmented)
+                            Text("В режиме «Страницы» глава режется на страницы по размеру экрана. Размер шрифта и тему можно менять в самой читалке.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .tint(Theme.accent)
+                    }
 
                     if platform == "manga" {
                         card("Чтение манги") {
@@ -5746,10 +5767,9 @@ struct ChapterCommentsView: View {
 
 /// Перелистывание как в Apple Books: страница загибается и переворачивается за край.
 struct BookPager: UIViewControllerRepresentable {
-    let pages: [MangaPage]
+    let count: Int
     @Binding var current: Int
-    let onTap: (CGFloat) -> Void
-    let end: AnyView
+    let content: (Int) -> AnyView
 
     final class Host: UIHostingController<AnyView> {
         var index = 0
@@ -5761,11 +5781,8 @@ struct BookPager: UIViewControllerRepresentable {
         init(_ p: BookPager) { parent = p }
 
         func host(_ i: Int) -> Host? {
-            guard i >= 0, i <= parent.pages.count else { return nil }
-            let view: AnyView = i < parent.pages.count
-                ? AnyView(MangaPageView(page: parent.pages[i], dim: 0.9, onTap: parent.onTap))
-                : parent.end
-            let h = Host(rootView: view)
+            guard i >= 0, i < parent.count else { return nil }
+            let h = Host(rootView: parent.content(i))
             h.index = i
             h.view.backgroundColor = .black
             return h
@@ -5980,8 +5997,12 @@ struct MangaReaderView: View {
                     Color.black
                         .contentShape(Rectangle())
                         .onTapGesture { handleTap(0.5) }
-                    BookPager(pages: pages, current: $current, onTap: handleTap, end: AnyView(endCard))
-                        .frame(width: fitW, height: fitH)
+                    BookPager(count: pages.count + 1, current: $current) { i in
+                        i < pages.count
+                            ? AnyView(MangaPageView(page: pages[i], dim: 0.9, onTap: handleTap))
+                            : AnyView(endCard)
+                    }
+                    .frame(width: fitW, height: fitH)
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
@@ -6188,6 +6209,195 @@ struct MangaReaderView: View {
     }
 }
 
+// MARK: - Ранобэ: постраничное чтение
+enum NovelPage: Identifiable {
+    case text(Int, NSAttributedString)
+    case image(Int, URL)
+
+    var id: Int {
+        switch self {
+        case .text(let i, _), .image(let i, _): return i
+        }
+    }
+}
+
+/// Режет текст главы на страницы по размеру экрана средствами TextKit.
+enum NovelPaginator {
+    static func font(_ size: CGFloat, serif: Bool, bold: Bool = false, italic: Bool = false) -> UIFont {
+        var d = UIFont.systemFont(ofSize: size).fontDescriptor
+        if serif, let s = d.withDesign(.serif) { d = s }
+        var traits = d.symbolicTraits
+        if bold { traits.insert(.traitBold) }
+        if italic { traits.insert(.traitItalic) }
+        if let t = d.withSymbolicTraits(traits) { d = t }
+        return UIFont(descriptor: d, size: size)
+    }
+
+    static func split(_ text: NSAttributedString, size: CGSize) -> [NSRange] {
+        let storage = NSTextStorage(attributedString: text)
+        let lm = NSLayoutManager()
+        storage.addLayoutManager(lm)
+        let ns = text.string as NSString
+        var ranges: [NSRange] = []
+        var loc = 0
+        while loc < text.length && ranges.count < 3000 {
+            let tc = NSTextContainer(size: size)
+            tc.lineFragmentPadding = 0
+            lm.addTextContainer(tc)
+            let glyphs = lm.glyphRange(for: tc)
+            if glyphs.length == 0 { break }
+            var r = lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            loc = NSMaxRange(r)
+            while r.length > 0 && ns.character(at: r.location) == 10 {
+                r.location += 1
+                r.length -= 1
+            }
+            if r.length > 0 { ranges.append(r) }
+        }
+        return ranges
+    }
+
+    static func paginate(blocks: [ReaderBlock], title: String, size: CGSize, fontSize: CGFloat,
+                         serif: Bool, lineGap: CGFloat, color: UIColor) -> [NovelPage] {
+        var pages: [NovelPage] = []
+        let text = NSMutableAttributedString()
+
+        func style(spacing: CGFloat, before: CGFloat = 0, indent: CGFloat = 0,
+                   align: NSTextAlignment = .natural) -> NSParagraphStyle {
+            let p = NSMutableParagraphStyle()
+            p.lineSpacing = fontSize * lineGap
+            p.paragraphSpacing = spacing
+            p.paragraphSpacingBefore = before
+            p.headIndent = indent
+            p.firstLineHeadIndent = indent
+            p.alignment = align
+            p.lineBreakMode = .byWordWrapping
+            return p
+        }
+        func add(_ s: String, _ f: UIFont, _ st: NSParagraphStyle) {
+            text.append(NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: color, .paragraphStyle: st]))
+        }
+        func flush() {
+            guard text.length > 0 else { return }
+            for r in split(text, size: size) {
+                pages.append(.text(pages.count, text.attributedSubstring(from: r)))
+            }
+            text.deleteCharacters(in: NSRange(location: 0, length: text.length))
+        }
+
+        let body = font(fontSize, serif: serif)
+        add(title + "\n", font(fontSize + 6, serif: serif, bold: true), style(spacing: fontSize))
+        for b in blocks {
+            switch b {
+            case .paragraph(_, let t):
+                add(t + "\n", body, style(spacing: fontSize * 0.6))
+            case .rich(_, let a):
+                let st = style(spacing: fontSize * 0.6)
+                for run in a.runs {
+                    let piece = String(a[run.range].characters)
+                    let intent = run.inlinePresentationIntent ?? []
+                    let f = font(fontSize, serif: serif, bold: intent.contains(.stronglyEmphasized),
+                                 italic: intent.contains(.emphasized))
+                    add(piece, f, st)
+                }
+                add("\n", body, st)
+            case .heading(_, let t):
+                add(t + "\n", font(fontSize + 4, serif: serif, bold: true),
+                    style(spacing: fontSize * 0.6, before: fontSize * 0.6))
+            case .quote(_, let t):
+                add(t + "\n", font(fontSize, serif: serif, italic: true),
+                    style(spacing: fontSize * 0.6, indent: 14))
+            case .rule:
+                add("* * *\n", body, style(spacing: fontSize * 0.6, align: .center))
+            case .image(_, let u):
+                flush()
+                pages.append(.image(pages.count, u))
+            }
+        }
+        flush()
+        return pages
+    }
+}
+
+final class PageTextUIView: UIView {
+    var text = NSAttributedString() {
+        didSet { setNeedsDisplay() }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ rect: CGRect) {
+        let storage = NSTextStorage(attributedString: text)
+        let lm = NSLayoutManager()
+        storage.addLayoutManager(lm)
+        let tc = NSTextContainer(size: CGSize(width: bounds.width, height: 100_000))
+        tc.lineFragmentPadding = 0
+        lm.addTextContainer(tc)
+        let r = lm.glyphRange(for: tc)
+        lm.drawGlyphs(forGlyphRange: r, at: .zero)
+    }
+}
+
+struct PageText: UIViewRepresentable {
+    let text: NSAttributedString
+
+    func makeUIView(context: Context) -> PageTextUIView {
+        let v = PageTextUIView()
+        v.text = text
+        return v
+    }
+
+    func updateUIView(_ v: PageTextUIView, context: Context) {
+        if !v.text.isEqual(to: text) { v.text = text }
+    }
+}
+
+/// Одна страница книги: текст или иллюстрация на фоне темы, с номером внизу.
+struct NovelPageCard: View {
+    let page: NovelPage
+    let number: Int
+    let total: Int
+    let bg: Color
+    let fg: Color
+    let margins: UIEdgeInsets
+    let onTap: (CGFloat) -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width - margins.left - margins.right
+            let h = geo.size.height - margins.top - margins.bottom
+            ZStack {
+                bg
+                Group {
+                    switch page {
+                    case .text(_, let t):
+                        PageText(text: t)
+                    case .image(_, let u):
+                        FitImage(url: u)
+                    }
+                }
+                .frame(width: w, height: h, alignment: .topLeading)
+                .position(x: margins.left + w / 2, y: margins.top + h / 2)
+
+                Text("\(number) / \(total)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(fg.opacity(0.45))
+                    .position(x: geo.size.width / 2, y: geo.size.height - margins.bottom / 2 - 2)
+            }
+            .contentShape(Rectangle())
+            .gesture(SpatialTapGesture().onEnded { v in onTap(v.location.x / max(geo.size.width, 1)) })
+        }
+        .ignoresSafeArea()
+    }
+}
+
 // MARK: - Ранобэ: читалка
 struct NovelReaderView: View {
     let novel: Anime
@@ -6201,6 +6411,11 @@ struct NovelReaderView: View {
     @AppStorage("reader.theme") private var theme = "dark"
     @AppStorage("reader.serif") private var serif = true
     @AppStorage("reader.lh") private var lineGap = 0.4
+    @AppStorage("novel.mode") private var mode = "pages"
+    @AppStorage("novel.anim") private var novelAnim = "book"
+    @State private var pages: [NovelPage] = []
+    @State private var pageIndex = 0
+    @State private var paginating = false
     @State private var chromeHidden = false
     @ObservedObject private var store = OfflineStore.shared
     @Environment(\.dismiss) private var dismiss
@@ -6255,6 +6470,145 @@ struct NovelReaderView: View {
 
     private var bodyFont: Font { .system(size: fontSize, design: serif ? .serif : .default) }
 
+    private var fgUI: UIColor {
+        switch activeTheme {
+        case "sepia": return UIColor(red: 0.23, green: 0.18, blue: 0.18, alpha: 1)
+        case "light": return UIColor(white: 0.1, alpha: 1)
+        default: return UIColor(white: 0.9, alpha: 1)
+        }
+    }
+
+    private var windowInsets: UIEdgeInsets {
+        let w = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+        return w?.safeAreaInsets ?? UIEdgeInsets(top: 47, left: 0, bottom: 34, right: 0)
+    }
+
+    private func pageMargins() -> UIEdgeInsets {
+        let ins = windowInsets
+        return UIEdgeInsets(top: ins.top + 16, left: 24, bottom: ins.bottom + 36, right: 24)
+    }
+
+    private func textSize(_ full: CGSize, _ m: UIEdgeInsets) -> CGSize {
+        CGSize(width: max(full.width - m.left - m.right, 50), height: max(full.height - m.top - m.bottom, 50))
+    }
+
+    private func turn(_ delta: Int) {
+        let n = pageIndex + delta
+        guard n >= 0, n <= pages.count else { return }
+        withAnimation(.easeOut(duration: 0.2)) { pageIndex = n }
+    }
+
+    private func handleTap(_ x: CGFloat) {
+        if x < 0.3 { turn(-1) }
+        else if x > 0.7 { turn(1) }
+        else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
+    }
+
+    private func paginate(_ full: CGSize) async {
+        guard !loading, !blocks.isEmpty, chapters.indices.contains(index), full.width > 100 else {
+            pages = []
+            return
+        }
+        paginating = true
+        let m = pageMargins()
+        let size = textSize(full, m)
+        let list = blocks
+        let title = chapters[index].title
+        let fs = CGFloat(fontSize), sf = serif, lg = CGFloat(lineGap), col = fgUI
+        let result = await Task.detached(priority: .userInitiated) {
+            NovelPaginator.paginate(blocks: list, title: title, size: size, fontSize: fs,
+                                    serif: sf, lineGap: lg, color: col)
+        }.value
+        if Task.isCancelled { return }
+        let old = pages.count
+        pages = result
+        pageIndex = old > 0 ? min(Int(Double(pageIndex) / Double(old) * Double(result.count)), max(result.count - 1, 0)) : 0
+        paginating = false
+    }
+
+    private var endPage: some View {
+        VStack(spacing: 16) {
+            Text(index + 1 < chapters.count ? "Глава закончилась" : "Это последняя глава")
+                .font(.subheadline).opacity(0.7)
+            if index + 1 < chapters.count {
+                Button { Haptics.tap(); index += 1 } label: {
+                    Text("Следующая глава")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.pressable)
+            }
+        }
+        .foregroundStyle(fg)
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(bg.ignoresSafeArea())
+    }
+
+    @ViewBuilder
+    private func pageContent(_ i: Int, margins m: UIEdgeInsets) -> some View {
+        if i < pages.count {
+            NovelPageCard(page: pages[i], number: i + 1, total: pages.count, bg: bg, fg: fg,
+                          margins: m, onTap: handleTap)
+        } else {
+            endPage
+        }
+    }
+
+    @ViewBuilder
+    private var pagedBody: some View {
+        GeometryReader { geo in
+            let m = pageMargins()
+            ZStack {
+                bg
+                if loading || paginating {
+                    ProgressView()
+                } else if let e = error {
+                    Text(e).font(.footnote).foregroundStyle(.orange).padding(24)
+                } else if !pages.isEmpty {
+                    let count = pages.count + 1
+                    switch novelAnim {
+                    case "book":
+                        BookPager(count: count, current: $pageIndex) { i in AnyView(pageContent(i, margins: m)) }
+                    case "fade":
+                        ZStack {
+                            pageContent(pageIndex, margins: m)
+                                .id(pageIndex)
+                                .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 1.03)),
+                                                        removal: .opacity))
+                        }
+                        .animation(.easeInOut(duration: 0.25), value: pageIndex)
+                        .gesture(
+                            DragGesture(minimumDistance: 30).onEnded { v in
+                                let dx = v.translation.width
+                                guard abs(dx) > 60, abs(dx) > abs(v.translation.height) else { return }
+                                turn(dx < 0 ? 1 : -1)
+                            }
+                        )
+                    default:
+                        TabView(selection: $pageIndex) {
+                            ForEach(0..<count, id: \.self) { i in
+                                pageContent(i, margins: m).tag(i)
+                            }
+                        }
+                        .tabViewStyle(.page(indexDisplayMode: .never))
+                    }
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .id("\(index)-\(novelAnim)-\(activeTheme)")
+            .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(lineGap)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
+                await paginate(geo.size)
+            }
+        }
+        .ignoresSafeArea()
+        .onAppear { if mode == "pages" { chromeHidden = true } }
+    }
+
     @ViewBuilder
     private func blockView(_ b: ReaderBlock) -> some View {
         switch b {
@@ -6277,6 +6631,8 @@ struct NovelReaderView: View {
 
     var body: some View {
         NavigationStack {
+            Group {
+            if mode == "scroll" {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: fontSize * (0.5 + lineGap)) {
@@ -6324,11 +6680,13 @@ struct NovelReaderView: View {
                     .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
                 }
                 .background(bg.ignoresSafeArea())
-                .task(id: index) {
-                    proxy.scrollTo("top", anchor: .top)
-                    await load()
-                }
+                .onChange(of: index) { _ in proxy.scrollTo("top", anchor: .top) }
             }
+            } else {
+                pagedBody
+            }
+            }
+            .task(id: index) { await load() }
             .safeAreaInset(edge: .bottom) {
                 if !chromeHidden {
                 HStack {
@@ -6372,6 +6730,15 @@ struct NovelReaderView: View {
                                 }
                             }
                         }
+                        Picker("Режим", selection: $mode) {
+                            Text("Страницы").tag("pages")
+                            Text("Прокрутка").tag("scroll")
+                        }
+                        Picker("Листание", selection: $novelAnim) {
+                            Text("Сдвиг").tag("slide")
+                            Text("Плавно").tag("fade")
+                            Text("Как в книге").tag("book")
+                        }
                         Picker("Интервал", selection: $lineGap) {
                             Text("Плотный").tag(0.25)
                             Text("Обычный").tag(0.4)
@@ -6399,6 +6766,8 @@ struct NovelReaderView: View {
         error = nil
         debug = ""
         blocks = []
+        pages = []
+        pageIndex = 0
         ReadStore.shared.mark(novel.readKey, ch.id)
         HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
         if let local = store.blocks(novel: novel.id, chapter: ch.id) {
