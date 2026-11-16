@@ -4,14 +4,24 @@ import AVFoundation
 import Foundation
 import WebKit
 import Security
+import Network
+import ImageIO
 
 // MARK: - Тема и общие элементы дизайна
 
 enum Theme {
     static let defaultAccentHex = "A87AFF"
     /// Акцентный цвет берётся из настроек и меняется на лету.
+    private static var cachedHex = ""
+    private static var cachedColor = Color(hex: defaultAccentHex)
+
     static var accent: Color {
-        Color(hex: UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex)
+        let hex = UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex
+        if hex != cachedHex {
+            cachedHex = hex
+            cachedColor = Color(hex: hex)
+        }
+        return cachedColor
     }
 }
 
@@ -87,9 +97,9 @@ struct Chip: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
                 .foregroundStyle(selected ? Color.white : Color.primary)
-                .background(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
+                .background(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.white.opacity(0.1)), in: Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.pressable)
     }
 }
 
@@ -101,7 +111,7 @@ struct Pill: View {
             .font(.caption)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(.ultraThinMaterial, in: Capsule())
+            .background(Color.white.opacity(0.1), in: Capsule())
     }
 }
 
@@ -690,13 +700,96 @@ actor AnimelibAPI {
     }
 }
 
+struct PressableStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+extension ButtonStyle where Self == PressableStyle {
+    static var pressable: PressableStyle { PressableStyle() }
+}
+
 // MARK: - Images (с заголовком Referer)
 final class ImageCache {
-    static let shared = NSCache<NSURL, UIImage>()
+    static let shared: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 140 * 1024 * 1024
+        c.countLimit = 500
+        return c
+    }()
+
+    static func key(_ url: URL, _ px: CGFloat) -> NSString { "\(url.absoluteString)#\(Int(px))" as NSString }
+
+    static func store(_ img: UIImage, _ key: NSString) {
+        let cost = Int(img.size.width * img.scale * img.size.height * img.scale * 4)
+        shared.setObject(img, forKey: key, cost: cost)
+    }
+}
+
+/// Загрузка картинок: общий дисковый кэш, один запрос на один адрес,
+/// декодирование и уменьшение вне главного потока.
+actor ImageLoader {
+    static let shared = ImageLoader()
+    private let session: URLSession
+    private var inflight: [String: Task<UIImage?, Never>] = [:]
+
+    init() {
+        let cfg = URLSessionConfiguration.default
+        cfg.urlCache = URLCache(memoryCapacity: 24 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024, diskPath: "hehe-images")
+        cfg.requestCachePolicy = .returnCacheDataElseLoad
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.timeoutIntervalForRequest = 20
+        session = URLSession(configuration: cfg)
+    }
+
+    func clearDisk() { session.configuration.urlCache?.removeAllCachedResponses() }
+
+    func image(_ url: URL, referer: String, maxPixel: CGFloat) async -> UIImage? {
+        let key = "\(url.absoluteString)#\(Int(maxPixel))"
+        if let t = inflight[key] { return await t.value }
+        let session = self.session
+        let t = Task.detached(priority: .userInitiated) { () -> UIImage? in
+            for attempt in 0..<3 {
+                if Task.isCancelled { return nil }
+                var req = URLRequest(url: url)
+                req.setValue(referer, forHTTPHeaderField: "Referer")
+                req.setValue("image/*", forHTTPHeaderField: "Accept")
+                if let (data, resp) = try? await session.data(for: req),
+                   (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
+                   let img = ImageLoader.downsample(data, maxPixel: maxPixel) {
+                    return img
+                }
+                try? await Task.sleep(nanoseconds: UInt64(500_000_000 * (attempt + 1)))
+            }
+            return nil
+        }
+        inflight[key] = t
+        let r = await t.value
+        inflight[key] = nil
+        return r
+    }
+
+    nonisolated static func downsample(_ data: Data, maxPixel: CGFloat) -> UIImage? {
+        let srcOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let src = CGImageSourceCreateWithData(data as CFData, srcOpts) else { return nil }
+        let opts = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ] as CFDictionary
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts) else { return nil }
+        return UIImage(cgImage: cg)
+    }
 }
 
 struct RemoteImage: View {
     let url: URL?
+    var maxPixel: CGFloat = 480
     @State private var image: UIImage?
     @State private var failed = false
 
@@ -704,11 +797,9 @@ struct RemoteImage: View {
         Rectangle().fill(.quaternary)
             .overlay {
                 if let image {
-                    Image(uiImage: image).resizable().scaledToFill()
+                    Image(uiImage: image).resizable().scaledToFill().transition(.opacity)
                 } else if failed {
                     Image(systemName: "photo").foregroundStyle(.secondary)
-                } else {
-                    ProgressView()
                 }
             }
             .clipped()
@@ -717,23 +808,20 @@ struct RemoteImage: View {
 
     private func load() async {
         guard let url else { failed = true; return }
-        if let cached = ImageCache.shared.object(forKey: url as NSURL) { image = cached; return }
-        for attempt in 0..<3 {
-            if Task.isCancelled { return }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 20
-            req.setValue(LibSite.current.referer, forHTTPHeaderField: "Referer")
-            req.setValue("image/*", forHTTPHeaderField: "Accept")
-            if let (data, resp) = try? await URLSession.shared.data(for: req),
-               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
-               let img = UIImage(data: data) {
-                ImageCache.shared.setObject(img, forKey: url as NSURL)
-                image = img
-                return
-            }
-            try? await Task.sleep(nanoseconds: UInt64(500_000_000 * (attempt + 1)))
+        if url.isFileURL {
+            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            return
         }
-        if !Task.isCancelled { failed = true }
+        let key = ImageCache.key(url, maxPixel)
+        if let cached = ImageCache.shared.object(forKey: key) { image = cached; failed = false; return }
+        image = nil
+        failed = false
+        if let img = await ImageLoader.shared.image(url, referer: LibSite.current.referer, maxPixel: maxPixel) {
+            ImageCache.store(img, key)
+            withAnimation(.easeOut(duration: 0.25)) { image = img }
+        } else if !Task.isCancelled {
+            failed = true
+        }
     }
 }
 
@@ -791,7 +879,7 @@ struct FavoritesView: View {
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(favorites.items) { anime in
                         TitleLink(anime: anime) { AnimeCard(anime: anime) }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                     }
                 }
                 .padding(.horizontal, 14)
@@ -809,6 +897,10 @@ struct SettingsView: View {
     @AppStorage("set.autoNative") private var autoNative = true
     @AppStorage("set.resume") private var resume = true
     @AppStorage("set.platform") private var platform = "anime"
+    @AppStorage("off.wifi") private var offWifi = false
+    @AppStorage("off.prefetch") private var offPrefetch = false
+    @ObservedObject private var offline = OfflineStore.shared
+    @State private var confirmOffline = false
     @ObservedObject private var auth = AuthStore.shared
     @State private var custom: Color = Theme.accent
     @State private var info: String?
@@ -819,9 +911,7 @@ struct SettingsView: View {
     ]
     private let platforms: [(String, String, String, Bool)] = [
         ("anime", "Аниме", "AnimeLib", true),
-        ("manga", "Манга", "MangaLib", false),
-        ("ranobe", "Ранобэ", "RanobeLib", true),
-        ("hentai", "Хентай", "HentaiLib · 18+", false)
+        ("ranobe", "Ранобэ", "RanobeLib", true)
     ]
 
     private func card<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
@@ -831,7 +921,7 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
     }
 
     var body: some View {
@@ -876,7 +966,7 @@ struct SettingsView: View {
                                     }
                                 }
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                         }
                     }
 
@@ -888,9 +978,38 @@ struct SettingsView: View {
                     }
                     .tint(Theme.accent)
 
+                    card("Загрузки · ранобэ") {
+                        if platform == "ranobe" {
+                            NavigationLink {
+                                OfflineLibraryView()
+                            } label: {
+                                HStack {
+                                    Label("Скачанное", systemImage: "arrow.down.circle")
+                                    Spacer()
+                                    Text("\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.pressable)
+                        } else {
+                            Text("Скачанные главы доступны на платформе «Ранобэ».")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Toggle("Скачивать только по Wi‑Fi", isOn: $offWifi)
+                        Toggle("Докачивать 3 следующие главы при чтении", isOn: $offPrefetch)
+                        if offline.totalBytes > 0 {
+                            Button("Удалить все загрузки", role: .destructive) { confirmOffline = true }
+                        }
+                    }
+                    .tint(Theme.accent)
+                    .confirmationDialog("Удалить все скачанные главы?", isPresented: $confirmOffline, titleVisibility: .visible) {
+                        Button("Удалить", role: .destructive) { offline.removeAll() }
+                    }
+
                     card("Данные") {
                         Button("Очистить кэш обложек") {
-                            ImageCache.shared.removeAllObjects(); info = "Кэш обложек очищен"
+                            ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
                         }
                         Button("Сбросить историю просмотра") {
                             ProgressStore.shared.clear(); HistoryStore.shared.clear()
@@ -913,7 +1032,7 @@ struct SettingsView: View {
                     }
 
                     card("О приложении") {
-                        Text("Hehe · версия 1.0")
+                        Text("Yume · версия 1.0")
                         Text("Данные: animelib.org. Приложение неофициальное.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -1079,7 +1198,7 @@ struct SectionHeader: View {
                         Image(systemName: "chevron.right").font(.footnote.bold()).foregroundStyle(Theme.accent)
                     }
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
             } else {
                 Text(title).font(.title3.bold())
             }
@@ -1162,7 +1281,7 @@ struct AnimeRow: View {
             }
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
     }
 }
 
@@ -1199,7 +1318,7 @@ struct ContinueCard: View {
         }
         .padding(10)
         .frame(width: 290)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.08)))
     }
 }
@@ -1216,7 +1335,7 @@ struct HomeView: View {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(list) { a in
                     TitleLink(anime: a) { PosterCard(anime: a) }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressable)
                 }
             }
             .padding(.horizontal, 14)
@@ -1258,7 +1377,7 @@ struct HomeView: View {
                                     LazyHStack(spacing: 12) {
                                         ForEach(history.items) { h in
                                             TitleLink(anime: h.anime) { ContinueCard(item: h) }
-                                                .buttonStyle(.plain)
+                                                .buttonStyle(.pressable)
                                                 .contextMenu {
                                                     Button(role: .destructive) { history.remove(h.anime.id) } label: {
                                                         Label("Убрать", systemImage: "trash")
@@ -1284,7 +1403,7 @@ struct HomeView: View {
                                 VStack(spacing: 8) {
                                     ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
                                         TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1) }
-                                            .buttonStyle(.plain)
+                                            .buttonStyle(.pressable)
                                     }
                                     if vm.canLoadMorePopular {
                                         Button { Task { await vm.morePopular() } } label: {
@@ -1294,9 +1413,9 @@ struct HomeView: View {
                                             .font(.subheadline.weight(.semibold))
                                             .frame(maxWidth: .infinity)
                                             .padding(.vertical, 12)
-                                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                                         }
-                                        .buttonStyle(.plain)
+                                        .buttonStyle(.pressable)
                                     }
                                 }
                                 .padding(.horizontal, 14)
@@ -1442,7 +1561,7 @@ struct SearchBar: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
             }
         }
         .padding(.horizontal, 14)
@@ -1554,7 +1673,7 @@ struct CatalogView: View {
                     }
                 }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.pressable)
     }
 
     var body: some View {
@@ -1588,7 +1707,7 @@ struct CatalogView: View {
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { anime in
                         TitleLink(anime: anime) { AnimeCard(anime: anime) }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                             .onAppear {
                                 if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
                             }
@@ -1716,7 +1835,7 @@ struct AuthorView: View {
                     Spacer()
                 }
                 .padding(14)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
 
                 if let e = vm.error {
                     Text(e).font(.footnote).foregroundStyle(.red)
@@ -1725,7 +1844,7 @@ struct AuthorView: View {
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { a in
                         TitleLink(anime: a) { AnimeCard(anime: a) }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                             .onAppear {
                                 if a.id == vm.items.last?.id { Task { await vm.loadMore() } }
                             }
@@ -1785,8 +1904,8 @@ struct DetailView: View {
     private var backdrop: some View {
         ZStack {
             Color.black
-            RemoteImage(url: vm.anime.imageURL)
-                .blur(radius: 50)
+            RemoteImage(url: vm.anime.imageURL, maxPixel: 96)
+                .blur(radius: 16)
                 .opacity(0.55)
             LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
         }
@@ -1839,7 +1958,7 @@ struct DetailView: View {
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
                 }
 
                 if let au = vm.anime.authors, !au.isEmpty {
@@ -1857,14 +1976,14 @@ struct DetailView: View {
                                         .font(.subheadline.weight(.medium))
                                         .foregroundStyle(Theme.accent)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(.ultraThinMaterial, in: Capsule())
+                                        .background(Color.white.opacity(0.1), in: Capsule())
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(.pressable)
                                 } else {
                                     Text(a.title)
                                         .font(.subheadline)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(.ultraThinMaterial, in: Capsule())
+                                        .background(Color.white.opacity(0.1), in: Capsule())
                                 }
                             }
                         }
@@ -1877,7 +1996,7 @@ struct DetailView: View {
                             .font(.subheadline)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .background(Color.white.opacity(0.1), in: Capsule())
                     }
                 }
 
@@ -1889,9 +2008,9 @@ struct DetailView: View {
                         Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
                     }
                     .padding(14)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
 
                 Text("Серии").font(.title3.bold())
                 if vm.isLoading { ProgressView() }
@@ -1931,9 +2050,9 @@ struct DetailView: View {
                                     .foregroundStyle(pr != nil ? Color.gray : Theme.accent)
                             }
                             .padding(10)
-                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressable)
                     }
                 }
             }
@@ -2409,7 +2528,7 @@ struct PlayerScreen: View {
                 .frame(width: 42, height: 40)
                 .background(.ultraThinMaterial, in: Circle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.pressable)
         .disabled(ep == nil)
         .opacity(ep == nil ? 0.35 : 1)
     }
@@ -2887,7 +3006,7 @@ struct CommentRow: View {
                                 .font(.caption)
                                 .foregroundStyle(liked ? Theme.accent : Color.secondary)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressable)
                         if c.down > 0 {
                             Label("\(c.down)", systemImage: "hand.thumbsdown").font(.caption)
                         }
@@ -2895,7 +3014,7 @@ struct CommentRow: View {
                             Button { vm.replyTarget = c } label: {
                                 Text("Ответить").font(.caption.bold()).foregroundStyle(Theme.accent)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                         }
                         if c.replyCount > 0 {
                             Button {
@@ -2906,7 +3025,7 @@ struct CommentRow: View {
                                     .font(.caption.bold())
                                     .foregroundStyle(Theme.accent)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                         }
                     }
                     .foregroundStyle(.secondary)
@@ -2926,7 +3045,7 @@ struct CommentRow: View {
             }
         }
         .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -2946,7 +3065,7 @@ struct ComposeSheet: View {
                     .scrollContentBackground(.hidden)
                     .padding(10)
                     .frame(minHeight: 180)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                 if let e = error {
                     Text(e).font(.footnote).foregroundStyle(.orange)
                 }
@@ -3391,9 +3510,9 @@ struct BookmarkSheet: View {
                                     }
                                 }
                                 .padding(14)
-                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressable)
                             .disabled(busy)
                         }
                         if !folders.isEmpty {
@@ -3563,7 +3682,7 @@ struct ProfileView: View {
                                             in: RoundedRectangle(cornerRadius: 16))
                                         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.1)))
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(.pressable)
                                 }
                             }
                         }
@@ -3574,7 +3693,7 @@ struct ProfileView: View {
                         LazyVGrid(columns: columns, spacing: 18) {
                             ForEach(vm.items) { anime in
                                 TitleLink(anime: anime) { AnimeCard(anime: anime) }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(.pressable)
                                     .onAppear {
                                         if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
                                     }
@@ -3622,7 +3741,7 @@ struct ProfileView: View {
                                 .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14))
                                 .foregroundStyle(.white)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressable)
                     }
                     .padding(24)
                     .padding(.top, 40)
@@ -3658,6 +3777,12 @@ struct NovelChapter: Identifiable, Hashable {
     let volume: String
     let number: String
     let name: String
+
+    init(id: Int, volume: String, number: String, name: String) {
+        self.id = id; self.volume = volume; self.number = number; self.name = name
+    }
+
+    var saved: SavedChapter { SavedChapter(id: id, volume: volume, number: number, name: name) }
 
     init?(_ d: [String: Any]) {
         guard let cid = J.int(d["id"]) else { return nil }
@@ -3914,7 +4039,7 @@ struct FitImage: View {
     var body: some View {
         Group {
             if let image {
-                Image(uiImage: image).resizable().scaledToFit()
+                Image(uiImage: image).resizable().scaledToFit().transition(.opacity)
             } else if failed {
                 Label("Иллюстрация не загрузилась", systemImage: "photo")
                     .font(.caption).foregroundStyle(.secondary)
@@ -3926,22 +4051,421 @@ struct FitImage: View {
     }
 
     private func load() async {
-        if let c = ImageCache.shared.object(forKey: url as NSURL) { image = c; return }
+        if url.isFileURL {
+            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            return
+        }
+        let key = ImageCache.key(url, 1600)
+        if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+        if let img = await ImageLoader.shared.image(url, referer: LibSite.ranobe.referer, maxPixel: 1600) {
+            ImageCache.store(img, key)
+            withAnimation(.easeOut(duration: 0.25)) { image = img }
+        } else if !Task.isCancelled {
+            failed = true
+        }
+    }
+}
+
+
+// MARK: - Ранобэ: офлайн-хранилище
+struct SavedChapter: Codable {
+    let id: Int
+    let volume: String
+    let number: String
+    let name: String
+}
+
+struct OfflineEntry: Codable {
+    var novel: Anime
+    var chapters: [SavedChapter]
+    var files: [Int: Int]
+    var updated: Date
+}
+
+func fmtBytes(_ n: Int) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+}
+
+/// Скачанные главы лежат в Application Support/Offline/<id тайтла>/:
+/// <id главы>.json (ответ сайта как есть) и картинки <id главы>_<хэш>.img.
+@MainActor
+final class OfflineStore: ObservableObject {
+    static let shared = OfflineStore()
+    @Published private(set) var entries: [Int: OfflineEntry] = [:]
+    nonisolated let root: URL
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        var dir = base.appendingPathComponent("Offline", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var rv = URLResourceValues()
+        rv.isExcludedFromBackup = true
+        try? dir.setResourceValues(rv)
+        root = dir
+        if let d = try? Data(contentsOf: dir.appendingPathComponent("manifest.json")),
+           let v = try? JSONDecoder().decode([Int: OfflineEntry].self, from: d) { entries = v }
+    }
+
+    nonisolated func folder(_ novel: Int) -> URL { root.appendingPathComponent(String(novel), isDirectory: true) }
+    nonisolated func chapterFile(_ novel: Int, _ chapter: Int) -> URL { folder(novel).appendingPathComponent("\(chapter).json") }
+    nonisolated func coverFile(_ novel: Int) -> URL { folder(novel).appendingPathComponent("cover.img") }
+    nonisolated func imageFile(novel: Int, chapter: Int, url: URL) -> URL {
+        var h: UInt64 = 5381
+        for b in url.absoluteString.utf8 { h = (h &* 33) &+ UInt64(b) }
+        return folder(novel).appendingPathComponent("\(chapter)_\(String(h, radix: 36)).img")
+    }
+
+    private func persist() {
+        if let d = try? JSONEncoder().encode(entries) {
+            try? d.write(to: root.appendingPathComponent("manifest.json"), options: .atomic)
+        }
+    }
+
+    var allEntries: [OfflineEntry] { entries.values.sorted { $0.updated > $1.updated } }
+    var totalBytes: Int { entries.values.reduce(0) { $0 + $1.files.values.reduce(0, +) } }
+    func isDownloaded(_ novel: Int, _ chapter: Int) -> Bool { entries[novel]?.files[chapter] != nil }
+    func downloadedCount(_ novel: Int) -> Int { entries[novel]?.files.count ?? 0 }
+
+    func coverURL(_ novel: Int) -> URL? {
+        let f = coverFile(novel)
+        return FileManager.default.fileExists(atPath: f.path) ? f : nil
+    }
+
+    /// Список глав, сохранённый вместе с тайтлом, только скачанные.
+    func savedChapters(_ novel: Int) -> [NovelChapter] {
+        guard let e = entries[novel] else { return [] }
+        return e.chapters
+            .filter { e.files[$0.id] != nil }
+            .map { NovelChapter(id: $0.id, volume: $0.volume, number: $0.number, name: $0.name) }
+    }
+
+    /// Обновляем сохранённый список глав, пока есть сеть (чтобы офлайн было что показать).
+    func refresh(novel: Anime, chapters: [NovelChapter]) {
+        guard var e = entries[novel.id] else { return }
+        e.novel = novel
+        e.chapters = chapters.map { $0.saved }
+        entries[novel.id] = e
+        persist()
+    }
+
+    func record(novel: Anime, chapters: [NovelChapter], chapter: NovelChapter, raw: Data, extraBytes: Int) {
+        try? FileManager.default.createDirectory(at: folder(novel.id), withIntermediateDirectories: true)
+        try? raw.write(to: chapterFile(novel.id, chapter.id), options: .atomic)
+        var e = entries[novel.id] ?? OfflineEntry(novel: novel, chapters: [], files: [:], updated: Date())
+        e.novel = novel
+        if !chapters.isEmpty { e.chapters = chapters.map { $0.saved } }
+        e.files[chapter.id] = raw.count + extraBytes
+        e.updated = Date()
+        entries[novel.id] = e
+        persist()
+    }
+
+    func remove(novel: Int, chapter: Int) {
+        guard var e = entries[novel] else { return }
+        try? FileManager.default.removeItem(at: chapterFile(novel, chapter))
+        let prefix = "\(chapter)_"
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: folder(novel).path) {
+            for n in names where n.hasPrefix(prefix) {
+                try? FileManager.default.removeItem(at: folder(novel).appendingPathComponent(n))
+            }
+        }
+        e.files[chapter] = nil
+        if e.files.isEmpty {
+            remove(novel: novel)
+        } else {
+            entries[novel] = e
+            persist()
+        }
+    }
+
+    func remove(novel: Int) {
+        try? FileManager.default.removeItem(at: folder(novel))
+        entries[novel] = nil
+        persist()
+    }
+
+    func removeAll() {
+        for id in Array(entries.keys) { try? FileManager.default.removeItem(at: folder(id)) }
+        entries = [:]
+        persist()
+    }
+
+    /// Глава с телефона: картинки подменяются локальными файлами.
+    func blocks(novel: Int, chapter: Int) -> [ReaderBlock]? {
+        guard isDownloaded(novel, chapter),
+              let data = try? Data(contentsOf: chapterFile(novel, chapter)),
+              let root = J.obj(data) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { return nil }
+        let att = (d["attachments"] as? [[String: Any]]) ?? []
+        let parsed = ReaderParser.parse(d["content"], attachments: att)
+        if parsed.isEmpty { return nil }
+        return parsed.map { (b: ReaderBlock) -> ReaderBlock in
+            if case .image(let i, let u) = b {
+                let f = imageFile(novel: novel, chapter: chapter, url: u)
+                if FileManager.default.fileExists(atPath: f.path) { return .image(i, f) }
+            }
+            return b
+        }
+    }
+}
+
+// MARK: - Ранобэ: очередь загрузок
+final class BackgroundBox {
+    var id = UIBackgroundTaskIdentifier.invalid
+}
+
+@MainActor
+final class DownloadManager: ObservableObject {
+    static let shared = DownloadManager()
+
+    struct Job {
+        let novel: Anime
+        let chapters: [NovelChapter]
+        let chapter: NovelChapter
+    }
+
+    @Published private(set) var pending: Set<Int> = []
+    @Published private(set) var current: Int?
+    @Published private(set) var failed: [Int: String] = [:]
+    @Published private(set) var total = 0
+    @Published private(set) var done = 0
+    @Published private(set) var status = ""
+
+    private var jobs: [Job] = []
+    private var worker: Task<Void, Never>?
+    private let monitor = NWPathMonitor()
+    private var expensive = false
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let exp = path.isExpensive
+            Task { @MainActor in self?.expensive = exp }
+        }
+        monitor.start(queue: DispatchQueue(label: "hehe.netmonitor"))
+    }
+
+    func enqueue(novel: Anime, all: [NovelChapter], targets: [NovelChapter]) {
+        let store = OfflineStore.shared
+        for c in targets where !store.isDownloaded(novel.id, c.id) && !pending.contains(c.id) {
+            jobs.append(Job(novel: novel, chapters: all, chapter: c))
+            pending.insert(c.id)
+            failed[c.id] = nil
+            total += 1
+        }
+        startIfNeeded()
+    }
+
+    func cancel(chapter id: Int) {
+        guard let i = jobs.firstIndex(where: { $0.chapter.id == id }) else { return }
+        jobs.remove(at: i)
+        pending.remove(id)
+        total = max(0, total - 1)
+    }
+
+    func cancelAll() {
+        jobs.removeAll()
+        pending = []
+        worker?.cancel()
+        worker = nil
+        current = nil
+        total = 0; done = 0; status = ""
+    }
+
+    private func startIfNeeded() {
+        guard worker == nil, !jobs.isEmpty else { return }
+        worker = Task { [weak self] in await self?.run() }
+    }
+
+    private func run() async {
+        let box = BackgroundBox()
+        box.id = UIApplication.shared.beginBackgroundTask(withName: "hehe.download") {
+            let id = box.id
+            box.id = .invalid
+            if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+        }
+        while !Task.isCancelled, !jobs.isEmpty {
+            let job = jobs.removeFirst()
+            current = job.chapter.id
+            if Settings.bool("off.wifi", false) {
+                while expensive && !Task.isCancelled {
+                    status = "Ждём Wi‑Fi…"
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            }
+            if Task.isCancelled { break }
+            status = job.chapter.title
+            do {
+                try await download(job)
+            } catch {
+                if Task.isCancelled { break }
+                failed[job.chapter.id] = error.localizedDescription
+            }
+            if Task.isCancelled { break }
+            done += 1
+            pending.remove(job.chapter.id)
+            try? await Task.sleep(nanoseconds: 350_000_000)
+        }
+        if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
+        if Task.isCancelled { return }
+        current = nil
+        status = ""
+        total = 0
+        done = 0
+        worker = nil
+    }
+
+    private func download(_ job: Job) async throws {
+        guard let slug = job.novel.slugUrl else { throw APIError.badURL }
+        let c = job.chapter
+        var raw: Data?
+        var lastError: Error = APIError.badURL
         for attempt in 0..<3 {
-            if Task.isCancelled { return }
+            do {
+                raw = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
+                                                           query: NovelService.chapterQuery(c))
+                break
+            } catch APIError.http(let code, let body) where code == 429 || code >= 500 {
+                lastError = APIError.http(code, body)
+                try await Task.sleep(nanoseconds: UInt64(3_000_000_000 * (attempt + 1)))
+            }
+        }
+        guard let raw, let root = J.obj(raw) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { throw lastError }
+        let att = (d["attachments"] as? [[String: Any]]) ?? []
+        let blocks = ReaderParser.parse(d["content"], attachments: att)
+        if blocks.isEmpty {
+            throw NSError(domain: "offline", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Текст главы пуст или недоступен"])
+        }
+        var urls: [URL] = []
+        for b in blocks {
+            if case .image(_, let u) = b, !urls.contains(u) { urls.append(u) }
+        }
+        let store = OfflineStore.shared
+        let nid = job.novel.id
+        try? FileManager.default.createDirectory(at: store.folder(nid), withIntermediateDirectories: true)
+        let targets: [(URL, URL)] = urls.map { ($0, store.imageFile(novel: nid, chapter: c.id, url: $0)) }
+        var imageBytes = 0
+        var start = 0
+        while start < targets.count {
+            let chunk = Array(targets[start..<min(start + 4, targets.count)])
+            start += 4
+            imageBytes += await withTaskGroup(of: Int.self) { group -> Int in
+                for (u, f) in chunk { group.addTask { await DownloadManager.fetchImage(u, to: f) } }
+                var sum = 0
+                for await n in group { sum += n }
+                return sum
+            }
+            if Task.isCancelled { throw CancellationError() }
+        }
+        if let cover = job.novel.imageURL, store.coverURL(nid) == nil {
+            _ = await DownloadManager.fetchImage(cover, to: store.coverFile(nid))
+        }
+        store.record(novel: job.novel, chapters: job.chapters, chapter: c, raw: raw, extraBytes: imageBytes)
+    }
+
+    nonisolated static func fetchImage(_ url: URL, to file: URL) async -> Int {
+        if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 { return size }
+        for attempt in 0..<3 {
             var req = URLRequest(url: url)
-            req.timeoutInterval = 25
-            req.setValue(LibSite.ranobe.referer, forHTTPHeaderField: "Referer")
+            req.timeoutInterval = 30
+            req.setValue("https://ranobelib.me/", forHTTPHeaderField: "Referer")
             if let (data, resp) = try? await URLSession.shared.data(for: req),
                (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
-               let img = UIImage(data: data) {
-                ImageCache.shared.setObject(img, forKey: url as NSURL)
-                image = img
-                return
+               !data.isEmpty, UIImage(data: data) != nil {
+                try? data.write(to: file, options: .atomic)
+                return data.count
             }
-            try? await Task.sleep(nanoseconds: UInt64(500_000_000 * (attempt + 1)))
+            try? await Task.sleep(nanoseconds: UInt64(600_000_000 * (attempt + 1)))
         }
-        if !Task.isCancelled { failed = true }
+        return 0
+    }
+}
+
+struct ChapterDownloadButton: View {
+    let novel: Anime
+    let chapters: [NovelChapter]
+    let chapter: NovelChapter
+    @ObservedObject private var store = OfflineStore.shared
+    @ObservedObject private var dl = DownloadManager.shared
+
+    var body: some View {
+        let saved = store.isDownloaded(novel.id, chapter.id)
+        let queued = dl.pending.contains(chapter.id)
+        Button {
+            if queued { dl.cancel(chapter: chapter.id) }
+            else if !saved { dl.enqueue(novel: novel, all: chapters, targets: [chapter]) }
+        } label: {
+            Group {
+                if saved {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.green)
+                } else if queued {
+                    if dl.current == chapter.id { ProgressView() }
+                    else { Image(systemName: "clock").foregroundStyle(.secondary) }
+                } else if dl.failed[chapter.id] != nil {
+                    Image(systemName: "exclamationmark.circle").foregroundStyle(Color.orange)
+                } else {
+                    Image(systemName: "arrow.down.circle").foregroundStyle(.secondary)
+                }
+            }
+            .font(.title3)
+            .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.pressable)
+    }
+}
+
+struct OfflineLibraryView: View {
+    @ObservedObject private var store = OfflineStore.shared
+    @State private var confirmAll = false
+
+    var body: some View {
+        List {
+            if store.allEntries.isEmpty {
+                Text("Пока ничего не скачано. Откройте тайтл и нажмите «Скачать» над списком глав.")
+                    .foregroundStyle(.secondary)
+                    .listRowBackground(Color.clear)
+            }
+            ForEach(store.allEntries, id: \.novel.id) { e in
+                NavigationLink(value: Novel(e.novel)) {
+                    HStack(spacing: 12) {
+                        RemoteImage(url: store.coverURL(e.novel.id) ?? e.novel.imageURL)
+                            .frame(width: 50, height: 74)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(e.novel.displayTitle)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(2)
+                            Text("\(e.files.count) гл. · \(fmtBytes(e.files.values.reduce(0, +)))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .listRowBackground(Color.clear)
+                .swipeActions {
+                    Button(role: .destructive) { store.remove(novel: e.novel.id) } label: {
+                        Label("Удалить", systemImage: "trash")
+                    }
+                }
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppBackground())
+        .navigationTitle("Скачанное")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
+        .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
+        .toolbar {
+            if !store.allEntries.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Удалить всё", role: .destructive) { confirmAll = true }
+                }
+            }
+        }
+        .confirmationDialog("Удалить все скачанные главы?", isPresented: $confirmAll, titleVisibility: .visible) {
+            Button("Удалить всё", role: .destructive) { store.removeAll() }
+        }
     }
 }
 
@@ -3952,6 +4476,7 @@ final class NovelDetailViewModel: ObservableObject {
     @Published var chapters: [NovelChapter] = []
     @Published var isLoading = true
     @Published var error: String?
+    @Published var offline = false
 
     init(anime: Anime) { self.anime = anime }
 
@@ -3966,7 +4491,20 @@ final class NovelDetailViewModel: ObservableObject {
         async let d = AnimelibAPI.shared.details(slug: slug)
         async let c = NovelService.chapters(slug: slug)
         if let full = try? await d { anime = full }
-        do { chapters = try await c } catch { self.error = error.localizedDescription }
+        do {
+            let list = try await c
+            chapters = list
+            offline = false
+            OfflineStore.shared.refresh(novel: anime, chapters: list)
+        } catch {
+            let saved = OfflineStore.shared.savedChapters(anime.id)
+            if saved.isEmpty {
+                self.error = error.localizedDescription
+            } else {
+                chapters = saved
+                offline = true
+            }
+        }
         isLoading = false
     }
 
@@ -3994,13 +4532,16 @@ struct NovelDetailView: View {
     @State private var reader: ReaderStart?
     @State private var showComments = false
     @State private var showBookmark = false
+    @ObservedObject private var store = OfflineStore.shared
+    @ObservedObject private var dl = DownloadManager.shared
+    @State private var confirmRemove = false
 
     init(novel: Novel) { _vm = StateObject(wrappedValue: NovelDetailViewModel(anime: novel.anime)) }
 
     private var backdrop: some View {
         ZStack {
             Color.black
-            RemoteImage(url: vm.anime.imageURL).blur(radius: 50).opacity(0.55)
+            RemoteImage(url: vm.anime.imageURL, maxPixel: 96).blur(radius: 16).opacity(0.55)
             LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
@@ -4012,34 +4553,119 @@ struct NovelDetailView: View {
         return 0
     }
 
+    private func queue(_ idx: [Int]) {
+        dl.enqueue(novel: vm.anime, all: vm.chapters, targets: idx.map { vm.chapters[$0] })
+    }
+
+    private func nextIndices(_ n: Int) -> [Int] {
+        let start = read.lastChapter(vm.anime.id) == nil ? 0 : resumeIndex
+        return Array(vm.chapters.indices.dropFirst(start).prefix(n))
+    }
+
+    private var downloadMenu: some View {
+        Menu {
+            Button { queue(Array(vm.chapters.indices)) } label: {
+                Label("Скачать все главы", systemImage: "arrow.down.circle")
+            }
+            Button {
+                queue(vm.chapters.indices.filter { !read.isRead(vm.anime.id, vm.chapters[$0].id) })
+            } label: {
+                Label("Скачать непрочитанные", systemImage: "book.closed")
+            }
+            Menu {
+                ForEach([5, 10, 25, 50], id: \.self) { n in
+                    Button("\(n) глав") { queue(nextIndices(n)) }
+                }
+            } label: {
+                Label("Следующие главы…", systemImage: "forward.end")
+            }
+            if store.downloadedCount(vm.anime.id) > 0 {
+                Divider()
+                Button(role: .destructive) { confirmRemove = true } label: {
+                    Label("Удалить загруженные", systemImage: "trash")
+                }
+            }
+        } label: {
+            let n = store.downloadedCount(vm.anime.id)
+            Label(n > 0 ? "Скачано: \(n)" : "Скачать", systemImage: "arrow.down.circle")
+                .font(.footnote)
+        }
+    }
+
+    @ViewBuilder
+    private func volumeButton(_ idx: [Int]) -> some View {
+        let all = idx.allSatisfy { store.isDownloaded(vm.anime.id, vm.chapters[$0].id) }
+        if all {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green).font(.footnote)
+        } else {
+            Button { queue(idx) } label: {
+                Label("Скачать том", systemImage: "arrow.down.circle").font(.caption)
+            }
+            .buttonStyle(.pressable)
+            .foregroundStyle(Theme.accent)
+        }
+    }
+
+    private var downloadBanner: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+            Text("Загрузка: \(dl.done) из \(dl.total)" + (dl.status.isEmpty ? "" : " · " + dl.status))
+                .font(.caption)
+                .lineLimit(1)
+            Spacer()
+            Button("Стоп") { dl.cancelAll() }
+                .font(.caption.bold())
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+
     private func row(_ i: Int) -> some View {
         let c = vm.chapters[i]
         let isRead = read.isRead(vm.anime.id, c.id)
-        return Button { reader = ReaderStart(id: i) } label: {
-            HStack(spacing: 12) {
-                Text(c.number)
-                    .font(.footnote.bold())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
+        let saved = store.isDownloaded(vm.anime.id, c.id)
+        return HStack(spacing: 8) {
+            Button { reader = ReaderStart(id: i) } label: {
+                HStack(spacing: 12) {
+                    Text(c.number)
+                        .font(.footnote.bold())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .foregroundStyle(isRead ? Color.secondary : Color.primary)
+                        .frame(width: 42, height: 42)
+                        .background(isRead ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(c.name.isEmpty ? "Глава \(c.number)" : c.name)
+                            .font(.subheadline)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        if let f = dl.failed[c.id] {
+                            Text(f).font(.caption2).foregroundStyle(Color.orange).lineLimit(1)
+                        } else if isRead {
+                            Text("Прочитано").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
                     .foregroundStyle(isRead ? Color.secondary : Color.primary)
-                    .frame(width: 42, height: 42)
-                    .background(isRead ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(c.name.isEmpty ? "Глава \(c.number)" : c.name)
-                        .font(.subheadline)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    if isRead { Text("Прочитано").font(.caption2).foregroundStyle(.secondary) }
+                    Spacer()
+                    Image(systemName: isRead ? "checkmark.circle.fill" : "book.fill")
+                        .foregroundStyle(isRead ? Color.gray : Theme.accent)
                 }
-                .foregroundStyle(isRead ? Color.secondary : Color.primary)
-                Spacer()
-                Image(systemName: isRead ? "checkmark.circle.fill" : "book.fill")
-                    .foregroundStyle(isRead ? Color.gray : Theme.accent)
+                .contentShape(Rectangle())
             }
-            .padding(10)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .buttonStyle(.pressable)
+            ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c)
         }
-        .buttonStyle(.plain)
+        .padding(10)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+        .contextMenu {
+            if saved {
+                Button(role: .destructive) { store.remove(novel: vm.anime.id, chapter: c.id) } label: {
+                    Label("Удалить загрузку", systemImage: "trash")
+                }
+            } else {
+                Button { queue([i]) } label: { Label("Скачать главу", systemImage: "arrow.down.circle") }
+            }
+        }
     }
 
     var body: some View {
@@ -4079,7 +4705,7 @@ struct NovelDetailView: View {
                         .background(Theme.accent, in: RoundedRectangle(cornerRadius: 16))
                         .foregroundStyle(.white)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.pressable)
                 }
 
                 if let g = vm.anime.genres, !g.isEmpty {
@@ -4105,7 +4731,7 @@ struct NovelDetailView: View {
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
                 }
 
                 if let au = vm.anime.authors, !au.isEmpty {
@@ -4123,14 +4749,14 @@ struct NovelDetailView: View {
                                         .font(.subheadline.weight(.medium))
                                         .foregroundStyle(Theme.accent)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(.ultraThinMaterial, in: Capsule())
+                                        .background(Color.white.opacity(0.1), in: Capsule())
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(.pressable)
                                 } else {
                                     Text(a.title)
                                         .font(.subheadline)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(.ultraThinMaterial, in: Capsule())
+                                        .background(Color.white.opacity(0.1), in: Capsule())
                                 }
                             }
                         }
@@ -4142,7 +4768,7 @@ struct NovelDetailView: View {
                         Label("Открыть на сайте", systemImage: "safari")
                             .font(.subheadline)
                             .padding(.horizontal, 14).padding(.vertical, 9)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .background(Color.white.opacity(0.1), in: Capsule())
                     }
                 }
 
@@ -4154,19 +4780,26 @@ struct NovelDetailView: View {
                         Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
                     }
                     .padding(14)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
 
                 HStack {
                     Text("Главы").font(.title3.bold())
                     Spacer()
+                    if !vm.chapters.isEmpty { downloadMenu }
                     if vm.chapters.count > 1 {
                         Button { withAnimation { reversed.toggle() } } label: {
                             Label(reversed ? "Сначала новые" : "Сначала старые", systemImage: "arrow.up.arrow.down")
                                 .font(.footnote)
                         }
+                        .padding(.leading, 6)
                     }
+                }
+                if dl.total > 0 { downloadBanner }
+                if vm.offline {
+                    Text("Нет сети: показаны только скачанные главы.")
+                        .font(.footnote).foregroundStyle(Color.orange)
                 }
                 if vm.isLoading { ProgressView() }
                 if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
@@ -4176,10 +4809,14 @@ struct NovelDetailView: View {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     let groups = reversed ? Array(vm.volumeGroups.reversed()) : vm.volumeGroups
                     ForEach(Array(groups.enumerated()), id: \.offset) { _, g in
-                        Text("Том \(g.volume)")
-                            .font(.footnote.bold())
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 8)
+                        HStack {
+                            Text("Том \(g.volume)")
+                                .font(.footnote.bold())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            volumeButton(g.indices)
+                        }
+                        .padding(.top, 8)
                         ForEach(reversed ? Array(g.indices.reversed()) : g.indices, id: \.self) { i in
                             row(i)
                         }
@@ -4204,6 +4841,12 @@ struct NovelDetailView: View {
         .task { await vm.load() }
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
+        .confirmationDialog("Удалить загруженные главы этого тайтла?", isPresented: $confirmRemove, titleVisibility: .visible) {
+            Button("Удалить", role: .destructive) {
+                store.remove(novel: vm.anime.id)
+                if vm.offline { vm.chapters = [] }
+            }
+        }
         .fullScreenCover(item: $reader) { r in
             NovelReaderView(novel: vm.anime, chapters: vm.chapters, start: r.id)
         }
@@ -4224,6 +4867,7 @@ struct NovelReaderView: View {
     @AppStorage("reader.serif") private var serif = true
     @AppStorage("reader.lh") private var lineGap = 0.4
     @State private var chromeHidden = false
+    @ObservedObject private var store = OfflineStore.shared
     @Environment(\.dismiss) private var dismiss
 
     init(novel: Anime, chapters: [NovelChapter], start: Int) {
@@ -4355,6 +4999,20 @@ struct NovelReaderView: View {
                         Button { fontSize = min(fontSize + 2, 34) } label: { Label("Крупнее", systemImage: "textformat.size.larger") }
                         Button { fontSize = max(fontSize - 2, 12) } label: { Label("Мельче", systemImage: "textformat.size.smaller") }
                         Toggle("Шрифт с засечками", isOn: $serif)
+                        if chapters.indices.contains(index) {
+                            let cur = chapters[index]
+                            if store.isDownloaded(novel.id, cur.id) {
+                                Button(role: .destructive) { store.remove(novel: novel.id, chapter: cur.id) } label: {
+                                    Label("Удалить загрузку", systemImage: "trash")
+                                }
+                            } else {
+                                Button {
+                                    DownloadManager.shared.enqueue(novel: novel, all: chapters, targets: [cur])
+                                } label: {
+                                    Label("Скачать главу", systemImage: "arrow.down.circle")
+                                }
+                            }
+                        }
                         Picker("Интервал", selection: $lineGap) {
                             Text("Плотный").tag(0.25)
                             Text("Обычный").tag(0.4)
@@ -4382,10 +5040,19 @@ struct NovelReaderView: View {
         blocks = []
         ReadStore.shared.mark(novel.id, ch.id)
         HistoryStore.novels.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        if let local = store.blocks(novel: novel.id, chapter: ch.id) {
+            blocks = local
+            loading = false
+            return
+        }
         do {
             let result = try await NovelService.content(slug: slug, chapter: ch)
             if Task.isCancelled { return }
             blocks = result
+            if !result.isEmpty, Settings.bool("off.prefetch", false), index + 1 < chapters.count {
+                DownloadManager.shared.enqueue(novel: novel, all: chapters,
+                                               targets: Array(chapters[(index + 1)..<min(index + 4, chapters.count)]))
+            }
             if result.isEmpty {
                 error = "Текст главы пуст или недоступен."
                 debug = await AnimelibAPI.shared.rawText(NovelService.chapterPath(slug: slug),
