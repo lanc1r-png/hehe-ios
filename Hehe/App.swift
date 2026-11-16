@@ -821,9 +821,42 @@ struct CatalogView: View {
     @State private var showFilters = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
+    private var filterButton: some View {
+        Button { showFilters = true } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.headline)
+                .frame(width: 42, height: 42)
+                .background(vm.filter.activeCount > 0 ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Circle())
+                .overlay(alignment: .topTrailing) {
+                    if vm.filter.activeCount > 0 {
+                        Text("\(vm.filter.activeCount)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(4)
+                            .background(Color.pink, in: Circle())
+                            .offset(x: 4, y: -4)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("Hehe")
+                            .font(.system(size: 32, weight: .heavy, design: .rounded))
+                        Spacer()
+                        filterButton
+                    }
+                    SearchBar(text: $vm.filter.query) { Task { await vm.reload() } }
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 4)
+                .padding(.bottom, 10)
+
                 if let e = vm.error, vm.items.isEmpty {
                     VStack(spacing: 12) {
                         Text(e).multilineTextAlignment(.center).foregroundStyle(.secondary)
@@ -845,37 +878,17 @@ struct CatalogView: View {
                     }
                 }
                 .padding(.horizontal, 14)
-                .padding(.top, 8)
                 if vm.isLoading { ProgressView().padding() }
             }
             .scrollDismissesKeyboard(.immediately)
             .refreshable { await vm.reload() }
             .background(AppBackground())
-            .navigationTitle("Hehe")
-            .searchable(text: $vm.filter.query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Поиск по названию")
-            .onSubmit(of: .search) { Task { await vm.reload() } }
-            .onChange(of: vm.filter.query) { q in
-                if q.isEmpty { Task { await vm.reload() } }
+            .overlay(alignment: .top) {
+                // размытие только под строкой состояния, остальная шапка уезжает вместе со списком
+                Color.clear.frame(height: 0)
+                    .background(.ultraThinMaterial, ignoresSafeAreaEdges: .top)
             }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showFilters = true } label: {
-                        Image(systemName: vm.filter.activeCount > 0
-                              ? "line.3.horizontal.decrease.circle.fill"
-                              : "line.3.horizontal.decrease.circle")
-                            .overlay(alignment: .topTrailing) {
-                                if vm.filter.activeCount > 0 {
-                                    Text("\(vm.filter.activeCount)")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .padding(3)
-                                        .background(Color.pink, in: Circle())
-                                        .foregroundStyle(.white)
-                                        .offset(x: 8, y: -8)
-                                }
-                            }
-                    }
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
@@ -938,6 +951,7 @@ final class DetailViewModel: ObservableObject {
 struct DetailView: View {
     @StateObject private var vm: DetailViewModel
     @State private var selected: EpisodeShort?
+    @ObservedObject private var progress = ProgressStore.shared
     @State private var expanded = false
     @ObservedObject private var favorites = FavoritesStore.shared
 
@@ -1025,12 +1039,14 @@ struct DetailView: View {
                 }
                 LazyVStack(spacing: 8) {
                     ForEach(vm.episodes) { ep in
+                        let pr = progress.get(ep.id)
                         Button { selected = ep } label: {
                             HStack(spacing: 12) {
                                 Text(ep.number ?? "–")
                                     .font(.subheadline.bold())
+                                    .foregroundStyle(pr != nil ? Color.secondary : Color.primary)
                                     .frame(width: 38, height: 38)
-                                    .background(Theme.accent.opacity(0.28), in: Circle())
+                                    .background(pr != nil ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text((ep.name?.isEmpty == false ? ep.name! : "Серия \(ep.number ?? "")"))
                                         .font(.subheadline)
@@ -1039,9 +1055,18 @@ struct DetailView: View {
                                     if let s = ep.season, s != "1" {
                                         Text("Сезон \(s)").font(.caption2).foregroundStyle(.secondary)
                                     }
+                                    if let pr = pr {
+                                        Text(pr.finished ? "Просмотрено"
+                                             : pr.position > 5 ? "Остановились на \(formatTime(pr.position))"
+                                             : "Открывали")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
+                                .foregroundStyle(pr != nil ? Color.secondary : Color.primary)
                                 Spacer()
-                                Image(systemName: "play.fill").foregroundStyle(Theme.accent)
+                                Image(systemName: (pr?.finished ?? false) ? "checkmark.circle.fill" : "play.fill")
+                                    .foregroundStyle(pr != nil ? Color.gray : Theme.accent)
                             }
                             .padding(10)
                             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -1070,15 +1095,64 @@ struct DetailView: View {
     }
 }
 
+// MARK: - Прогресс просмотра
+struct WatchProgress: Codable {
+    var position: Double
+    var duration: Double
+    var updated: Date
+    var finished: Bool { duration > 0 && position / duration > 0.92 }
+}
+
+@MainActor
+final class ProgressStore: ObservableObject {
+    static let shared = ProgressStore()
+    @Published private(set) var items: [String: WatchProgress] = [:]
+    private let key = "progress.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([String: WatchProgress].self, from: d) {
+            items = v
+        }
+    }
+
+    func get(_ id: Int) -> WatchProgress? { items[String(id)] }
+    func position(_ id: Int) -> Double { items[String(id)]?.position ?? 0 }
+
+    func opened(_ id: Int) {
+        if items[String(id)] == nil {
+            items[String(id)] = WatchProgress(position: 0, duration: 0, updated: Date())
+            save()
+        }
+    }
+
+    func update(_ id: Int, position: Double, duration: Double) {
+        items[String(id)] = WatchProgress(position: position, duration: duration, updated: Date())
+        save()
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+func formatTime(_ t: Double) -> String {
+    let s = Int(t)
+    let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%02d:%02d", m, sec)
+}
+
 // MARK: - Kodik (прямое получение потока)
 enum KodikError: LocalizedError {
     case page, params, noLinks, decode
+    case server(String)
     var errorDescription: String? {
         switch self {
         case .page: return "не открылась страница плеера"
         case .params: return "не найдены параметры плеера"
         case .noLinks: return "плеер не вернул ссылки на видео"
         case .decode: return "не удалось расшифровать ссылку"
+        case .server(let t): return "ответ Kodik: " + t
         }
     }
 }
@@ -1147,7 +1221,10 @@ enum Kodik {
         req.setValue(ua, forHTTPHeaderField: "User-Agent")
         let (data, _) = try await URLSession.shared.data(for: req)
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let links = obj["links"] as? [String: Any] else { throw KodikError.noLinks }
+              let links = obj["links"] as? [String: Any] else {
+            let t = String(data: data.prefix(140), encoding: .utf8) ?? ""
+            throw KodikError.server(t)
+        }
 
         var result: [(Int, URL)] = []
         for (q, v) in links {
@@ -1192,15 +1269,43 @@ enum Kodik {
 /// так же, как это делает сам сайт.
 struct WebPlayerView: UIViewRepresentable {
     let url: URL
+    var onStream: ((URL) -> Void)? = nil
 
-    final class Coordinator { var loaded: URL? }
+    final class Coordinator: NSObject, WKScriptMessageHandler {
+        var loaded: URL?
+        var onStream: ((URL) -> Void)?
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard let t = m.body as? String, t.hasPrefix("http"), let u = URL(string: t) else { return }
+            DispatchQueue.main.async { self.onStream?(u) }
+        }
+    }
     func makeCoordinator() -> Coordinator { Coordinator() }
+
+    static let sniffer = """
+    (function(){
+      if (window.__heheSniff) return; window.__heheSniff = true;
+      var sent = {};
+      setInterval(function(){
+        var vs = document.getElementsByTagName('video');
+        for (var i = 0; i < vs.length; i++) {
+          var u = vs[i].currentSrc || vs[i].src;
+          if (u && u.indexOf('http') === 0 && !sent[u]) {
+            sent[u] = 1;
+            try { window.webkit.messageHandlers.hehe.postMessage(u); } catch (e) {}
+          }
+        }
+      }, 700);
+    })();
+    """
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         cfg.allowsInlineMediaPlayback = true
+        cfg.userContentController.add(context.coordinator, name: "hehe")
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Self.sniffer, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         let v = WKWebView(frame: .zero, configuration: cfg)
-        v.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        v.customUserAgent = Kodik.ua
         v.isOpaque = false
         v.backgroundColor = .black
         v.scrollView.isScrollEnabled = false
@@ -1208,6 +1313,7 @@ struct WebPlayerView: UIViewRepresentable {
     }
 
     func updateUIView(_ v: WKWebView, context: Context) {
+        context.coordinator.onStream = onStream
         guard context.coordinator.loaded != url else { return }
         context.coordinator.loaded = url
         let html = """
@@ -1236,6 +1342,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var error: String?
     @Published var isLoading = true
     @Published var debug = ""
+    var autoNative = true
+    var episodeID = 0
+    var lastPosition: Double = 0
+    private var timeObserver: Any?
+    private var observedPlayer: AVPlayer?
 
     var usesWeb: Bool {
         guard let v = current, v.isWeb else { return false }
@@ -1244,6 +1355,9 @@ final class PlayerViewModel: ObservableObject {
 
     func load(episodeID: Int) async {
         isLoading = true; error = nil
+        self.episodeID = episodeID
+        ProgressStore.shared.opened(episodeID)
+        lastPosition = ProgressStore.shared.position(episodeID)
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
             if let first = variants.first { select(first) }
@@ -1258,12 +1372,15 @@ final class PlayerViewModel: ObservableObject {
     func select(_ v: PlayableVariant) {
         note = nil
         showWeb = false
+        autoNative = true
         qualities = []
         current = v
         if v.kodik {
+            savePosition(); detachObserver()
             player?.pause(); player = nil
             Task { await playKodik(v) }
         } else if v.isWeb {
+            savePosition(); detachObserver()
             player?.pause(); player = nil
             showWeb = true
         } else {
@@ -1281,7 +1398,7 @@ final class PlayerViewModel: ObservableObject {
             if let best = qualities.first { pickQuality(best) }
         } catch {
             guard current?.id == v.id else { return }
-            note = "Прямой поток не получен (\(error.localizedDescription)). Показан веб-плеер."
+            note = "Прямой поток не получен (\(error.localizedDescription)). Пробую получить его через веб-плеер."
             showWeb = true
         }
     }
@@ -1291,17 +1408,55 @@ final class PlayerViewModel: ObservableObject {
         startAV(q.url, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
     }
 
+    func forceWeb() { autoNative = false; showWeb = true; note = nil }
+
+    /// Веб-плеер Kodik отдал адрес потока: переключаемся на родной плеер iOS.
+    func webStream(_ u: URL) {
+        guard autoNative, showWeb, current?.kodik == true else { return }
+        showWeb = false
+        note = nil
+        startAV(u, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
+    }
+
     private func startAV(_ url: URL, headers: [String: String]) {
-        let time = player?.currentTime()
+        savePosition()
+        if let t = player?.currentTime(), t.isValid, t.seconds > 1 { lastPosition = t.seconds }
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let p = AVPlayer(playerItem: AVPlayerItem(asset: asset))
-        if let t = time, t.isValid, t.seconds > 1 { p.seek(to: t) }
+        if lastPosition > 1 { p.seek(to: CMTime(seconds: lastPosition, preferredTimescale: 600)) }
+        detachObserver()
         player?.pause()
         player = p
+        let id = episodeID
+        timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 5, preferredTimescale: 1), queue: .main) { [weak self, weak p] t in
+            let dur = p?.currentItem?.duration.seconds ?? 0
+            let pos = t.seconds
+            Task { @MainActor in
+                guard pos.isFinite, pos > 1 else { return }
+                self?.lastPosition = pos
+                ProgressStore.shared.update(id, position: pos, duration: dur.isFinite ? dur : 0)
+            }
+        }
+        observedPlayer = p
         p.play()
     }
 
-    func stop() { player?.pause(); player = nil }
+    private func detachObserver() {
+        if let o = timeObserver, let p = observedPlayer { p.removeTimeObserver(o) }
+        timeObserver = nil; observedPlayer = nil
+    }
+
+    private func savePosition() {
+        guard let p = player else { return }
+        let pos = p.currentTime().seconds
+        let dur = p.currentItem?.duration.seconds ?? 0
+        if pos.isFinite, pos > 1, episodeID != 0 {
+            lastPosition = pos
+            ProgressStore.shared.update(episodeID, position: pos, duration: dur.isFinite ? dur : 0)
+        }
+    }
+
+    func stop() { savePosition(); detachObserver(); player?.pause(); player = nil }
 }
 
 struct PlayerScreen: View {
@@ -1316,7 +1471,7 @@ struct PlayerScreen: View {
                 ZStack {
                     Color.black
                     if vm.usesWeb, let v = vm.current {
-                        WebPlayerView(url: v.url)
+                        WebPlayerView(url: v.url, onStream: v.kodik ? { vm.webStream($0) } : nil)
                     } else if let p = vm.player {
                         VideoPlayer(player: p)
                     } else if vm.isLoading || vm.isResolving {
@@ -1372,7 +1527,7 @@ struct PlayerScreen: View {
                         }
                         if let v = vm.current, v.isWeb {
                             if v.kodik && !vm.showWeb {
-                                Button("Показать веб-плеер вместо прямого") { vm.showWeb = true }
+                                Button("Показать веб-плеер вместо прямого") { vm.forceWeb() }
                                     .font(.footnote)
                             }
                             Link(destination: v.url) {
