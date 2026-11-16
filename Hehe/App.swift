@@ -1218,17 +1218,19 @@ enum BackupManager {
     }
 
     private static func writeToFolder(_ d: Data) {
-        guard let dir = resolveFolder() else { return }
-        let ok = dir.startAccessingSecurityScopedResource()
-        defer { if ok { dir.stopAccessingSecurityScopedResource() } }
-        let target = dir.appendingPathComponent("Yume-backup.plist")
+        guard let target = resolveFolder() else { return }
+        let ok = target.startAccessingSecurityScopedResource()
+        defer { if ok { target.stopAccessingSecurityScopedResource() } }
         var err: NSError?
         var wrote = false
         NSFileCoordinator().coordinate(writingItemAt: target, options: .forReplacing, error: &err) { u in
-            wrote = (try? d.write(to: u, options: .atomic)) != nil
+            wrote = (try? d.write(to: u)) != nil
         }
+        UserDefaults.standard.set(!wrote, forKey: "backup.folder.fail")
         if wrote { UserDefaults.standard.set(Date(), forKey: "backup.folder.date") }
     }
+
+    static var lastFolderFailed: Bool { UserDefaults.standard.bool(forKey: "backup.folder.fail") }
 
     /// Пишет копию в папку приложения и, если выбрана, в папку пользователя (iCloud Drive).
     @discardableResult
@@ -1258,6 +1260,21 @@ enum BackupManager {
             n += 1
         }
         return n
+    }
+}
+
+struct BackupDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.propertyList] }
+    var data: Data
+
+    init(data: Data) { self.data = data }
+
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
 
@@ -1434,7 +1451,7 @@ struct SettingsView: View {
     @State private var info: String?
     @State private var shareItem: ShareItem?
     @State private var showImporter = false
-    @State private var importMode = "restore"
+    @State private var showExporter = false
     @State private var backupInfo = ""
 
     private let presets: [(String, String)] = [
@@ -1653,52 +1670,59 @@ struct SettingsView: View {
                     }
 
                     card("Резервная копия") {
-                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Выбери папку в iCloud Drive: копия будет обновляться сама при каждом сворачивании приложения и переживёт даже удаление Yume.")
+                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Один раз выбери место в iCloud Drive: файл будет обновляться сам при каждом сворачивании приложения и переживёт даже удаление Yume.")
                             .font(.caption).foregroundStyle(.secondary)
-                        Button { importMode = "folder"; showImporter = true } label: {
-                            Label(BackupManager.folderName.map { "iCloud-папка: \($0)" } ?? "Выбрать папку в iCloud Drive", systemImage: "icloud")
+                        Button { showExporter = true } label: {
+                            Label(BackupManager.folderName == nil ? "Выбрать место в iCloud Drive" : "Файл копии: \(BackupManager.folderName ?? "") (сменить)",
+                                  systemImage: "icloud")
+                        }
+                        .fileExporter(isPresented: $showExporter,
+                                      document: BackupDocument(data: BackupManager.data() ?? Data()),
+                                      contentType: .propertyList,
+                                      defaultFilename: "Yume-backup") { result in
+                            guard case .success(let url) = result else { return }
+                            if BackupManager.setFolder(url) {
+                                backupInfo = "Готово: копия будет обновляться сама."
+                                Haptics.success()
+                            } else {
+                                backupInfo = "Не удалось привязать файл. Попробуй выбрать другое место."
+                            }
                         }
                         if BackupManager.folderName != nil {
                             if let d = BackupManager.lastFolderWrite {
-                                Text("Последняя копия в папке: \(d.formatted(date: .abbreviated, time: .shortened))")
+                                Text("Последнее обновление в iCloud: \(d.formatted(date: .abbreviated, time: .shortened))")
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
-                            Button("Отключить папку", role: .destructive) {
-                                BackupManager.clearFolder(); backupInfo = "Автокопия в папку отключена."
+                            if BackupManager.lastFolderFailed {
+                                Text("Последняя запись не удалась. Выбери место заново.")
+                                    .font(.caption2).foregroundStyle(.red)
+                            }
+                            Button("Отключить автокопию", role: .destructive) {
+                                BackupManager.clearFolder(); backupInfo = "Автокопия в iCloud отключена."
                             }
                         }
                         Button {
                             if let u = BackupManager.writeAuto() { shareItem = ShareItem(url: u) }
                         } label: {
-                            Label("Сохранить копию в «Файлы» или отправить", systemImage: "square.and.arrow.up")
+                            Label("Отправить копию (Telegram, Файлы…)", systemImage: "square.and.arrow.up")
                         }
-                        Button { importMode = "restore"; showImporter = true } label: {
+                        .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
+                        Button { showImporter = true } label: {
                             Label("Восстановить из копии", systemImage: "arrow.down.doc")
+                        }
+                        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.propertyList, .data]) { result in
+                            guard case .success(let url) = result else { return }
+                            let access = url.startAccessingSecurityScopedResource()
+                            defer { if access { url.stopAccessingSecurityScopedResource() } }
+                            if let d = try? Data(contentsOf: url), let n = BackupManager.restore(d) {
+                                backupInfo = "Восстановлено записей: \(n). Закрой приложение полностью и открой заново."
+                                Haptics.success()
+                            } else {
+                                backupInfo = "Не удалось прочитать файл копии."
+                            }
                         }
                         if !backupInfo.isEmpty {
                             Text(backupInfo).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
-                    .fileImporter(isPresented: $showImporter,
-                                  allowedContentTypes: importMode == "folder" ? [.folder] : [.propertyList, .data]) { result in
-                        guard case .success(let url) = result else { return }
-                        if importMode == "folder" {
-                            if BackupManager.setFolder(url) {
-                                backupInfo = "Папка выбрана, первая копия записана."
-                                Haptics.success()
-                            } else {
-                                backupInfo = "Не удалось записать в эту папку. Выбери другую."
-                            }
-                            return
-                        }
-                        let access = url.startAccessingSecurityScopedResource()
-                        defer { if access { url.stopAccessingSecurityScopedResource() } }
-                        if let d = try? Data(contentsOf: url), let n = BackupManager.restore(d) {
-                            backupInfo = "Восстановлено записей: \(n). Закрой приложение полностью и открой заново."
-                            Haptics.success()
-                        } else {
-                            backupInfo = "Не удалось прочитать файл копии."
                         }
                     }
 
@@ -3324,7 +3348,10 @@ final class PlayerViewModel: ObservableObject {
             showWeb = true
         } else if !v.options.isEmpty {
             qualities = v.options
-            let q = v.options.first(where: { $0.title == lastQualityTitle }) ?? v.options[0]
+            // Сначала не выше 1080p: 2160p часто в формате, который iPhone не показывает (звук есть, картинки нет).
+            let q = v.options.first(where: { $0.title == lastQualityTitle })
+                ?? v.options.first(where: { (Int($0.title.dropLast()) ?? 0) <= 1080 })
+                ?? v.options[0]
             pickQuality(q)
         } else {
             startAV(v.url, headers: AnimelibAPI.shared.playbackHeaders)
@@ -3385,7 +3412,11 @@ final class PlayerViewModel: ObservableObject {
 
     private func itemStatus(_ item: AVPlayerItem) {
         guard item === player?.currentItem, attemptIndex < attempts.count else { return }
-        if item.status == .readyToPlay { playbackError = nil; return }
+        if item.status == .readyToPlay {
+            playbackError = nil
+            checkVideo(item)
+            return
+        }
         guard item.status == .failed else { return }
         let code = item.errorLog()?.events.last?.errorStatusCode ?? 0
         let msg = item.error?.localizedDescription ?? "неизвестная ошибка"
@@ -3399,6 +3430,26 @@ final class PlayerViewModel: ObservableObject {
             for l in attemptLog where !seen.contains(l) { seen.append(l) }
             playbackError = "Видео не открылось.\n" + seen.joined(separator: "\n")
         }
+    }
+
+    /// Звук идёт, а картинки нет (формат не поддерживается): переключаемся на качество ниже.
+    private func checkVideo(_ item: AVPlayerItem) {
+        Task { @MainActor [weak self, weak item] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, let item, item === self.player?.currentItem,
+                  item.status == .readyToPlay, item.presentationSize == .zero else { return }
+            self.lowerQuality()
+        }
+    }
+
+    private func lowerQuality() {
+        guard let i = qualities.firstIndex(where: { $0.id == currentQuality }), i + 1 < qualities.count else {
+            playbackError = "Звук есть, но видео не показывается: этот формат не поддерживается устройством. Выбери другое качество или озвучку."
+            return
+        }
+        let next = qualities[i + 1]
+        note = "\(qualities[i].title) не показывает картинку на этом устройстве, включил \(next.title)."
+        pickQuality(next)
     }
 
     /// Веб-плеер Kodik просит весь экран: открываем родной плеер с тем же потоком и временем.
@@ -3692,14 +3743,16 @@ struct PlayerScreen: View {
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
                 FullscreenPlayer(player: vm.fsPlayer).ignoresSafeArea()
-                Button { vm.closeNative() } label: {
-                    Image(systemName: "xmark")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(.ultraThinMaterial, in: Circle())
+                if #unavailable(iOS 26) {
+                    Button { vm.closeNative() } label: {
+                        Image(systemName: "xmark")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                            .frame(width: 40, height: 40)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .padding(14)
                 }
-                .padding(14)
             }
         }
         .onDisappear { vm.stop() }
