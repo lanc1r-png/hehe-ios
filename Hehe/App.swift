@@ -415,6 +415,8 @@ struct PlayableVariant: Identifiable, Hashable {
     let subtitle: URL?
     var isWeb = false
     var kodik = false
+    var player = ""
+    var options: [PlayableVariant] = []
 }
 
 struct FilterOptions {
@@ -695,41 +697,88 @@ actor AnimelibAPI {
         try await get("/episodes/\(id)", as: Envelope<EpisodeDetail>.self).data
     }
 
+    private(set) var variantNote = ""
+
     private func videoServers() async throws -> [VideoServer] {
-        if let c = cachedServers { return c }
+        if let c = cachedServers, !c.isEmpty { return c }
         let q = [URLQueryItem(name: "fields[]", value: "videoServers")]
-        let c = try await get("/constants", query: q, as: Envelope<Constants>.self).data
-        let s = c.videoServers ?? []
-        cachedServers = s
-        return s
+        let data = try await rawData("/constants", query: q)
+        guard let root = J.obj(data) as? [String: Any] else { return [] }
+        let d = (root["data"] as? [String: Any]) ?? root
+        let arr = (d["videoServers"] as? [[String: Any]]) ?? []
+        let list = arr.compactMap { e -> VideoServer? in
+            guard let u = J.str(e["url"]) else { return nil }
+            return VideoServer(id: J.str(e["id"]), label: J.str(e["label"]), url: u)
+        }
+        if !list.isEmpty { cachedServers = list }
+        return list
     }
 
     func variants(episodeID: Int) async throws -> [PlayableVariant] {
-        async let detailTask = episodeDetail(id: episodeID)
+        let token = Keychain.get("lib.token")
+        async let dataTask = rawData("/episodes/\(episodeID)", token: token)
         async let serversTask = videoServers()
-        let detail = try await detailTask
-        let base: String? = (try? await serversTask)?.first?.url
+        let data = try await dataTask
+        let servers = (try? await serversTask) ?? []
+        let base: String? = (servers.first { ($0.id ?? "").lowercased().contains("main") } ?? servers.first)?.url
+
+        guard let root = J.obj(data) as? [String: Any] else { throw APIError.badURL }
+        let d = (root["data"] as? [String: Any]) ?? root
+        let players = (d["players"] as? [[String: Any]]) ?? []
 
         var native: [PlayableVariant] = []
         var web: [PlayableVariant] = []
-        for p in detail.players ?? [] {
-            if p.isNative {
+        var seen: [String: Int] = [:]
+        for p in players {
+            let name = J.str(p["player"]) ?? ""
+            seen[name, default: 0] += 1
+            let team = J.str((p["team"] as? [String: Any])?["name"]) ?? "—"
+            let tt = p["translation_type"] as? [String: Any]
+            let kind = J.str(tt?["label"]) ?? J.str(tt?["title"]) ?? J.str(tt?["name"]) ?? ""
+            let label = kind.isEmpty ? team : "\(team) (\(kind))"
+
+            if name.lowercased() == "animelib" {
                 guard let base = base else { continue }
-                let subURL: URL? = p.subtitles?.first?.src.flatMap { URL(string: absolute($0, base: base)) }
-                let qualities = (p.video?.quality ?? []).sorted { ($0.quality ?? 0) > ($1.quality ?? 0) }
-                for q in qualities {
-                    guard let href = q.href, let url = URL(string: absolute(href, base: base)) else { continue }
-                    let qt = q.quality.map { "\($0)p" } ?? ""
-                    native.append(PlayableVariant(title: "\(p.label) · \(qt)", url: url, subtitle: subURL))
+                let video = p["video"] as? [String: Any]
+                let list = (video?["quality"] as? [[String: Any]]) ?? []
+                let sub: URL? = ((p["subtitles"] as? [[String: Any]])?.first).flatMap { J.str($0["src"]) }
+                    .flatMap { URL(string: absolute($0, base: base)) }
+                var options: [PlayableVariant] = []
+                for q in list.sorted(by: { (J.int($0["quality"]) ?? 0) > (J.int($1["quality"]) ?? 0) }) {
+                    guard let href = J.str(q["href"]), let url = URL(string: absolute(href, base: base)) else { continue }
+                    let h = J.int(q["quality"]).map { "\($0)p" } ?? "—"
+                    options.append(PlayableVariant(title: h, url: url, subtitle: sub))
                 }
-            } else if let src = p.src {
+                guard let best = options.first else { continue }
+                var v = PlayableVariant(title: label, url: best.url, subtitle: sub)
+                v.player = "Animelib"
+                v.options = options
+                native.append(v)
+            } else if let src = J.str(p["src"]) {
                 let full = src.hasPrefix("//") ? "https:" + src : src
                 if let url = URL(string: full) {
                     let isK = full.contains("kodik")
-                    web.append(PlayableVariant(title: "\(p.label) · \(p.player ?? "Плеер")", url: url, subtitle: nil, isWeb: true, kodik: isK))
+                    var v = PlayableVariant(title: "\(label) · \(name.isEmpty ? "Плеер" : name)", url: url,
+                                            subtitle: nil, isWeb: true, kodik: isK)
+                    v.player = name.isEmpty ? "Плеер" : name
+                    web.append(v)
                 }
             }
         }
+
+        var note = ""
+        if native.isEmpty {
+            let list = seen.sorted { $0.key < $1.key }.map { "\($0.key)×\($0.value)" }.joined(separator: ", ")
+            if seen.keys.contains(where: { $0.lowercased() == "animelib" }) {
+                note = base == nil
+                    ? "Animelib: адрес видео-сервера не получен (в ответе: \(list))"
+                    : "Animelib: в ответе есть плеер, но без ссылок на видео"
+            } else {
+                note = "Animelib: сервер не отдал этот плеер (в ответе: \(list.isEmpty ? "пусто" : list))"
+            }
+        }
+        variantNote = note
+
         let result = native + web
         if result.isEmpty { throw APIError.noVideo }
         return result
@@ -737,6 +786,7 @@ actor AnimelibAPI {
 
     private func absolute(_ href: String, base: String) -> String {
         if href.hasPrefix("http") { return href }
+        if href.hasPrefix("//") { return "https:" + href }
         let b = base.hasSuffix("/") ? String(base.dropLast()) : base
         let h = href.hasPrefix("/") ? href : "/" + href
         return b + "/" + h
@@ -2827,6 +2877,8 @@ final class PlayerViewModel: ObservableObject {
     @Published var error: String?
     @Published var isLoading = true
     @Published var debug = ""
+    @Published var sourceNote = ""
+    private var lastQualityTitle: String?
     var autoNative = true
     var onEnd: (() -> Void)?
     private var endObserver: NSObjectProtocol?
@@ -2846,13 +2898,14 @@ final class PlayerViewModel: ObservableObject {
         isLoading = true; error = nil
         detachObserver(); player?.pause(); player = nil
         variants = []; current = nil; qualities = []; currentQuality = nil
-        showWeb = false; note = nil; debug = ""
+        showWeb = false; note = nil; debug = ""; sourceNote = ""
         stopped = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
+            sourceNote = await AnimelibAPI.shared.variantNote
             if let first = variants.first { select(variants.first(where: { $0.title == prevTitle }) ?? first) }
         } catch {
             self.error = error.localizedDescription
@@ -2876,6 +2929,10 @@ final class PlayerViewModel: ObservableObject {
             savePosition(); detachObserver()
             player?.pause(); player = nil
             showWeb = true
+        } else if !v.options.isEmpty {
+            qualities = v.options
+            let q = v.options.first(where: { $0.title == lastQualityTitle }) ?? v.options[0]
+            pickQuality(q)
         } else {
             startAV(v.url, headers: AnimelibAPI.shared.playbackHeaders)
         }
@@ -2898,7 +2955,12 @@ final class PlayerViewModel: ObservableObject {
 
     func pickQuality(_ q: PlayableVariant) {
         currentQuality = q.id
-        startAV(q.url, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
+        lastQualityTitle = q.title
+        if current?.isWeb == true {
+            startAV(q.url, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
+        } else {
+            startAV(q.url, headers: AnimelibAPI.shared.playbackHeaders)
+        }
     }
 
     func forceWeb() { autoNative = false; showWeb = true; note = nil }
@@ -3022,14 +3084,28 @@ struct PlayerScreen: View {
         .opacity(ep == nil ? 0.35 : 1)
     }
 
+    private var sourceNames: [String] {
+        var out: [String] = []
+        for v in vm.variants {
+            let n = v.player.isEmpty ? "Другие" : v.player
+            if !out.contains(n) { out.append(n) }
+        }
+        return out
+    }
+
     private var controls: some View {
+        VStack(spacing: 4) {
         HStack(spacing: 8) {
             arrow("chevron.left", prevEpisode)
             Menu {
-                ForEach(vm.variants) { v in
-                    Button { vm.select(v) } label: {
-                        if v.id == vm.current?.id { Label(v.title, systemImage: "checkmark") }
-                        else { Text(v.title) }
+                ForEach(sourceNames, id: \.self) { n in
+                    Section(n) {
+                        ForEach(vm.variants.filter { ($0.player.isEmpty ? "Другие" : $0.player) == n }) { v in
+                            Button { vm.select(v) } label: {
+                                if v.id == vm.current?.id { Label(v.title, systemImage: "checkmark") }
+                                else { Text(v.title) }
+                            }
+                        }
                     }
                 }
                 if let v = vm.current, v.isWeb {
@@ -3057,6 +3133,15 @@ struct PlayerScreen: View {
                 }
             }
             arrow("chevron.right", nextEpisode)
+        }
+        if !vm.sourceNote.isEmpty {
+            Text(vm.sourceNote)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
     }
