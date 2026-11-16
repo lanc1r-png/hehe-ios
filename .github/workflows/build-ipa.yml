@@ -5,9 +5,18 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Add app icon
+        run: |
+          if [ -f icon-1024.png ]; then
+            D=Hehe/Assets.xcassets/AppIcon.appiconset
+            mkdir -p "$D"
+            cp icon-1024.png "$D/icon-1024.png"
+            printf '%s' '{"info":{"author":"xcode","version":1}}' > Hehe/Assets.xcassets/Contents.json
+            printf '%s' '{"images":[{"filename":"icon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$D/Contents.json"
+          fi
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
