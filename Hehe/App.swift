@@ -4247,11 +4247,11 @@ final class ReadStore: ObservableObject {
 }
 
 /// Ссылка на тайтл: для аниме ведёт на экран аниме, для ранобэ на экран ранобэ.
-struct TitleLink<Label: View>: View {
+struct TitleLink<Content: View>: View {
     let anime: Anime
-    let label: () -> Label
+    let label: () -> Content
 
-    init(anime: Anime, @ViewBuilder label: @escaping () -> Label) {
+    init(anime: Anime, @ViewBuilder label: @escaping () -> Content) {
         self.anime = anime
         self.label = label
     }
@@ -4267,11 +4267,11 @@ struct TitleLink<Label: View>: View {
         .contextMenu {
             let store = LibSite.current.isRanobe ? FavoritesStore.novels : FavoritesStore.shared
             Button { store.toggle(anime) } label: {
-                Label(store.contains(anime) ? "Убрать из избранного" : "В избранное",
+                SwiftUI.Label(store.contains(anime) ? "Убрать из избранного" : "В избранное",
                       systemImage: store.contains(anime) ? "heart.slash" : "heart")
             }
             if let u = titleURL(anime) {
-                ShareLink(item: u) { Label("Поделиться", systemImage: "square.and.arrow.up") }
+                ShareLink(item: u) { SwiftUI.Label("Поделиться", systemImage: "square.and.arrow.up") }
             }
         }
     }
