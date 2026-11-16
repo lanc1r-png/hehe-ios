@@ -417,6 +417,7 @@ struct PlayableVariant: Identifiable, Hashable {
     var kodik = false
     var player = ""
     var options: [PlayableVariant] = []
+    var alts: [URL] = []
 }
 
 struct FilterOptions {
@@ -720,7 +721,9 @@ actor AnimelibAPI {
         async let serversTask = videoServers()
         let data = try await dataTask
         let servers = (try? await serversTask) ?? []
-        let base: String? = (servers.first { ($0.id ?? "").lowercased().contains("main") } ?? servers.first)?.url
+        let mainServer = servers.first { ($0.id ?? "").lowercased().contains("main") } ?? servers.first
+        let base: String? = mainServer?.url
+        let otherBases: [String] = servers.compactMap { $0.url }.filter { $0 != base }
 
         guard let root = J.obj(data) as? [String: Any] else { throw APIError.badURL }
         let d = (root["data"] as? [String: Any]) ?? root
@@ -747,7 +750,9 @@ actor AnimelibAPI {
                 for q in list.sorted(by: { (J.int($0["quality"]) ?? 0) > (J.int($1["quality"]) ?? 0) }) {
                     guard let href = J.str(q["href"]), let url = URL(string: absolute(href, base: base)) else { continue }
                     let h = J.int(q["quality"]).map { "\($0)p" } ?? "—"
-                    options.append(PlayableVariant(title: h, url: url, subtitle: sub))
+                    var opt = PlayableVariant(title: h, url: url, subtitle: sub)
+                    opt.alts = otherBases.compactMap { URL(string: absolute(href, base: $0)) }
+                    options.append(opt)
                 }
                 guard let best = options.first else { continue }
                 var v = PlayableVariant(title: label, url: best.url, subtitle: sub)
@@ -1160,6 +1165,7 @@ struct SettingsView: View {
     @AppStorage("set.autoNative") private var autoNative = true
     @AppStorage("set.resume") private var resume = true
     @AppStorage("set.autoNext") private var autoNext = true
+    @AppStorage("set.kodikDirect") private var kodikDirect = false
     @AppStorage("set.theme") private var appTheme = "system"
     @AppStorage("set.platform") private var platform = "anime"
     @AppStorage("set.haptics") private var haptics = true
@@ -1339,10 +1345,11 @@ struct SettingsView: View {
                     }
 
                     card("Воспроизведение") {
-                        Toggle("Родной плеер iOS, если получится", isOn: $autoNative)
+                        Toggle("Весь экран в родном плеере iOS", isOn: $autoNative)
+                        Toggle("Kodik: сразу родной плеер, без веб-плеера", isOn: $kodikDirect)
                         Toggle("Продолжать с места остановки", isOn: $resume)
                         Toggle("Следующая серия сама после конца", isOn: $autoNext)
-                        Text("Если родной плеер выключен, серии всегда идут в веб-плеере Kodik.")
+                        Text("Kodik открывается в веб-плеере: выбери качество и нажми «на весь экран», тогда включится родной плеер iOS. Если выключить первый пункт, весь экран останется внутри веб-плеера.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .tint(Theme.accent)
@@ -2788,15 +2795,54 @@ enum Kodik {
 struct WebPlayerView: UIViewRepresentable {
     let url: URL
     var onStream: ((URL) -> Void)? = nil
+    var onFullscreen: ((Double, URL?) -> Void)? = nil
+    var interceptFS = false
 
     final class Coordinator: NSObject, WKScriptMessageHandler {
         var loaded: URL?
         var onStream: ((URL) -> Void)?
+        var onFullscreen: ((Double, URL?) -> Void)?
         func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
-            guard let t = m.body as? String, t.hasPrefix("http"), let u = URL(string: t) else { return }
+            guard let t = m.body as? String else { return }
+            if t.hasPrefix("FS|") {
+                let parts = t.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+                let time = parts.count > 1 ? (Double(parts[1]) ?? 0) : 0
+                var link: URL?
+                if parts.count > 2, parts[2].hasPrefix("http") { link = URL(string: String(parts[2])) }
+                DispatchQueue.main.async { self.onFullscreen?(time, link) }
+                return
+            }
+            guard t.hasPrefix("http"), let u = URL(string: t) else { return }
             DispatchQueue.main.async { self.onStream?(u) }
         }
     }
+
+    /// Кнопка «на весь экран» в веб-плеере вместо этого открывает родной плеер iOS.
+    static let fsHook = """
+    (function(){
+      if (window.__heheFS) return; window.__heheFS = true;
+      function fs(el){
+        try {
+          var v = (el && el.tagName === 'VIDEO') ? el : document.getElementsByTagName('video')[0];
+          var u = v ? (v.currentSrc || v.src || '') : '';
+          var t = v ? (v.currentTime || 0) : 0;
+          if (v) { try { v.pause(); } catch (e) {} }
+          window.webkit.messageHandlers.hehe.postMessage('FS|' + t + '|' + u);
+        } catch (e) {}
+      }
+      try {
+        HTMLVideoElement.prototype.webkitEnterFullscreen = function(){ fs(this); };
+        HTMLVideoElement.prototype.webkitEnterFullScreen = function(){ fs(this); };
+        var rf = function(){ fs(null); return Promise.resolve(); };
+        Element.prototype.requestFullscreen = rf;
+        Element.prototype.webkitRequestFullscreen = rf;
+        Element.prototype.webkitRequestFullScreen = rf;
+        Object.defineProperty(document, 'fullscreenEnabled', { get: function(){ return true; } });
+        Object.defineProperty(document, 'webkitFullscreenEnabled', { get: function(){ return true; } });
+      } catch (e) {}
+    })();
+    """
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
@@ -2839,6 +2885,10 @@ struct WebPlayerView: UIViewRepresentable {
         cfg.userContentController.add(context.coordinator, name: "hehe")
         cfg.userContentController.addUserScript(
             WKUserScript(source: Self.sniffer, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        if interceptFS {
+            cfg.userContentController.addUserScript(
+                WKUserScript(source: Self.fsHook, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         let v = WKWebView(frame: .zero, configuration: cfg)
         v.customUserAgent = Kodik.ua
         v.isOpaque = false
@@ -2849,6 +2899,7 @@ struct WebPlayerView: UIViewRepresentable {
 
     func updateUIView(_ v: WKWebView, context: Context) {
         context.coordinator.onStream = onStream
+        context.coordinator.onFullscreen = onFullscreen
         guard context.coordinator.loaded != url else { return }
         context.coordinator.loaded = url
         let html = """
@@ -2862,6 +2913,19 @@ struct WebPlayerView: UIViewRepresentable {
         """
         v.loadHTMLString(html, baseURL: URL(string: "https://animelib.org/"))
     }
+}
+
+struct FullscreenPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer?
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let c = AVPlayerViewController()
+        c.player = player
+        c.allowsPictureInPicturePlayback = true
+        return c
+    }
+
+    func updateUIViewController(_ c: AVPlayerViewController, context: Context) {}
 }
 
 @MainActor
@@ -2878,6 +2942,14 @@ final class PlayerViewModel: ObservableObject {
     @Published var isLoading = true
     @Published var debug = ""
     @Published var sourceNote = ""
+    @Published var playbackError: String?
+    @Published var showNative = false
+    var fsPlayer: AVPlayer?
+    private var lastWebStream: URL?
+    private var attempts: [(URL, [String: String])] = []
+    private var attemptIndex = 0
+    private var attemptLog: [String] = []
+    private var statusObs: NSKeyValueObservation?
     private var lastQualityTitle: String?
     var autoNative = true
     var onEnd: (() -> Void)?
@@ -2899,6 +2971,7 @@ final class PlayerViewModel: ObservableObject {
         detachObserver(); player?.pause(); player = nil
         variants = []; current = nil; qualities = []; currentQuality = nil
         showWeb = false; note = nil; debug = ""; sourceNote = ""
+        playbackError = nil; lastWebStream = nil; statusObs = nil
         stopped = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
@@ -2924,7 +2997,8 @@ final class PlayerViewModel: ObservableObject {
         if v.kodik {
             savePosition(); detachObserver()
             player?.pause(); player = nil
-            if autoNative { Task { await playKodik(v) } } else { showWeb = true }
+            // Сначала веб-плеер Kodik: качество выбирается в нём, а родной плеер открывается по кнопке «на весь экран».
+            if Settings.bool("set.kodikDirect", false) { Task { await playKodik(v) } } else { showWeb = true }
         } else if v.isWeb {
             savePosition(); detachObserver()
             player?.pause(); player = nil
@@ -2959,18 +3033,95 @@ final class PlayerViewModel: ObservableObject {
         if current?.isWeb == true {
             startAV(q.url, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
         } else {
-            startAV(q.url, headers: AnimelibAPI.shared.playbackHeaders)
+            playNative(q)
         }
+    }
+
+    /// Родной плеер Animelib: пробуем разные серверы и заголовки, пока видео не откроется.
+    private func playNative(_ q: PlayableVariant) {
+        let sets: [[String: String]] = [
+            AnimelibAPI.shared.playbackHeaders,
+            ["Referer": "https://animelib.org/", "Origin": "https://animelib.org"],
+            [:]
+        ]
+        attempts = []
+        for u in [q.url] + q.alts {
+            for h in sets { attempts.append((u, h)) }
+        }
+        attemptIndex = 0
+        attemptLog = []
+        playbackError = nil
+        runAttempt()
+    }
+
+    private func runAttempt() {
+        guard attemptIndex < attempts.count else { return }
+        let (u, h) = attempts[attemptIndex]
+        startAV(u, headers: h)
+        guard let item = player?.currentItem else { return }
+        statusObs = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            Task { @MainActor in self?.itemStatus(it) }
+        }
+    }
+
+    private func itemStatus(_ item: AVPlayerItem) {
+        guard item === player?.currentItem, attemptIndex < attempts.count else { return }
+        if item.status == .readyToPlay { playbackError = nil; return }
+        guard item.status == .failed else { return }
+        let code = item.errorLog()?.events.last?.errorStatusCode ?? 0
+        let msg = item.error?.localizedDescription ?? "неизвестная ошибка"
+        let host = attempts[attemptIndex].0.host ?? "?"
+        attemptLog.append("\(host): \(code > 0 ? "HTTP \(code)" : msg)")
+        attemptIndex += 1
+        if attemptIndex < attempts.count {
+            runAttempt()
+        } else {
+            var seen: [String] = []
+            for l in attemptLog where !seen.contains(l) { seen.append(l) }
+            playbackError = "Видео не открылось.\n" + seen.joined(separator: "\n")
+        }
+    }
+
+    /// Веб-плеер Kodik просит весь экран: открываем родной плеер с тем же потоком и временем.
+    func webFullscreen(time: Double, url: URL?) {
+        guard let stream = url ?? lastWebStream else {
+            note = "Видео ещё не запущено. Нажми ▶ в плеере, затем «на весь экран»."
+            return
+        }
+        let headers = ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua]
+        let asset = AVURLAsset(url: stream, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let p = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        if time > 1 { p.seek(to: CMTime(seconds: time, preferredTimescale: 600)) }
+        fsPlayer = p
+        showNative = true
+        Haptics.tap()
+        p.play()
+    }
+
+    /// Родной полноэкранный режим для уже играющего видео.
+    func openFullscreen() {
+        guard let p = player else { return }
+        fsPlayer = p
+        showNative = true
+        Haptics.tap()
+    }
+
+    func closeNative() {
+        if let p = fsPlayer {
+            let t = p.currentTime().seconds
+            let d = p.currentItem?.duration.seconds ?? 0
+            if t.isFinite, d.isFinite, d > 0 { ProgressStore.shared.update(episodeID, position: t, duration: d) }
+            if p !== player { p.pause() }
+        }
+        fsPlayer = nil
+        showNative = false
     }
 
     func forceWeb() { autoNative = false; showWeb = true; note = nil }
 
-    /// Веб-плеер Kodik отдал адрес потока: переключаемся на родной плеер iOS.
+    /// Веб-плеер Kodik отдал адрес потока: запоминаем его для полноэкранного режима.
     func webStream(_ u: URL) {
-        guard !stopped, autoNative, showWeb, current?.kodik == true else { return }
-        showWeb = false
-        note = "Играет в родном плеере (\(u.host ?? "kodik"))"
-        startAV(u, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
+        lastWebStream = u
     }
 
     private func startAV(_ url: URL, headers: [String: String]) {
@@ -3152,13 +3303,38 @@ struct PlayerScreen: View {
                 ZStack {
                     Color.black
                     if vm.usesWeb, let v = vm.current {
-                        WebPlayerView(url: v.url, onStream: v.kodik ? { vm.webStream($0) } : nil)
+                        WebPlayerView(url: v.url,
+                                      onStream: v.kodik ? { vm.webStream($0) } : nil,
+                                      onFullscreen: v.kodik ? { t, u in vm.webFullscreen(time: t, url: u) } : nil,
+                                      interceptFS: v.kodik && Settings.bool("set.autoNative", true))
                     } else if let p = vm.player {
                         VideoPlayer(player: p)
+                            .overlay(alignment: .topTrailing) {
+                                Button { vm.openFullscreen() } label: {
+                                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                        .font(.footnote.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .frame(width: 34, height: 34)
+                                        .background(.ultraThinMaterial, in: Circle())
+                                }
+                                .padding(8)
+                            }
                     } else if vm.isLoading || vm.isResolving {
                         ProgressView().tint(.white)
                     } else if let e = vm.error {
                         Text(e).foregroundStyle(.white).padding()
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if let e = vm.playbackError {
+                        Text(e)
+                            .font(.caption2)
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.leading)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.black.opacity(0.75))
+                            .textSelection(.enabled)
                     }
                 }
                 .aspectRatio(16/9, contentMode: .fit)
@@ -3192,6 +3368,20 @@ struct PlayerScreen: View {
             if let a = anime { HistoryStore.shared.record(anime: a, episode: current) }
             vm.onEnd = { go(nextEpisode) }
             await vm.load(episodeID: current.id)
+        }
+        .fullScreenCover(isPresented: $vm.showNative, onDismiss: { vm.closeNative() }) {
+            ZStack(alignment: .topLeading) {
+                Color.black.ignoresSafeArea()
+                FullscreenPlayer(player: vm.fsPlayer).ignoresSafeArea()
+                Button { vm.closeNative() } label: {
+                    Image(systemName: "xmark")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .padding(14)
+            }
         }
         .onDisappear { vm.stop() }
     }
