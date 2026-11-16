@@ -1729,7 +1729,7 @@ struct CommentItem: Identifiable {
     let replyCount: Int
     let replies: [CommentItem]
 
-    init?(_ d: [String: Any]) {
+    init?(_ d: [String: Any], extra: [CommentItem] = []) {
         guard let cid = J.int(d["id"]) else { return nil }
         id = cid
         text = J.text(d["comment"] ?? d["content"] ?? d["text"] ?? d["body"])
@@ -1744,10 +1744,49 @@ struct CommentItem: Identifiable {
         let rawReplies = (d["replies"] as? [[String: Any]])
             ?? (d["children"] as? [[String: Any]])
             ?? (d["comments"] as? [[String: Any]]) ?? []
-        let parsed = rawReplies.compactMap { CommentItem($0) }
+        let parsed = rawReplies.compactMap { CommentItem($0) } + extra
         replies = parsed
-        replyCount = J.int(d["comments_count"]) ?? J.int(d["replies_count"])
-            ?? J.int(d["children_count"]) ?? parsed.count
+        replyCount = max(parsed.count, J.int(d["comments_count"]) ?? J.int(d["replies_count"])
+            ?? J.int(d["children_count"]) ?? 0)
+    }
+}
+
+/// Ответ сервера может быть списком или объектом со вложенными массивами:
+/// собираем все комментарии, где бы они ни лежали, и выстраиваем ветки по parent_comment.
+enum CommentParser {
+    static func collect(_ v: Any, into out: inout [[String: Any]]) {
+        if let d = v as? [String: Any] {
+            if J.int(d["id"]) != nil, d["comment"] != nil { out.append(d); return }
+            for k in d.keys.sorted() { if let x = d[k] { collect(x, into: &out) } }
+        } else if let a = v as? [Any] {
+            for x in a { collect(x, into: &out) }
+        }
+    }
+
+    static func parse(_ root: Any) -> [CommentItem] {
+        var raw: [[String: Any]] = []
+        collect(root, into: &raw)
+        var seen = Set<Int>()
+        raw = raw.filter { d in
+            guard let id = J.int(d["id"]) else { return false }
+            return seen.insert(id).inserted
+        }
+        let ids = Set(raw.compactMap { J.int($0["id"]) })
+        var children: [Int: [[String: Any]]] = [:]
+        var tops: [[String: Any]] = []
+        for d in raw {
+            if let p = J.int(d["parent_comment"]), p != J.int(d["id"]), ids.contains(p) {
+                children[p, default: []].append(d)
+            } else {
+                tops.append(d)
+            }
+        }
+        func build(_ d: [String: Any], depth: Int) -> CommentItem? {
+            let id = J.int(d["id"]) ?? 0
+            let kids = depth < 6 ? (children[id] ?? []).compactMap { build($0, depth: depth + 1) } : []
+            return CommentItem(d, extra: kids)
+        }
+        return tops.compactMap { build($0, depth: 0) }
     }
 }
 
@@ -1780,17 +1819,15 @@ final class CommentsViewModel: ObservableObject {
         let attempts: [(String, [URLQueryItem])] = [
             ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page))]),
             ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page)),
-                           q("sort_by", "created_at"), q("sort_type", "desc")]),
-            ("/anime/\(slug)/comments", [q("page", String(page))])
+                           q("sort_by", "created_at"), q("sort_type", "desc")])
         ]
         var lastError: Error = APIError.badURL
         for (path, query) in attempts {
             do {
                 let data = try await AnimelibAPI.shared.rawData(path, query: query, token: AuthStore.shared.token)
-                guard let root = J.obj(data) as? [String: Any],
-                      let arr = root["data"] as? [[String: Any]] else { continue }
-                let list = arr.compactMap { CommentItem($0) }
-                let meta = root["meta"] as? [String: Any]
+                guard let root = J.obj(data) else { continue }
+                let list = CommentParser.parse(root)
+                let meta = (root as? [String: Any])?["meta"] as? [String: Any]
                 return (list, meta?["has_next_page"] as? Bool)
             } catch {
                 lastError = error
@@ -1830,9 +1867,8 @@ final class CommentsViewModel: ObservableObject {
         for key in ["parent_comment", "parent_id", "parent_comment_id"] {
             let query = [q("post_id", String(animeID)), q("post_type", "anime"), q(key, String(c.id))]
             if let data = try? await AnimelibAPI.shared.rawData("/comments", query: query, token: AuthStore.shared.token),
-               let root = J.obj(data) as? [String: Any],
-               let arr = root["data"] as? [[String: Any]] {
-                let list = arr.compactMap { CommentItem($0) }.filter { $0.id != c.id && !known.contains($0.id) }
+               let root = J.obj(data) {
+                let list = CommentParser.parse(root).filter { $0.id != c.id && !known.contains($0.id) }
                 if !list.isEmpty { repliesLoaded[c.id] = list; return }
             }
         }
