@@ -522,25 +522,43 @@ actor AnimelibAPI {
         return (r.data, hasNext)
     }
 
-    /// Все тайтлы одного автора.
+    private var authorParam: [String: String] = [:]
+
+    /// Все тайтлы одного автора. Имя параметра фильтра сайт нигде не описывает,
+    /// поэтому пробуем варианты и принимаем тот, что реально меняет выдачу.
     func byAuthor(_ id: Int, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
         let site = LibSite.current
-        func run(withSite: Bool) async throws -> (items: [Anime], hasNext: Bool) {
-            var q: [URLQueryItem] = [
-                .init(name: "page", value: String(page)),
-                .init(name: "sort_by", value: "rate_avg"),
-                .init(name: "sort_type", value: "desc"),
-                .init(name: "authors[]", value: String(id))
-            ]
-            if withSite { q.append(.init(name: "site_id[]", value: site.id)) }
-            let r = try await get(site.apiPath, query: q, as: Envelope<[Anime]>.self)
-            return (r.data, r.meta?.hasNextPage ?? !r.data.isEmpty)
+        func run(_ extra: [URLQueryItem]) async throws -> (items: [Anime], hasNext: Bool) {
+            for withSite in [true, false] {
+                var q: [URLQueryItem] = [
+                    .init(name: "page", value: String(page)),
+                    .init(name: "sort_by", value: "rate_avg"),
+                    .init(name: "sort_type", value: "desc")
+                ] + extra
+                if withSite { q.append(.init(name: "site_id[]", value: site.id)) }
+                do {
+                    let r = try await get(site.apiPath, query: q, as: Envelope<[Anime]>.self)
+                    return (r.data, r.meta?.hasNextPage ?? !r.data.isEmpty)
+                } catch APIError.http(let code, _) where (code == 422 || code == 400) && withSite {
+                    continue
+                }
+            }
+            throw APIError.badURL
         }
-        do {
-            return try await run(withSite: true)
-        } catch APIError.http(let code, _) where code == 422 {
-            return try await run(withSite: false)
+        if let known = authorParam[site.key] {
+            return try await run([.init(name: known, value: String(id))])
         }
+        let baseline = (try? await run([]))?.items.map { $0.id } ?? []
+        var tried: [String] = []
+        for name in ["authors[]", "author[]", "author", "people[]", "person[]", "authors", "artists[]", "creators[]"] {
+            tried.append(name)
+            guard let r = try? await run([.init(name: name, value: String(id))]) else { continue }
+            if !r.items.isEmpty && r.items.map({ $0.id }) != baseline {
+                authorParam[site.key] = name
+                return r
+            }
+        }
+        throw APIError.http(404, "Сайт не отфильтровал тайтлы по автору. Пробовал параметры: \(tried.joined(separator: ", "))")
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -2686,14 +2704,15 @@ final class CommentsViewModel: ObservableObject {
     @Published var sort: CommentSort = .new
     let animeID: Int
     let slug: String
-    let type: String
+    private(set) var types: [String]
+    var type: String { types.first ?? "anime" }
     private var page = 1
     private var finished = false
 
-    init(animeID: Int, slug: String, postType: String? = nil) {
+    init(animeID: Int, slug: String, postType: String? = nil, alternatives: [String] = []) {
         self.animeID = animeID
         self.slug = slug
-        self.type = postType ?? LibSite.current.postType
+        self.types = [postType ?? LibSite.current.postType] + alternatives
     }
 
     var sorted: [CommentItem] {
@@ -2720,11 +2739,9 @@ final class CommentsViewModel: ObservableObject {
     }
 
     private func fetch(page: Int) async throws -> ([CommentItem], Bool?) {
-        let attempts: [(String, [URLQueryItem])] = [
-            ("/comments", [q("post_id", String(animeID)), q("post_type", type), q("page", String(page))]),
-            ("/comments", [q("post_id", String(animeID)), q("post_type", type), q("page", String(page)),
-                           q("sort_by", "created_at"), q("sort_type", "desc")])
-        ]
+        let attempts: [(String, [URLQueryItem])] = types.map {
+            ("/comments", [q("post_id", String(animeID)), q("post_type", $0), q("page", String(page))])
+        }
         var lastError: Error = APIError.badURL
         for (path, query) in attempts {
             do {
@@ -2732,10 +2749,17 @@ final class CommentsViewModel: ObservableObject {
                 guard let root = J.obj(data) else { continue }
                 let list = CommentParser.parse(root)
                 let meta = (root as? [String: Any])?["meta"] as? [String: Any]
+                if let used = query.first(where: { $0.name == "post_type" })?.value, types.count > 1 {
+                    types = [used]
+                }
                 return (list, meta?["has_next_page"] as? Bool)
             } catch {
                 lastError = error
             }
+        }
+        if types.count > 1 {
+            throw NSError(domain: "comments", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "Сайт не принял ни один тип комментариев (\(types.joined(separator: ", "))). Последняя ошибка: \(lastError.localizedDescription)"])
         }
         throw lastError
     }
@@ -3017,7 +3041,9 @@ struct CommentsSection: View {
     @State private var showCompose = false
 
     init(postID: Int, postType: String) {
-        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: postID, slug: "", postType: postType))
+        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: postID, slug: "", postType: postType,
+                                                                alternatives: postType == "episode"
+                                                                    ? ["episodes", "anime_episode", "animeEpisode", "anime-episode", "video", "chapter"] : []))
     }
 
     var body: some View {
