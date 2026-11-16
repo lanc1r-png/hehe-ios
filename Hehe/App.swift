@@ -3,6 +3,7 @@ import AVKit
 import AVFoundation
 import Foundation
 import WebKit
+import Security
 
 // MARK: - Тема и общие элементы дизайна
 
@@ -447,13 +448,31 @@ actor AnimelibAPI {
         return list.filter { $0.id != nil && !$0.title.isEmpty }
     }
 
-    func rawText(_ path: String, query: [URLQueryItem] = []) async -> String {
+    func rawData(_ path: String, query: [URLQueryItem] = [], token: String? = nil) async throws -> Data {
+        guard var comps = URLComponents(string: apiURL + path) else { throw APIError.badURL }
+        if !query.isEmpty { comps.queryItems = query }
+        guard let url = comps.url else { throw APIError.badURL }
+        var req = URLRequest(url: url)
+        for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("5", forHTTPHeaderField: "Site-Id")
+        if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
+        let (data, resp) = try await session.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw APIError.http(http.statusCode, String(data: data.prefix(300), encoding: .utf8) ?? "")
+        }
+        return data
+    }
+
+    func rawText(_ path: String, query: [URLQueryItem] = [], token: String? = nil) async -> String {
         guard var comps = URLComponents(string: apiURL + path) else { return "bad url" }
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { return "bad url" }
         var req = URLRequest(url: url)
         for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("5", forHTTPHeaderField: "Site-Id")
+        if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         do {
             let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -643,6 +662,8 @@ struct RootView: View {
                 .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
             FavoritesView()
                 .tabItem { Label("Избранное", systemImage: "heart") }
+            ProfileView()
+                .tabItem { Label("Профиль", systemImage: "person.crop.circle") }
         }
         .tint(Theme.accent)
         .preferredColorScheme(.dark)
@@ -895,6 +916,7 @@ struct CatalogView: View {
                         .init(color: .clear, location: 1)
                     ], startPoint: .top, endPoint: .bottom))
                     .allowsHitTesting(false)
+                    .offset(y: -geo.safeAreaInsets.top)
             }
             }
             .background(AppBackground())
@@ -961,6 +983,7 @@ final class DetailViewModel: ObservableObject {
 struct DetailView: View {
     @StateObject private var vm: DetailViewModel
     @State private var selected: EpisodeShort?
+    @State private var showComments = false
     @ObservedObject private var progress = ProgressStore.shared
     @State private var expanded = false
     @ObservedObject private var favorites = FavoritesStore.shared
@@ -1041,6 +1064,18 @@ struct DetailView: View {
                     }
                 }
 
+                Button { showComments = true } label: {
+                    HStack {
+                        Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(Theme.accent)
+                        Text("Комментарии").font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .padding(14)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+
                 Text("Серии").font(.title3.bold())
                 if vm.isLoading { ProgressView() }
                 if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
@@ -1099,6 +1134,7 @@ struct DetailView: View {
             }
         }
         .task { await vm.load() }
+        .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .fullScreenCover(item: $selected) { ep in
             PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle)
         }
@@ -1578,6 +1614,701 @@ struct PlayerScreen: View {
         }
         .task { await vm.load(episodeID: episode.id) }
         .onDisappear { vm.stop() }
+    }
+}
+
+// MARK: - JSON-помощники (формат ответов сайта разный, разбираем мягко)
+enum J {
+    static func obj(_ d: Data) -> Any? { try? JSONSerialization.jsonObject(with: d) }
+
+    static func int(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let d = v as? Double { return Int(d) }
+        if let s = v as? String { return Int(s) }
+        return nil
+    }
+
+    static func str(_ v: Any?) -> String? {
+        if let s = v as? String, !s.isEmpty { return s }
+        return nil
+    }
+
+    static func text(_ v: Any?) -> String {
+        if let s = v as? String { return stripHTML(s) }
+        if let d = v as? [String: Any] {
+            let type = (d["type"] as? String) ?? ""
+            if type == "text" { return (d["text"] as? String) ?? "" }
+            let inner = ((d["content"] as? [Any]) ?? []).map { text($0) }.joined()
+            switch type {
+            case "paragraph", "heading": return inner + "\n"
+            case "hardBreak": return "\n"
+            default: return inner
+            }
+        }
+        if let a = v as? [Any] { return a.map { text($0) }.joined() }
+        return ""
+    }
+
+    static func stripHTML(_ s: String) -> String {
+        guard s.contains("<") else { return s }
+        var t = s.replacingOccurrences(of: "<br>", with: "\n")
+            .replacingOccurrences(of: "</p>", with: "\n")
+        t = t.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        return t.replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+    }
+
+    static func url(_ v: Any?) -> URL? {
+        var s: String?
+        if let x = v as? String { s = x }
+        else if let d = v as? [String: Any] {
+            s = str(d["url"]) ?? str(d["default"]) ?? str(d["md"]) ?? str(d["thumbnail"]) ?? str(d["src"])
+        }
+        guard var t = s else { return nil }
+        if t.hasPrefix("//") { t = "https:" + t }
+        if t.hasPrefix("/") { t = "https://cover.cdnlibs.org" + t }
+        return URL(string: t)
+    }
+
+    static func date(_ s: String?) -> String {
+        guard let s = s else { return "" }
+        let f1 = ISO8601DateFormatter()
+        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        if let d = f1.date(from: s) ?? f2.date(from: s) {
+            let out = DateFormatter()
+            out.locale = Locale(identifier: "ru_RU")
+            out.dateFormat = "d MMM yyyy"
+            return out.string(from: d)
+        }
+        return String(s.prefix(10))
+    }
+}
+
+// MARK: - Keychain (токен входа хранится в защищённом хранилище)
+enum Keychain {
+    static func set(_ value: String, key: String) {
+        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrAccount as String: key]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = Data(value.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    static func get(_ key: String) -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrAccount as String: key,
+                                kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func delete(_ key: String) {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrAccount as String: key]
+        SecItemDelete(q as CFDictionary)
+    }
+}
+
+// MARK: - Комментарии
+struct CommentItem: Identifiable {
+    let id: Int
+    let text: String
+    let username: String
+    let avatar: URL?
+    let up: Int
+    let down: Int
+    let date: String
+    let replyCount: Int
+    let replies: [CommentItem]
+
+    init?(_ d: [String: Any]) {
+        guard let cid = J.int(d["id"]) else { return nil }
+        id = cid
+        text = J.text(d["comment"] ?? d["content"] ?? d["text"] ?? d["body"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let u = (d["user"] as? [String: Any]) ?? [:]
+        username = J.str(u["username"]) ?? J.str(u["name"]) ?? "Аноним"
+        avatar = J.url(u["avatar"])
+        let votes = d["votes"] as? [String: Any]
+        up = J.int(votes?["up"]) ?? J.int(d["likes_count"]) ?? J.int(d["likes"]) ?? J.int(d["votes_up"]) ?? 0
+        down = J.int(votes?["down"]) ?? J.int(d["dislikes_count"]) ?? 0
+        date = J.date(J.str(d["created_at"]) ?? J.str(d["date"]))
+        let rawReplies = (d["replies"] as? [[String: Any]])
+            ?? (d["children"] as? [[String: Any]])
+            ?? (d["comments"] as? [[String: Any]]) ?? []
+        let parsed = rawReplies.compactMap { CommentItem($0) }
+        replies = parsed
+        replyCount = J.int(d["comments_count"]) ?? J.int(d["replies_count"])
+            ?? J.int(d["children_count"]) ?? parsed.count
+    }
+}
+
+@MainActor
+final class CommentsViewModel: ObservableObject {
+    @Published var items: [CommentItem] = []
+    @Published var isLoading = false
+    @Published var error: String?
+    @Published var debug = ""
+    @Published var loadingReplies: Set<Int> = []
+    @Published var repliesLoaded: [Int: [CommentItem]] = [:]
+
+    let animeID: Int
+    let slug: String
+    private var page = 1
+    private var finished = false
+
+    init(animeID: Int, slug: String) {
+        self.animeID = animeID
+        self.slug = slug
+    }
+
+    private func q(_ n: String, _ v: String) -> URLQueryItem { URLQueryItem(name: n, value: v) }
+
+    private func firstPageQuery() -> [URLQueryItem] {
+        [q("post_id", String(animeID)), q("post_type", "anime"), q("page", "1")]
+    }
+
+    private func fetch(page: Int) async throws -> ([CommentItem], Bool?) {
+        let attempts: [(String, [URLQueryItem])] = [
+            ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page))]),
+            ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page)),
+                           q("sort_by", "created_at"), q("sort_type", "desc")]),
+            ("/anime/\(slug)/comments", [q("page", String(page))])
+        ]
+        var lastError: Error = APIError.badURL
+        for (path, query) in attempts {
+            do {
+                let data = try await AnimelibAPI.shared.rawData(path, query: query, token: AuthStore.shared.token)
+                guard let root = J.obj(data) as? [String: Any],
+                      let arr = root["data"] as? [[String: Any]] else { continue }
+                let list = arr.compactMap { CommentItem($0) }
+                let meta = root["meta"] as? [String: Any]
+                return (list, meta?["has_next_page"] as? Bool)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    func loadMore() async {
+        guard !isLoading, !finished else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let (list, hasNext) = try await fetch(page: page)
+            let known = Set(items.map { $0.id })
+            let fresh = list.filter { !known.contains($0.id) }
+            items += fresh
+            page += 1
+            if fresh.isEmpty || hasNext == false { finished = true }
+            error = nil
+            if items.isEmpty {
+                debug = await AnimelibAPI.shared.rawText("/comments", query: firstPageQuery())
+            }
+        } catch {
+            finished = true
+            if items.isEmpty {
+                self.error = error.localizedDescription
+                debug = await AnimelibAPI.shared.rawText("/comments", query: firstPageQuery())
+            }
+        }
+    }
+
+    func loadReplies(_ c: CommentItem) async {
+        loadingReplies.insert(c.id)
+        defer { loadingReplies.remove(c.id) }
+        let known = Set(items.map { $0.id })
+        for key in ["parent_comment", "parent_id", "parent_comment_id"] {
+            let query = [q("post_id", String(animeID)), q("post_type", "anime"), q(key, String(c.id))]
+            if let data = try? await AnimelibAPI.shared.rawData("/comments", query: query, token: AuthStore.shared.token),
+               let root = J.obj(data) as? [String: Any],
+               let arr = root["data"] as? [[String: Any]] {
+                let list = arr.compactMap { CommentItem($0) }.filter { $0.id != c.id && !known.contains($0.id) }
+                if !list.isEmpty { repliesLoaded[c.id] = list; return }
+            }
+        }
+        repliesLoaded[c.id] = []
+    }
+}
+
+struct CommentRow: View {
+    let c: CommentItem
+    var depth = 0
+    @ObservedObject var vm: CommentsViewModel
+    @State private var expanded = false
+
+    private var children: [CommentItem] {
+        c.replies.isEmpty ? (vm.repliesLoaded[c.id] ?? []) : c.replies
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                RemoteImage(url: c.avatar)
+                    .frame(width: 38, height: 38)
+                    .clipShape(Circle())
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(c.username).font(.subheadline.bold())
+                        Text(c.date).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(c.text)
+                        .font(.subheadline)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 16) {
+                        Label("\(c.up)", systemImage: "hand.thumbsup").font(.caption)
+                        if c.down > 0 {
+                            Label("\(c.down)", systemImage: "hand.thumbsdown").font(.caption)
+                        }
+                        if c.replyCount > 0 {
+                            Button {
+                                expanded.toggle()
+                                if expanded && children.isEmpty { Task { await vm.loadReplies(c) } }
+                            } label: {
+                                Text(expanded ? "Скрыть ответы" : "Ответы (\(c.replyCount))")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(Theme.accent)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                }
+                Spacer(minLength: 0)
+            }
+            if expanded {
+                if vm.loadingReplies.contains(c.id) { ProgressView() }
+                ForEach(children) { r in
+                    CommentRow(c: r, depth: depth + 1, vm: vm)
+                }
+                .padding(.leading, depth < 2 ? 18 : 0)
+            }
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+struct CommentsView: View {
+    let anime: Anime
+    @StateObject private var vm: CommentsViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    init(anime: Anime) {
+        self.anime = anime
+        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: anime.id, slug: anime.slugUrl ?? String(anime.id)))
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(vm.items) { c in
+                        CommentRow(c: c, vm: vm)
+                            .onAppear {
+                                if c.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                            }
+                    }
+                    if vm.isLoading { ProgressView().padding() }
+                    if let e = vm.error {
+                        Text(e).font(.footnote).foregroundStyle(.red).padding(.top, 30)
+                    }
+                    if vm.items.isEmpty && !vm.isLoading {
+                        if vm.error == nil {
+                            Text("Комментариев пока нет").foregroundStyle(.secondary).padding(.top, 30)
+                        }
+                        if !vm.debug.isEmpty {
+                            Text(vm.debug)
+                                .font(.system(size: 9, design: .monospaced))
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(14)
+            }
+            .background(AppBackground())
+            .navigationTitle("Комментарии")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+            }
+            .task { await vm.loadMore() }
+        }
+    }
+}
+
+// MARK: - Вход через сайт и профиль
+struct ProfileUser {
+    let id: Int
+    let username: String
+    let avatar: URL?
+}
+
+@MainActor
+final class AuthStore: ObservableObject {
+    static let shared = AuthStore()
+    @Published var token: String?
+    @Published var user: ProfileUser?
+    @Published var error: String?
+
+    init() {
+        token = Keychain.get("lib.token")
+        if token != nil { Task { await refreshUser() } }
+    }
+
+    func signIn(access: String, refresh: String?) async {
+        token = access
+        Keychain.set(access, key: "lib.token")
+        if let r = refresh { Keychain.set(r, key: "lib.refresh") }
+        await refreshUser()
+    }
+
+    func signOut() {
+        token = nil
+        user = nil
+        Keychain.delete("lib.token")
+        Keychain.delete("lib.refresh")
+        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                                                modifiedSince: .distantPast) {}
+    }
+
+    func refreshUser() async {
+        guard let t = token else { return }
+        do {
+            let data = try await AnimelibAPI.shared.rawData("/auth/me", token: t)
+            guard let root = J.obj(data) as? [String: Any] else { throw APIError.badURL }
+            let d = (root["data"] as? [String: Any]) ?? root
+            guard let id = J.int(d["id"]) else { throw APIError.badURL }
+            user = ProfileUser(id: id,
+                               username: J.str(d["username"]) ?? J.str(d["name"]) ?? "Профиль",
+                               avatar: J.url(d["avatar"]))
+            error = nil
+        } catch {
+            if case APIError.http(let code, _) = error, code == 401 || code == 403 {
+                signOut()
+                self.error = "Сессия закончилась, войдите снова"
+            } else {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+}
+
+struct LoginWebView: UIViewRepresentable {
+    var onToken: (String, String?) -> Void
+
+    final class Coordinator {
+        var timer: Timer?
+        weak var web: WKWebView?
+        var onToken: ((String, String?) -> Void)?
+        var done = false
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let v = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        v.customUserAgent = Kodik.ua
+        v.isOpaque = false
+        v.backgroundColor = .black
+        v.load(URLRequest(url: URL(string: "https://animelib.org/ru/")!))
+        let c = context.coordinator
+        c.web = v
+        c.onToken = onToken
+        c.timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak c] _ in
+            guard let c = c, let web = c.web, !c.done else { return }
+            web.evaluateJavaScript("JSON.stringify(Object.assign({}, window.localStorage))") { res, _ in
+                guard let s = res as? String,
+                      let data = s.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data),
+                      let tok = LoginWebView.findToken(obj) else { return }
+                c.done = true
+                c.timer?.invalidate()
+                DispatchQueue.main.async { c.onToken?(tok.0, tok.1) }
+            }
+        }
+        return v
+    }
+
+    func updateUIView(_ v: WKWebView, context: Context) { context.coordinator.onToken = onToken }
+
+    static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
+        coordinator.timer?.invalidate()
+    }
+
+    static func findToken(_ obj: Any) -> (String, String?)? {
+        if let d = obj as? [String: Any] {
+            if let a = d["access_token"] as? String, !a.isEmpty { return (a, d["refresh_token"] as? String) }
+            for v in d.values { if let r = findToken(v) { return r } }
+        } else if let arr = obj as? [Any] {
+            for v in arr { if let r = findToken(v) { return r } }
+        } else if let s = obj as? String, s.hasPrefix("{") || s.hasPrefix("["),
+                  let data = s.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: data) {
+            return findToken(o)
+        }
+        return nil
+    }
+}
+
+struct LoginSheet: View {
+    @ObservedObject private var auth = AuthStore.shared
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Text("Войдите на сайте как обычно. Как только вход завершится, приложение подхватит его само.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(10)
+                LoginWebView { access, refresh in
+                    Task {
+                        await auth.signIn(access: access, refresh: refresh)
+                        dismiss()
+                    }
+                }
+            }
+            .background(AppBackground())
+            .navigationTitle("Вход через сайт")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+            }
+        }
+    }
+}
+
+struct BookmarkFolder: Identifiable, Hashable {
+    let id: Int
+    let name: String
+    let count: Int?
+}
+
+@MainActor
+final class ProfileViewModel: ObservableObject {
+    @Published var folders: [BookmarkFolder] = []
+    @Published var selected: Int?
+    @Published var items: [Anime] = []
+    @Published var isLoading = false
+    @Published var error: String?
+    @Published var debug = ""
+
+    private var userID: Int?
+    private var token: String?
+    private var page = 1
+    private var finished = false
+
+    func configure(userID: Int, token: String) {
+        self.userID = userID
+        self.token = token
+    }
+
+    func loadFolders() async {
+        guard let uid = userID, let t = token else { return }
+        do {
+            let data = try await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t)
+            guard let root = J.obj(data) as? [String: Any],
+                  let arr = root["data"] as? [[String: Any]] else {
+                error = "Неожиданный ответ сервера для списков"
+                debug = await AnimelibAPI.shared.rawText("/bookmarks/folder/\(uid)", token: t)
+                return
+            }
+            folders = arr.compactMap { d -> BookmarkFolder? in
+                guard let id = J.int(d["id"]) else { return nil }
+                return BookmarkFolder(id: id,
+                                      name: J.str(d["name"]) ?? J.str(d["title"]) ?? "Список",
+                                      count: J.int(d["count"]) ?? J.int(d["items_count"]) ?? J.int(d["titles_count"]))
+            }
+            if selected == nil || !folders.contains(where: { $0.id == selected }) {
+                selected = folders.first?.id
+            }
+            error = nil
+            await reload()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func select(_ id: Int) async {
+        selected = id
+        await reload()
+    }
+
+    func reload() async {
+        items = []
+        page = 1
+        finished = false
+        debug = ""
+        await loadMore()
+    }
+
+    func loadMore() async {
+        guard !isLoading, !finished, let uid = userID, let t = token else { return }
+        isLoading = true
+        defer { isLoading = false }
+        var query = [URLQueryItem(name: "user_id", value: String(uid)),
+                     URLQueryItem(name: "page", value: String(page))]
+        if let s = selected { query.append(URLQueryItem(name: "status", value: String(s))) }
+        do {
+            let data = try await AnimelibAPI.shared.rawData("/bookmarks", query: query, token: t)
+            guard let root = J.obj(data) as? [String: Any],
+                  let arr = root["data"] as? [[String: Any]] else { finished = true; return }
+            let list = arr.compactMap { Self.anime(from: $0) }
+            let known = Set(items.map { $0.id })
+            let fresh = list.filter { !known.contains($0.id) }
+            items += fresh
+            page += 1
+            if fresh.isEmpty { finished = true }
+            error = nil
+            if items.isEmpty {
+                debug = await AnimelibAPI.shared.rawText("/bookmarks", query: query, token: t)
+            }
+        } catch {
+            finished = true
+            self.error = error.localizedDescription
+        }
+    }
+
+    static func anime(from d: [String: Any]) -> Anime? {
+        var candidates: [[String: Any]] = []
+        for v in d.values { if let sub = v as? [String: Any] { candidates.append(sub) } }
+        candidates.append(d)
+        for c in candidates {
+            guard J.int(c["id"]) != nil,
+                  c["slug_url"] != nil || c["rus_name"] != nil || c["name"] != nil,
+                  let data = try? JSONSerialization.data(withJSONObject: c),
+                  let a = try? JSONDecoder().decode(Anime.self, from: data) else { continue }
+            return a
+        }
+        return nil
+    }
+}
+
+struct ProfileView: View {
+    @ObservedObject private var auth = AuthStore.shared
+    @StateObject private var vm = ProfileViewModel()
+    @State private var showLogin = false
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                if let u = auth.user {
+                    VStack(spacing: 16) {
+                        HStack(spacing: 14) {
+                            RemoteImage(url: u.avatar)
+                                .frame(width: 64, height: 64)
+                                .clipShape(Circle())
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(u.username).font(.title3.bold())
+                                Button("Выйти") { auth.signOut() }
+                                    .font(.footnote)
+                                    .foregroundStyle(.red)
+                            }
+                            Spacer()
+                        }
+                        .padding(14)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+                        if !vm.folders.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(vm.folders) { f in
+                                        Button { Task { await vm.select(f.id) } } label: {
+                                            Text(f.count.map { "\(f.name) · \($0)" } ?? f.name)
+                                                .font(.subheadline.weight(.semibold))
+                                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                                .background(f.id == vm.selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+
+                        if let e = vm.error {
+                            Text(e).font(.footnote).foregroundStyle(.red)
+                        }
+                        LazyVGrid(columns: columns, spacing: 18) {
+                            ForEach(vm.items) { anime in
+                                NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                                    .buttonStyle(.plain)
+                                    .onAppear {
+                                        if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                                    }
+                            }
+                        }
+                        if vm.isLoading { ProgressView() }
+                        if vm.items.isEmpty && !vm.isLoading {
+                            Text("В этом списке пока ничего нет").foregroundStyle(.secondary)
+                            if !vm.debug.isEmpty {
+                                Text(vm.debug)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(14)
+                } else if auth.token != nil {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        if let e = auth.error {
+                            Text(e).font(.footnote).foregroundStyle(.red)
+                            Button("Повторить") { Task { await auth.refreshUser() } }
+                            Button("Выйти") { auth.signOut() }.foregroundStyle(.red)
+                        }
+                    }
+                    .padding(.top, 80)
+                } else {
+                    VStack(spacing: 16) {
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.system(size: 64))
+                            .foregroundStyle(Theme.accent)
+                        Text("Профиль").font(.title2.bold())
+                        Text("Войдите через сайт, чтобы видеть свои списки: смотрю, в планах, просмотрено и другие.")
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
+                        if let e = auth.error {
+                            Text(e).font(.footnote).foregroundStyle(.orange)
+                        }
+                        Button { showLogin = true } label: {
+                            Text("Войти через сайт")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14))
+                                .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(24)
+                    .padding(.top, 40)
+                }
+            }
+            .background(AppBackground())
+            .navigationTitle("Профиль")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .sheet(isPresented: $showLogin) { LoginSheet() }
+            .task(id: auth.user?.id) {
+                if let u = auth.user, let t = auth.token {
+                    vm.configure(userID: u.id, token: t)
+                    await vm.loadFolders()
+                }
+            }
+        }
     }
 }
 
