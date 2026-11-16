@@ -843,6 +843,7 @@ struct CatalogView: View {
 
     var body: some View {
         NavigationStack {
+            GeometryReader { geo in
             ScrollView {
                 VStack(spacing: 10) {
                     HStack {
@@ -854,7 +855,7 @@ struct CatalogView: View {
                     SearchBar(text: $vm.filter.query) { Task { await vm.reload() } }
                 }
                 .padding(.horizontal, 14)
-                .padding(.top, 4)
+                .padding(.top, geo.safeAreaInsets.top + 4)
                 .padding(.bottom, 10)
 
                 if let e = vm.error, vm.items.isEmpty {
@@ -882,12 +883,21 @@ struct CatalogView: View {
             }
             .scrollDismissesKeyboard(.immediately)
             .refreshable { await vm.reload() }
-            .background(AppBackground())
+            .ignoresSafeArea(edges: .top)
             .overlay(alignment: .top) {
-                // размытие только под строкой состояния, остальная шапка уезжает вместе со списком
-                Color.clear.frame(height: 0)
-                    .background(.ultraThinMaterial, ignoresSafeAreaEdges: .top)
+                // мягкое размытие под строкой состояния: обложки заезжают под неё, как в системных приложениях
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .frame(height: geo.safeAreaInsets.top + 14)
+                    .mask(LinearGradient(stops: [
+                        .init(color: .black, location: 0),
+                        .init(color: .black, location: 0.75),
+                        .init(color: .clear, location: 1)
+                    ], startPoint: .top, endPoint: .bottom))
+                    .allowsHitTesting(false)
             }
+            }
+            .background(AppBackground())
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
@@ -1178,10 +1188,16 @@ enum Kodik {
 
     static func resolve(_ pageURL: URL) async throws -> [(Int, URL)] {
         let html = try await fetch(pageURL, referer: "https://animelib.org/")
-        guard let paramsText = match("urlParams\\s*=\\s*'?(\\{[^;]*?\\})'?\\s*;", in: html),
-              let pd = paramsText.data(using: .utf8),
-              let params = (try? JSONSerialization.jsonObject(with: pd)) as? [String: Any]
-        else { throw KodikError.params }
+        // параметры подписи: ищем каждое поле отдельно, формат страницы может меняться
+        var params: [String: Any] = [:]
+        for k in ["d", "d_sign", "pd", "pd_sign", "ref", "ref_sign"] {
+            if let v = match("\\\\?[\"']" + k + "\\\\?[\"']\\s*:\\s*\\\\?[\"']([^\"'\\\\]*)", in: html) { params[k] = v }
+        }
+        if params["d_sign"] == nil || params["pd_sign"] == nil {
+            let hasKey = html.contains("urlParams")
+            let head = String(html.prefix(70)).replacingOccurrences(of: "\n", with: " ")
+            throw KodikError.server("нет параметров (страница \(html.count) симв., urlParams: \(hasKey ? "есть" : "нет"), начало: \(head))")
+        }
 
         let parts = pageURL.pathComponents.filter { $0 != "/" }
         let type = match("videoInfo\\.type\\s*=\\s*'([^']+)'", in: html) ?? (parts.count > 0 ? parts[0] : "")
@@ -1285,14 +1301,25 @@ struct WebPlayerView: UIViewRepresentable {
     (function(){
       if (window.__heheSniff) return; window.__heheSniff = true;
       var sent = {};
+      function post(u){
+        try { if (!sent[u]) { sent[u] = 1; window.webkit.messageHandlers.hehe.postMessage(u); } } catch (e) {}
+      }
+      function report(u){
+        try {
+          if (!u) return;
+          var a = new URL(String(u), location.href).href;
+          if (/\\.m3u8|\\.mp4/.test(a)) post(a);
+        } catch (e) {}
+      }
+      var oo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(m, u){ report(u); return oo.apply(this, arguments); };
+      var of = window.fetch;
+      if (of) window.fetch = function(a){ report(typeof a === 'string' ? a : (a && a.url)); return of.apply(this, arguments); };
       setInterval(function(){
         var vs = document.getElementsByTagName('video');
         for (var i = 0; i < vs.length; i++) {
           var u = vs[i].currentSrc || vs[i].src;
-          if (u && u.indexOf('http') === 0 && !sent[u]) {
-            sent[u] = 1;
-            try { window.webkit.messageHandlers.hehe.postMessage(u); } catch (e) {}
-          }
+          if (u && u.indexOf('http') === 0) report(u);
         }
       }, 700);
     })();
@@ -1303,7 +1330,7 @@ struct WebPlayerView: UIViewRepresentable {
         cfg.allowsInlineMediaPlayback = true
         cfg.userContentController.add(context.coordinator, name: "hehe")
         cfg.userContentController.addUserScript(
-            WKUserScript(source: Self.sniffer, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+            WKUserScript(source: Self.sniffer, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let v = WKWebView(frame: .zero, configuration: cfg)
         v.customUserAgent = Kodik.ua
         v.isOpaque = false
@@ -1414,7 +1441,7 @@ final class PlayerViewModel: ObservableObject {
     func webStream(_ u: URL) {
         guard autoNative, showWeb, current?.kodik == true else { return }
         showWeb = false
-        note = nil
+        note = "Играет в родном плеере (\(u.host ?? "kodik"))"
         startAV(u, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
     }
 
