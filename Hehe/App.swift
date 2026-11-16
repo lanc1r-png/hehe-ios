@@ -5178,6 +5178,12 @@ actor MangaImageServers {
         return list
     }
 
+    /// Адрес «как есть»: сервер + путь без правок (так делают сайт и сторонние клиенты).
+    static func raw(_ path: String, base: String) -> URL? {
+        if path.hasPrefix("http") || path.hasPrefix("//") { return nil }
+        return URL(string: base + path)
+    }
+
     static func resolve(_ path: String, base: String) -> URL? {
         if path.hasPrefix("http") { return URL(string: path) }
         if path.hasPrefix("//") { return URL(string: "https:" + path) }
@@ -5204,7 +5210,12 @@ enum MangaService {
         var out: [MangaPage] = []
         for p in raw {
             guard let path = J.str(p["url"]) ?? J.str(p["image"]) else { continue }
-            let urls = bases.compactMap { MangaImageServers.resolve(path, base: $0) }
+            var urls: [URL] = []
+            for b in bases {
+                for u in [MangaImageServers.resolve(path, base: b), MangaImageServers.raw(path, base: b)] {
+                    if let u = u, !urls.contains(u) { urls.append(u) }
+                }
+            }
             if urls.isEmpty { continue }
             out.append(MangaPage(id: out.count, urls: urls, width: num(p["width"]), height: num(p["height"])))
         }
@@ -5212,50 +5223,199 @@ enum MangaService {
     }
 }
 
+/// Загрузка страниц манги: по одной попытке на каждый адрес, повтор кругом, без дублей.
+actor MangaImageStore {
+    static let shared = MangaImageStore()
+    private var inflight: [String: Task<(UIImage?, String), Never>] = [:]
+    private(set) var lastNote = ""
+
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 25
+        cfg.httpMaximumConnectionsPerHost = 4
+        cfg.urlCache = URLCache(memoryCapacity: 30_000_000, diskCapacity: 400_000_000)
+        cfg.requestCachePolicy = .returnCacheDataElseLoad
+        return URLSession(configuration: cfg)
+    }()
+
+    private static let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    func image(for page: MangaPage) async -> UIImage? {
+        let key = ImageCache.key(page.url, page.maxPixel)
+        if let c = ImageCache.shared.object(forKey: key) { return c }
+        let id = key as String
+        if let t = inflight[id] { return await t.value.0 }
+        let urls = page.urls
+        let px = page.maxPixel
+        let t = Task.detached(priority: .userInitiated) { () -> (UIImage?, String) in
+            var note = ""
+            for round in 0..<2 {
+                for u in urls {
+                    var req = URLRequest(url: u)
+                    req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                    req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+                    req.setValue(MangaImageStore.agent, forHTTPHeaderField: "User-Agent")
+                    do {
+                        let (data, resp) = try await MangaImageStore.session.data(for: req)
+                        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                        if (200..<300).contains(code) {
+                            if let img = ImageLoader.downsample(data, maxPixel: px) {
+                                ImageCache.store(img, key)
+                                return (img, "")
+                            }
+                            note = "не удалось разобрать картинку (\(data.count) байт, \(resp.mimeType ?? "?"))"
+                        } else {
+                            note = "HTTP \(code) · \(u.host ?? "")"
+                        }
+                    } catch {
+                        note = error.localizedDescription
+                    }
+                }
+                if round == 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
+            }
+            return (nil, note + "\n" + (urls.first?.absoluteString ?? ""))
+        }
+        inflight[id] = t
+        let r = await t.value
+        inflight[id] = nil
+        if r.0 == nil { lastNote = r.1 }
+        return r.0
+    }
+}
+
 struct MangaPageView: View {
     let page: MangaPage
+    var vertical = false
+    let onTap: (CGFloat) -> Void
     @State private var image: UIImage?
     @State private var failed = false
+    @State private var note = ""
     @State private var attempt = 0
+    @State private var scale: CGFloat = 1
+    @State private var base: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    private func resetZoom() {
+        scale = 1; base = 1; offset = .zero; lastOffset = .zero
+    }
 
     var body: some View {
         Group {
-            if let image {
-                Image(uiImage: image).resizable().scaledToFit().frame(maxWidth: .infinity)
-            } else if failed {
-                Button { failed = false; attempt += 1 } label: {
-                    VStack(spacing: 8) {
-                        Image(systemName: "arrow.clockwise")
-                        Text("Страница \(page.id + 1) не загрузилась. Нажми, чтобы повторить.")
-                            .font(.caption)
-                            .multilineTextAlignment(.center)
-                    }
-                    .foregroundStyle(.white.opacity(0.7))
-                    .frame(maxWidth: .infinity, minHeight: 240)
-                }
+            if vertical {
+                flow
             } else {
-                ZStack {
-                    Color.white.opacity(0.04)
-                    ProgressView().tint(.white)
-                }
-                .aspectRatio(page.ratio > 0 ? 1 / page.ratio : 0.7, contentMode: .fit)
-                .frame(maxWidth: .infinity)
+                GeometryReader { geo in content(geo.size) }
             }
         }
         .task(id: "\(page.id)-\(attempt)") { await load() }
     }
 
-    private func load() async {
-        for u in page.urls {
-            let key = ImageCache.key(u, page.maxPixel)
-            if let c = ImageCache.shared.object(forKey: key) { image = c; return }
-            if let img = await ImageLoader.shared.image(u, referer: LibSite.manga.referer, maxPixel: page.maxPixel) {
-                ImageCache.store(img, key)
-                image = img
-                return
+    /// Режим ленты: страницы идут одна под другой, высота по картинке.
+    @ViewBuilder
+    private var flow: some View {
+        if let image {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .onTapGesture { onTap(0.5) }
+        } else if failed {
+            Button { failed = false; attempt += 1 } label: {
+                VStack(spacing: 8) {
+                    Image(systemName: "arrow.clockwise").font(.title3)
+                    Text("Страница \(page.id + 1) не загрузилась. Нажми, чтобы повторить.")
+                        .font(.footnote).multilineTextAlignment(.center)
+                    if !note.isEmpty {
+                        Text(note).font(.caption2).opacity(0.6).multilineTextAlignment(.center)
+                    }
+                }
+                .foregroundStyle(.white.opacity(0.8))
+                .padding(20)
+                .frame(maxWidth: .infinity, minHeight: 200)
             }
-            if Task.isCancelled { return }
+        } else {
+            ZStack {
+                Color.white.opacity(0.04)
+                ProgressView().tint(.white)
+            }
+            .aspectRatio(page.ratio > 0 ? 1 / page.ratio : 0.7, contentMode: .fit)
+            .frame(maxWidth: .infinity)
         }
+    }
+
+    @ViewBuilder
+    private func content(_ size: CGSize) -> some View {
+        if let image {
+            if page.ratio > 2.2 {
+                ScrollView(.vertical, showsIndicators: false) {
+                    Image(uiImage: image).resizable().scaledToFit().frame(width: size.width)
+                }
+                .simultaneousGesture(SpatialTapGesture().onEnded { v in onTap(v.location.x / max(size.width, 1)) })
+            } else {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: size.width, height: size.height)
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        TapGesture(count: 2).onEnded {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                if scale > 1 { resetZoom() } else { scale = 2.4; base = 2.4 }
+                            }
+                        }
+                        .exclusively(before: SpatialTapGesture().onEnded { v in
+                            onTap(v.location.x / max(size.width, 1))
+                        })
+                    )
+                    .simultaneousGesture(
+                        MagnificationGesture()
+                            .onChanged { scale = min(max(base * $0, 1), 4) }
+                            .onEnded { _ in
+                                base = scale
+                                if scale <= 1.02 { withAnimation { resetZoom() } }
+                            }
+                    )
+                    .gesture(
+                        DragGesture()
+                            .onChanged { v in
+                                offset = CGSize(width: lastOffset.width + v.translation.width,
+                                                height: lastOffset.height + v.translation.height)
+                            }
+                            .onEnded { _ in lastOffset = offset },
+                        including: scale > 1 ? .all : .none
+                    )
+            }
+        } else if failed {
+            Button { failed = false; attempt += 1 } label: {
+                VStack(spacing: 10) {
+                    Image(systemName: "arrow.clockwise").font(.title2)
+                    Text("Страница \(page.id + 1) не загрузилась. Нажми, чтобы повторить.")
+                        .font(.footnote)
+                        .multilineTextAlignment(.center)
+                    if !note.isEmpty {
+                        Text(note).font(.caption2).opacity(0.6).multilineTextAlignment(.center)
+                    }
+                }
+                .foregroundStyle(.white.opacity(0.8))
+                .padding(24)
+                .frame(width: size.width, height: size.height)
+            }
+        } else {
+            ProgressView().tint(.white).frame(width: size.width, height: size.height)
+        }
+    }
+
+    private func load() async {
+        if let img = await MangaImageStore.shared.image(for: page) {
+            withAnimation(.easeOut(duration: 0.15)) { image = img }
+            return
+        }
+        if Task.isCancelled { return }
+        note = await MangaImageStore.shared.lastNote
         failed = true
     }
 }
@@ -5295,6 +5455,47 @@ struct ChapterCommentsView: View {
     }
 }
 
+struct MangaReaderSettings: View {
+    @Binding var titleMode: String
+    @Binding var defaultMode: String
+    let detected: String
+    @Environment(\.dismiss) private var dismiss
+
+    private func picker(_ sel: Binding<String>) -> some View {
+        Picker("", selection: sel) {
+            Text("Авто").tag("auto")
+            Text("Страницы").tag("pages")
+            Text("Лента").tag("scroll")
+        }
+        .pickerStyle(.segmented)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    picker($titleMode)
+                } header: {
+                    Text("Для этого тайтла")
+                } footer: {
+                    Text("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы и веб-комиксов: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)».")
+                }
+                Section {
+                    picker($defaultMode)
+                } header: {
+                    Text("По умолчанию для остальных")
+                } footer: {
+                    Text("Работает, пока для тайтла выбрано «Авто» и у него нет своей настройки.")
+                }
+            }
+            .navigationTitle("Режим чтения")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 struct MangaReaderView: View {
     let novel: Anime
     let chapters: [NovelChapter]
@@ -5303,17 +5504,42 @@ struct MangaReaderView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var chromeHidden = false
-    @State private var seen = 0
+    @State private var current = 0
+    @State private var scrollPage = 0
     @State private var showComments = false
+    @State private var preloadTask: Task<Void, Never>?
+    @State private var titleMode: String
+    @State private var showSettings = false
+    @AppStorage("manga.mode.default") private var defaultMode = "auto"
     @Environment(\.dismiss) private var dismiss
 
     init(novel: Anime, chapters: [NovelChapter], start: Int) {
         self.novel = novel
         self.chapters = chapters
+        _titleMode = State(initialValue: UserDefaults.standard.string(forKey: "manga.mode.\(novel.id)") ?? "auto")
         _index = State(initialValue: min(max(start, 0), max(chapters.count - 1, 0)))
     }
 
     private var chapter: NovelChapter? { chapters.indices.contains(index) ? chapters[index] : nil }
+
+    /// Манхву, маньхуа и длинные полосы читаем лентой, обычную мангу листаем.
+    private var autoVertical: Bool {
+        let t = (novel.type?.title ?? "").lowercased()
+        if t.contains("манхв") || t.contains("маньхуа") || t.contains("веб") { return true }
+        let r = pages.map { $0.ratio }.filter { $0 > 0 }.sorted()
+        if r.isEmpty { return false }
+        return r[r.count / 2] > 1.9
+    }
+
+    private var shown: Int { vertical ? scrollPage : current }
+
+    private var vertical: Bool {
+        switch titleMode == "auto" ? defaultMode : titleMode {
+        case "scroll": return true
+        case "pages": return false
+        default: return autoVertical
+        }
+    }
 
     private func go(_ delta: Int) {
         let n = index + delta
@@ -5322,23 +5548,46 @@ struct MangaReaderView: View {
         index = n
     }
 
-    private func preload(after id: Int) {
-        let next = pages.dropFirst(id + 1).prefix(3)
-        for p in next {
-            let u = p.url
-            let px = p.maxPixel
-            Task.detached(priority: .utility) {
-                let key = ImageCache.key(u, px)
-                if ImageCache.shared.object(forKey: key) != nil { return }
-                if let img = await ImageLoader.shared.image(u, referer: LibSite.manga.referer, maxPixel: px) {
-                    ImageCache.store(img, key)
+    private func turn(_ delta: Int) {
+        let n = current + delta
+        if n < 0 { return }
+        if n > pages.count { return }
+        withAnimation(.easeOut(duration: 0.2)) { current = n }
+    }
+
+    private func handleTap(_ x: CGFloat) {
+        if vertical { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() }; return }
+        if x < 0.3 { turn(-1) }
+        else if x > 0.7 { turn(1) }
+        else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
+    }
+
+    /// Фоновая подгрузка: сначала открытая страница, потом остальные по порядку, по две за раз.
+    private func preload(from start: Int) {
+        preloadTask?.cancel()
+        let list = pages
+        guard !list.isEmpty else { return }
+        let first = min(max(start, 0), list.count - 1)
+        preloadTask = Task {
+            var order = Array(first..<list.count)
+            order += Array((0..<first).reversed())
+            var i = 0
+            while i < order.count {
+                if Task.isCancelled { return }
+                let n = i == 0 ? 1 : 2
+                let chunk = Array(order[i..<min(i + n, order.count)])
+                i += n
+                await withTaskGroup(of: Void.self) { group in
+                    for id in chunk {
+                        group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) }
+                    }
                 }
             }
         }
     }
 
     private var endCard: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             Text(index + 1 < chapters.count ? "Глава закончилась" : "Это последняя глава")
                 .font(.subheadline).foregroundStyle(.white.opacity(0.7))
             if index + 1 < chapters.count {
@@ -5358,7 +5607,8 @@ struct MangaReaderView: View {
                     .foregroundStyle(.white.opacity(0.85))
             }
         }
-        .padding(20)
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var topBar: some View {
@@ -5373,6 +5623,10 @@ struct MangaReaderView: View {
                 }
             }
             Spacer()
+            Button { showSettings = true } label: {
+                Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
+                    .frame(width: 40, height: 40)
+            }
             Button { showComments = true } label: {
                 Image(systemName: "bubble.left.and.bubble.right").frame(width: 40, height: 40)
             }
@@ -5386,13 +5640,13 @@ struct MangaReaderView: View {
 
     private var bottomBar: some View {
         HStack {
-            Button { go(-1) } label: { Image(systemName: "chevron.left").frame(width: 48, height: 40) }
+            Button { go(-1) } label: { Image(systemName: "backward.end").frame(width: 48, height: 40) }
                 .disabled(index == 0)
             Spacer()
-            Text(pages.isEmpty ? "…" : "\(min(max(seen, 1), pages.count)) / \(pages.count)")
+            Text(pages.isEmpty ? "…" : "\(min(shown + 1, pages.count)) / \(pages.count)")
                 .font(.footnote.monospacedDigit())
             Spacer()
-            Button { go(1) } label: { Image(systemName: "chevron.right").frame(width: 48, height: 40) }
+            Button { go(1) } label: { Image(systemName: "forward.end").frame(width: 48, height: 40) }
                 .disabled(index + 1 >= chapters.count)
         }
         .foregroundStyle(.white)
@@ -5405,31 +5659,48 @@ struct MangaReaderView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if loading {
-                        ProgressView().tint(.white).frame(maxWidth: .infinity).padding(.top, 220)
-                    }
-                    if let e = error {
-                        VStack(spacing: 10) {
-                            Text(e).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
-                            Button("Повторить") { Task { await load() } }
-                        }
-                        .padding(24)
-                    }
-                    ForEach(pages) { p in
-                        MangaPageView(page: p)
-                            .onAppear {
-                                if p.id + 1 > seen { seen = p.id + 1 }
-                                preload(after: p.id)
+
+            if !pages.isEmpty {
+                if vertical {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(pages) { p in
+                                    MangaPageView(page: p, vertical: true, onTap: handleTap)
+                                        .id(p.id)
+                                        .onAppear { scrollPage = p.id }
+                                }
+                                endCard.frame(height: 360).id(pages.count)
                             }
+                        }
+                        .onAppear {
+                            if current > 0 { proxy.scrollTo(current, anchor: .top) }
+                        }
                     }
-                    if !pages.isEmpty { endCard }
+                    .id("v\(index)")
+                    .ignoresSafeArea(edges: .bottom)
+                } else {
+                    TabView(selection: $current) {
+                        ForEach(pages) { p in
+                            MangaPageView(page: p, onTap: handleTap).tag(p.id)
+                        }
+                        endCard.tag(pages.count)
+                    }
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                    .id("p\(index)")
+                    .ignoresSafeArea()
                 }
             }
-            .id(index)
-            .ignoresSafeArea(edges: .bottom)
-            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
+            if loading {
+                ProgressView().tint(.white)
+            }
+            if let e = error {
+                VStack(spacing: 10) {
+                    Text(e).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
+                    Button("Повторить") { Task { await load() } }
+                }
+                .padding(24)
+            }
 
             VStack {
                 if !chromeHidden { topBar.transition(.move(edge: .top).combined(with: .opacity)) }
@@ -5440,19 +5711,41 @@ struct MangaReaderView: View {
         .statusBarHidden(chromeHidden)
         .preferredColorScheme(.dark)
         .task(id: index) { await load() }
+        .onChange(of: current) { v in
+            Haptics.select()
+            if !vertical && v < pages.count { preload(from: v) }
+        }
+        .onChange(of: scrollPage) { v in
+            if vertical && v < pages.count { preload(from: v) }
+        }
+        .onChange(of: vertical) { v in
+            if v { scrollPage = current } else { current = min(scrollPage, pages.count) }
+        }
+        .onChange(of: titleMode) { v in
+            UserDefaults.standard.set(v, forKey: "manga.mode.\(novel.id)")
+        }
+        .sheet(isPresented: $showSettings) {
+            MangaReaderSettings(titleMode: $titleMode, defaultMode: $defaultMode,
+                                detected: autoVertical ? "лента" : "страницы")
+        }
         .sheet(isPresented: $showComments) {
             if let c = chapter { ChapterCommentsView(novel: novel, chapter: c) }
         }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
-        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+            preloadTask?.cancel()
+        }
     }
 
     private func load() async {
         guard let ch = chapter, let slug = novel.slugUrl else { return }
+        preloadTask?.cancel()
         loading = true
         error = nil
         pages = []
-        seen = 0
+        current = 0
+        scrollPage = 0
         ReadStore.shared.mark(novel.readKey, ch.id)
         HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
         do {
@@ -5462,7 +5755,7 @@ struct MangaReaderView: View {
             if result.isEmpty {
                 error = "У главы нет страниц или она недоступна."
             } else {
-                preload(after: -1)
+                preload(from: 0)
             }
         } catch {
             if Task.isCancelled { return }
