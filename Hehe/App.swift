@@ -43,6 +43,9 @@ struct LibSite: Hashable {
     let title: String
 
     var isRanobe: Bool { key == "ranobe" }
+    var isManga: Bool { key == "manga" }
+    /// Ранобэ и манга устроены одинаково: тайтл, тома и главы.
+    var isBook: Bool { key != "anime" }
 
     static let anime = LibSite(key: "anime", id: "5", referer: "https://v5.animelib.org/",
                                origin: "https://v5.animelib.org", apiPath: "/anime",
@@ -51,8 +54,16 @@ struct LibSite: Hashable {
                                 origin: "https://ranobelib.me", apiPath: "/manga",
                                 postType: "manga", title: "Ранобэ")
 
+    static let manga = LibSite(key: "manga", id: "1", referer: "https://mangalib.me/",
+                               origin: "https://mangalib.me", apiPath: "/manga",
+                               postType: "manga", title: "Манга")
+
     static var current: LibSite {
-        UserDefaults.standard.string(forKey: "set.platform") == "ranobe" ? .ranobe : .anime
+        switch UserDefaults.standard.string(forKey: "set.platform") {
+        case "ranobe": return .ranobe
+        case "manga": return .manga
+        default: return .anime
+        }
     }
 }
 
@@ -446,7 +457,7 @@ struct CatalogFilter: Equatable {
 
         /// Названия полей сортировки у разных сайтов отличаются, пробуем по очереди.
         func aliases(_ site: LibSite) -> [String] {
-            guard site.isRanobe else { return [rawValue] }
+            guard site.isBook else { return [rawValue] }
             switch self {
             case .rating: return ["rate_avg", "rating_score"]
             case .views: return ["views"]
@@ -741,9 +752,11 @@ enum Haptics {
 /// Адрес тайтла на сайте (для «Поделиться»).
 func titleURL(_ a: Anime) -> URL? {
     guard let slug = a.slugUrl else { return nil }
-    return LibSite.current.isRanobe
-        ? URL(string: "https://ranobelib.me/ru/book/\(slug)")
-        : URL(string: "https://animelib.org/ru/anime/\(slug)")
+    switch LibSite.current.key {
+    case "ranobe": return URL(string: "https://ranobelib.me/ru/book/\(slug)")
+    case "manga": return URL(string: "https://mangalib.me/ru/manga/\(slug)")
+    default: return URL(string: "https://animelib.org/ru/anime/\(slug)")
+    }
 }
 
 struct PressableStyle: ButtonStyle {
@@ -903,6 +916,11 @@ struct RemoteImage: View {
 final class FavoritesStore: ObservableObject {
     static let shared = FavoritesStore(key: "favorites.v1")
     static let novels = FavoritesStore(key: "favorites.novels.v1")
+    static let manga = FavoritesStore(key: "favorites.manga.v1")
+    static var current: FavoritesStore {
+        let site = LibSite.current
+        return site.isManga ? manga : (site.isRanobe ? novels : shared)
+    }
     @Published private(set) var items: [Anime] = []
     private let key: String
 
@@ -935,7 +953,7 @@ final class FavoritesStore: ObservableObject {
 }
 
 struct FavoritesView: View {
-    @ObservedObject private var favorites: FavoritesStore = LibSite.current.isRanobe ? FavoritesStore.novels : FavoritesStore.shared
+    @ObservedObject private var favorites: FavoritesStore = FavoritesStore.current
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     var body: some View {
@@ -987,7 +1005,8 @@ struct SettingsView: View {
     ]
     private let platforms: [(String, String, String, Bool)] = [
         ("anime", "Аниме", "AnimeLib", true),
-        ("ranobe", "Ранобэ", "RanobeLib", true)
+        ("ranobe", "Ранобэ", "RanobeLib", true),
+        ("manga", "Манга", "MangaLib", true)
     ]
 
     private func card<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
@@ -1079,7 +1098,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.pressable)
                         } else {
-                            Text("Скачанные главы доступны на платформе «Ранобэ».")
+                            Text(platform == "manga" ? "Для манги загрузки пока недоступны: главы читаются онлайн." : "Скачанные главы доступны на платформе «Ранобэ».")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Toggle("Скачивать только по Wi‑Fi", isOn: $offWifi)
@@ -1099,11 +1118,11 @@ struct SettingsView: View {
                         }
                         Button("Сбросить историю просмотра") {
                             ProgressStore.shared.clear(); HistoryStore.shared.clear()
-                            HistoryStore.novels.clear(); ReadStore.shared.clear()
+                            HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear()
                             info = "История просмотра и чтения сброшена"
                         }
                         Button("Очистить избранное") {
-                            FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); info = "Избранное очищено"
+                            FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
                         }
                         if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
                     }
@@ -1160,6 +1179,11 @@ struct HistoryItem: Codable, Identifiable {
 final class HistoryStore: ObservableObject {
     static let shared = HistoryStore(key: "history.v1")
     static let novels = HistoryStore(key: "history.novels.v1")
+    static let manga = HistoryStore(key: "history.manga.v1")
+    static var current: HistoryStore {
+        let site = LibSite.current
+        return site.isManga ? manga : (site.isRanobe ? novels : shared)
+    }
     @Published private(set) var items: [HistoryItem] = []
     private let key: String
 
@@ -1355,7 +1379,7 @@ struct AnimeRow: View {
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                Text([anime.type?.title, LibSite.current.isRanobe ? nil : anime.episodesCount.map { "\($0) эп." }]
+                Text([anime.type?.title, LibSite.current.isBook ? nil : anime.episodesCount.map { "\($0) эп." }]
                     .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1377,7 +1401,7 @@ struct ContinueCard: View {
     @ObservedObject private var progress = ProgressStore.shared
 
     var body: some View {
-        let p = LibSite.current.isRanobe ? nil : progress.get(item.episodeID)
+        let p = LibSite.current.isBook ? nil : progress.get(item.episodeID)
         HStack(spacing: 12) {
             RemoteImage(url: item.anime.imageURL)
                 .frame(width: 56, height: 84)
@@ -1412,10 +1436,10 @@ struct ContinueCard: View {
 
 struct HomeView: View {
     @StateObject private var vm = HomeViewModel()
-    @ObservedObject private var history: HistoryStore = LibSite.current.isRanobe ? HistoryStore.novels : HistoryStore.shared
+    @ObservedObject private var history: HistoryStore = HistoryStore.current
     @ObservedObject private var router = AppRouter.shared
     @State private var query = ""
-    private let ranobe = LibSite.current.isRanobe
+    private let ranobe = LibSite.current.isBook
 
     private func poster(_ list: [Anime]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -1729,7 +1753,7 @@ struct FilterSheet: View {
                         Text("Сортировка").font(.headline)
                         FlowLayout(spacing: 8) {
                             ForEach(CatalogFilter.SortOption.allCases) { opt in
-                                Chip(title: opt.label(LibSite.current.isRanobe), selected: vm.filter.sortBy == opt) {
+                                Chip(title: opt.label(LibSite.current.isBook), selected: vm.filter.sortBy == opt) {
                                     vm.filter.sortBy = opt
                                 }
                             }
@@ -1811,7 +1835,7 @@ struct CatalogView: View {
     @ViewBuilder
     private var randomDestination: some View {
         if let a = randomTarget {
-            if LibSite.current.isRanobe { NovelDetailView(novel: Novel(a)) } else { DetailView(anime: a) }
+            if LibSite.current.isBook { NovelDetailView(novel: Novel(a)) } else { DetailView(anime: a) }
         }
     }
 
@@ -4006,6 +4030,11 @@ struct Novel: Codable, Identifiable, Hashable {
     func encode(to encoder: Encoder) throws { try anime.encode(to: encoder) }
 }
 
+extension Anime {
+    /// Ключ в хранилище прочитанного: у манги и ранобэ id тайтлов могут совпасть.
+    var readKey: Int { LibSite.current.isManga ? -id : id }
+}
+
 struct NovelChapter: Identifiable, Hashable {
     let id: Int
     let volume: String
@@ -4258,14 +4287,14 @@ struct TitleLink<Content: View>: View {
 
     var body: some View {
         Group {
-            if LibSite.current.isRanobe {
+            if LibSite.current.isBook {
                 NavigationLink(value: Novel(anime)) { label() }
             } else {
                 NavigationLink(value: anime) { label() }
             }
         }
         .contextMenu {
-            let store = LibSite.current.isRanobe ? FavoritesStore.novels : FavoritesStore.shared
+            let store = FavoritesStore.current
             Button { store.toggle(anime) } label: {
                 SwiftUI.Label(store.contains(anime) ? "Убрать из избранного" : "В избранное",
                       systemImage: store.contains(anime) ? "heart.slash" : "heart")
@@ -4742,7 +4771,7 @@ final class NovelDetailViewModel: ObservableObject {
             let list = try await c
             chapters = list
             offline = false
-            OfflineStore.shared.refresh(novel: anime, chapters: list)
+            if !LibSite.current.isManga { OfflineStore.shared.refresh(novel: anime, chapters: list) }
         } catch {
             let saved = OfflineStore.shared.savedChapters(anime.id)
             if saved.isEmpty {
@@ -4773,7 +4802,7 @@ struct ReaderStart: Identifiable {
 struct NovelDetailView: View {
     @StateObject private var vm: NovelDetailViewModel
     @ObservedObject private var read = ReadStore.shared
-    @ObservedObject private var favorites = FavoritesStore.novels
+    @ObservedObject private var favorites = FavoritesStore.current
     @State private var expanded = false
     @State private var reversed = false
     @State private var reader: ReaderStart?
@@ -4782,6 +4811,7 @@ struct NovelDetailView: View {
     @ObservedObject private var store = OfflineStore.shared
     @ObservedObject private var dl = DownloadManager.shared
     @State private var confirmRemove = false
+    private var isManga: Bool { LibSite.current.isManga }
 
     init(novel: Novel) { _vm = StateObject(wrappedValue: NovelDetailViewModel(anime: novel.anime)) }
 
@@ -4795,7 +4825,7 @@ struct NovelDetailView: View {
     }
 
     private var resumeIndex: Int {
-        if let last = read.lastChapter(vm.anime.id),
+        if let last = read.lastChapter(vm.anime.readKey),
            let i = vm.chapters.firstIndex(where: { $0.id == last }) { return i }
         return 0
     }
@@ -4805,7 +4835,7 @@ struct NovelDetailView: View {
     }
 
     private func nextIndices(_ n: Int) -> [Int] {
-        let start = read.lastChapter(vm.anime.id) == nil ? 0 : resumeIndex
+        let start = read.lastChapter(vm.anime.readKey) == nil ? 0 : resumeIndex
         return Array(vm.chapters.indices.dropFirst(start).prefix(n))
     }
 
@@ -4815,7 +4845,7 @@ struct NovelDetailView: View {
                 Label("Скачать все главы", systemImage: "arrow.down.circle")
             }
             Button {
-                queue(vm.chapters.indices.filter { !read.isRead(vm.anime.id, vm.chapters[$0].id) })
+                queue(vm.chapters.indices.filter { !read.isRead(vm.anime.readKey, vm.chapters[$0].id) })
             } label: {
                 Label("Скачать непрочитанные", systemImage: "book.closed")
             }
@@ -4869,7 +4899,7 @@ struct NovelDetailView: View {
 
     private func row(_ i: Int) -> some View {
         let c = vm.chapters[i]
-        let isRead = read.isRead(vm.anime.id, c.id)
+        let isRead = read.isRead(vm.anime.readKey, c.id)
         let saved = store.isDownloaded(vm.anime.id, c.id)
         return HStack(spacing: 8) {
             Button { reader = ReaderStart(id: i) } label: {
@@ -4900,12 +4930,14 @@ struct NovelDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.pressable)
-            ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c)
+            if !isManga { ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c) }
         }
         .padding(10)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
         .contextMenu {
-            if saved {
+            if isManga {
+                Button { reader = ReaderStart(id: i) } label: { Label("Читать", systemImage: "book") }
+            } else if saved {
                 Button(role: .destructive) { store.remove(novel: vm.anime.id, chapter: c.id) } label: {
                     Label("Удалить загрузку", systemImage: "trash")
                 }
@@ -4942,7 +4974,7 @@ struct NovelDetailView: View {
                     Button { reader = ReaderStart(id: resumeIndex) } label: {
                         HStack {
                             Image(systemName: "book.fill")
-                            Text(read.lastChapter(vm.anime.id) == nil
+                            Text(read.lastChapter(vm.anime.readKey) == nil
                                  ? "Начать читать"
                                  : "Продолжить: Глава \(vm.chapters[resumeIndex].number)")
                                 .font(.headline)
@@ -5010,7 +5042,7 @@ struct NovelDetailView: View {
                     }
                 }
 
-                if let slug = vm.anime.slugUrl, let url = URL(string: "https://ranobelib.me/ru/book/\(slug)") {
+                if let url = titleURL(vm.anime) {
                     Link(destination: url) {
                         Label("Открыть на сайте", systemImage: "safari")
                             .font(.subheadline)
@@ -5034,7 +5066,7 @@ struct NovelDetailView: View {
                 HStack {
                     Text("Главы").font(.title3.bold())
                     Spacer()
-                    if !vm.chapters.isEmpty { downloadMenu }
+                    if !vm.chapters.isEmpty && !isManga { downloadMenu }
                     if vm.chapters.count > 1 {
                         Button { withAnimation { reversed.toggle() } } label: {
                             Label(reversed ? "Сначала новые" : "Сначала старые", systemImage: "arrow.up.arrow.down")
@@ -5061,7 +5093,7 @@ struct NovelDetailView: View {
                                 .font(.footnote.bold())
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            volumeButton(g.indices)
+                            if !isManga { volumeButton(g.indices) }
                         }
                         .padding(.top, 8)
                         ForEach(reversed ? Array(g.indices.reversed()) : g.indices, id: \.self) { i in
@@ -5098,8 +5130,345 @@ struct NovelDetailView: View {
             }
         }
         .fullScreenCover(item: $reader) { r in
-            NovelReaderView(novel: vm.anime, chapters: vm.chapters, start: r.id)
+            if isManga {
+                MangaReaderView(novel: vm.anime, chapters: vm.chapters, start: r.id)
+            } else {
+                NovelReaderView(novel: vm.anime, chapters: vm.chapters, start: r.id)
+            }
         }
+    }
+}
+
+// MARK: - Манга: страницы и читалка
+struct MangaPage: Identifiable, Hashable {
+    let id: Int
+    let urls: [URL]
+    let width: CGFloat
+    let height: CGFloat
+
+    var url: URL { urls[0] }
+    var ratio: CGFloat { width > 0 && height > 0 ? height / width : 0 }
+    /// Страница должна занять по ширине экран, поэтому длинным полосам разрешаем больше пикселей.
+    var maxPixel: CGFloat { min(4096, max(1300, 1300 * (ratio > 0 ? ratio : 1.5))) }
+}
+
+actor MangaImageServers {
+    static let shared = MangaImageServers()
+    private var cached: [String]?
+    private let fallback = "https://img3.cdnlibs.org"
+
+    func bases() async -> [String] {
+        if let c = cached { return c }
+        var list: [String] = []
+        let q = [URLQueryItem(name: "fields[]", value: "imageServers")]
+        if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q),
+           let root = J.obj(data) as? [String: Any],
+           let d = root["data"] as? [String: Any],
+           let arr = d["imageServers"] as? [[String: Any]] {
+            let mine = arr.filter { srv in
+                guard let ids = srv["site_ids"] as? [Any], !ids.isEmpty else { return true }
+                return ids.contains { J.int($0) == 1 }
+            }
+            let main = mine.filter { ($0["id"] as? String) == "main" }
+            let rest = mine.filter { ($0["id"] as? String) != "main" }
+            list = (main + rest).compactMap { J.str($0["url"]) }
+            if !list.isEmpty { cached = list + (list.contains(fallback) ? [] : [fallback]) }
+        }
+        if !list.contains(fallback) { list.append(fallback) }
+        return list
+    }
+
+    static func resolve(_ path: String, base: String) -> URL? {
+        if path.hasPrefix("http") { return URL(string: path) }
+        if path.hasPrefix("//") { return URL(string: "https:" + path) }
+        var b = base
+        while b.hasSuffix("/") { b.removeLast() }
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        return URL(string: b + "/" + p)
+    }
+}
+
+enum MangaService {
+    static func pages(slug: String, chapter c: NovelChapter) async throws -> [MangaPage] {
+        let data = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
+                                                        query: NovelService.chapterQuery(c))
+        guard let root = J.obj(data) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { throw APIError.badURL }
+        let raw = (d["pages"] as? [[String: Any]]) ?? []
+        let bases = await MangaImageServers.shared.bases()
+        func num(_ v: Any?) -> CGFloat {
+            if let x = v as? Double { return CGFloat(x) }
+            return CGFloat(J.int(v) ?? 0)
+        }
+        var out: [MangaPage] = []
+        for p in raw {
+            guard let path = J.str(p["url"]) ?? J.str(p["image"]) else { continue }
+            let urls = bases.compactMap { MangaImageServers.resolve(path, base: $0) }
+            if urls.isEmpty { continue }
+            out.append(MangaPage(id: out.count, urls: urls, width: num(p["width"]), height: num(p["height"])))
+        }
+        return out
+    }
+}
+
+struct MangaPageView: View {
+    let page: MangaPage
+    @State private var image: UIImage?
+    @State private var failed = false
+    @State private var attempt = 0
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit().frame(maxWidth: .infinity)
+            } else if failed {
+                Button { failed = false; attempt += 1 } label: {
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("Страница \(page.id + 1) не загрузилась. Нажми, чтобы повторить.")
+                            .font(.caption)
+                            .multilineTextAlignment(.center)
+                    }
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(maxWidth: .infinity, minHeight: 240)
+                }
+            } else {
+                ZStack {
+                    Color.white.opacity(0.04)
+                    ProgressView().tint(.white)
+                }
+                .aspectRatio(page.ratio > 0 ? 1 / page.ratio : 0.7, contentMode: .fit)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .task(id: "\(page.id)-\(attempt)") { await load() }
+    }
+
+    private func load() async {
+        for u in page.urls {
+            let key = ImageCache.key(u, page.maxPixel)
+            if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+            if let img = await ImageLoader.shared.image(u, referer: LibSite.manga.referer, maxPixel: page.maxPixel) {
+                ImageCache.store(img, key)
+                image = img
+                return
+            }
+            if Task.isCancelled { return }
+        }
+        failed = true
+    }
+}
+
+struct ChapterCommentsView: View {
+    let novel: Anime
+    let chapter: NovelChapter
+    @StateObject private var vm: CommentsViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showCompose = false
+
+    init(novel: Anime, chapter: NovelChapter) {
+        self.novel = novel
+        self.chapter = chapter
+        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: chapter.id, slug: novel.slugUrl ?? String(novel.id),
+                                                          postType: "chapter"))
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView { CommentsList(vm: vm).padding(14) }
+                .background(AppBackground())
+                .navigationTitle("Глава \(chapter.number)")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        HStack(spacing: 12) {
+                            CommentSortMenu(vm: vm)
+                            Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                        }
+                    }
+                }
+                .commentSheets(vm, showCompose: $showCompose)
+                .task { await vm.loadMore() }
+        }
+    }
+}
+
+struct MangaReaderView: View {
+    let novel: Anime
+    let chapters: [NovelChapter]
+    @State private var index: Int
+    @State private var pages: [MangaPage] = []
+    @State private var loading = true
+    @State private var error: String?
+    @State private var chromeHidden = false
+    @State private var seen = 0
+    @State private var showComments = false
+    @Environment(\.dismiss) private var dismiss
+
+    init(novel: Anime, chapters: [NovelChapter], start: Int) {
+        self.novel = novel
+        self.chapters = chapters
+        _index = State(initialValue: min(max(start, 0), max(chapters.count - 1, 0)))
+    }
+
+    private var chapter: NovelChapter? { chapters.indices.contains(index) ? chapters[index] : nil }
+
+    private func go(_ delta: Int) {
+        let n = index + delta
+        guard chapters.indices.contains(n) else { return }
+        Haptics.tap()
+        index = n
+    }
+
+    private func preload(after id: Int) {
+        let next = pages.dropFirst(id + 1).prefix(3)
+        for p in next {
+            let u = p.url
+            let px = p.maxPixel
+            Task.detached(priority: .utility) {
+                let key = ImageCache.key(u, px)
+                if ImageCache.shared.object(forKey: key) != nil { return }
+                if let img = await ImageLoader.shared.image(u, referer: LibSite.manga.referer, maxPixel: px) {
+                    ImageCache.store(img, key)
+                }
+            }
+        }
+    }
+
+    private var endCard: some View {
+        VStack(spacing: 12) {
+            Text(index + 1 < chapters.count ? "Глава закончилась" : "Это последняя глава")
+                .font(.subheadline).foregroundStyle(.white.opacity(0.7))
+            if index + 1 < chapters.count {
+                Button { go(1) } label: {
+                    Label("Следующая глава", systemImage: "chevron.right.circle.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.pressable)
+            }
+            Button { showComments = true } label: {
+                Label("Комментарии к главе", systemImage: "bubble.left.and.bubble.right")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+        }
+        .padding(20)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 12) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").font(.headline).frame(width: 40, height: 40)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(novel.displayTitle).font(.footnote.bold()).lineLimit(1)
+                if let c = chapter {
+                    Text("Том \(c.volume) · Глава \(c.number)").font(.caption2).opacity(0.7)
+                }
+            }
+            Spacer()
+            Button { showComments = true } label: {
+                Image(systemName: "bubble.left.and.bubble.right").frame(width: 40, height: 40)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 10)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+        .background(LinearGradient(colors: [.black.opacity(0.85), .clear], startPoint: .top, endPoint: .bottom))
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            Button { go(-1) } label: { Image(systemName: "chevron.left").frame(width: 48, height: 40) }
+                .disabled(index == 0)
+            Spacer()
+            Text(pages.isEmpty ? "…" : "\(min(max(seen, 1), pages.count)) / \(pages.count)")
+                .font(.footnote.monospacedDigit())
+            Spacer()
+            Button { go(1) } label: { Image(systemName: "chevron.right").frame(width: 48, height: 40) }
+                .disabled(index + 1 >= chapters.count)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 6)
+        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if loading {
+                        ProgressView().tint(.white).frame(maxWidth: .infinity).padding(.top, 220)
+                    }
+                    if let e = error {
+                        VStack(spacing: 10) {
+                            Text(e).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
+                            Button("Повторить") { Task { await load() } }
+                        }
+                        .padding(24)
+                    }
+                    ForEach(pages) { p in
+                        MangaPageView(page: p)
+                            .onAppear {
+                                if p.id + 1 > seen { seen = p.id + 1 }
+                                preload(after: p.id)
+                            }
+                    }
+                    if !pages.isEmpty { endCard }
+                }
+            }
+            .id(index)
+            .ignoresSafeArea(edges: .bottom)
+            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
+
+            VStack {
+                if !chromeHidden { topBar.transition(.move(edge: .top).combined(with: .opacity)) }
+                Spacer()
+                if !chromeHidden { bottomBar.transition(.move(edge: .bottom).combined(with: .opacity)) }
+            }
+        }
+        .statusBarHidden(chromeHidden)
+        .preferredColorScheme(.dark)
+        .task(id: index) { await load() }
+        .sheet(isPresented: $showComments) {
+            if let c = chapter { ChapterCommentsView(novel: novel, chapter: c) }
+        }
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+    }
+
+    private func load() async {
+        guard let ch = chapter, let slug = novel.slugUrl else { return }
+        loading = true
+        error = nil
+        pages = []
+        seen = 0
+        ReadStore.shared.mark(novel.readKey, ch.id)
+        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        do {
+            let result = try await MangaService.pages(slug: slug, chapter: ch)
+            if Task.isCancelled { return }
+            pages = result
+            if result.isEmpty {
+                error = "У главы нет страниц или она недоступна."
+            } else {
+                preload(after: -1)
+            }
+        } catch {
+            if Task.isCancelled { return }
+            self.error = error.localizedDescription
+        }
+        loading = false
     }
 }
 
@@ -5314,8 +5683,8 @@ struct NovelReaderView: View {
         error = nil
         debug = ""
         blocks = []
-        ReadStore.shared.mark(novel.id, ch.id)
-        HistoryStore.novels.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        ReadStore.shared.mark(novel.readKey, ch.id)
+        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
         if let local = store.blocks(novel: novel.id, chapter: ch.id) {
             blocks = local
             loading = false
