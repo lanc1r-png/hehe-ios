@@ -3703,6 +3703,7 @@ final class AuthStore: ObservableObject {
     @Published var token: String?
     @Published var user: ProfileUser?
     @Published var error: String?
+    @Published var coverDebug = ""
 
     init() {
         token = Keychain.get("lib.token")
@@ -3725,19 +3726,42 @@ final class AuthStore: ObservableObject {
                                                 modifiedSince: .distantPast) {}
     }
 
-    nonisolated static func coverURL(_ d: [String: Any]) -> URL? {
-        for k in ["cover", "background", "banner", "header", "profile_cover"] {
-            if let u = J.url(d[k]) { return u }
+    nonisolated static func coverURL(_ d: [String: Any]) -> URL? { deepCover(d, depth: 0) }
+
+    /// Ищем баннер по любому ключу с «cover», «background» или «banner», в том числе во вложенных объектах.
+    nonisolated private static func deepCover(_ d: [String: Any], depth: Int) -> URL? {
+        let hints = ["cover", "background", "banner", "header", "bg"]
+        for (k, v) in d where hints.contains(where: { k.lowercased().contains($0) }) {
+            if let u = J.url(v) { return u }
+        }
+        if depth < 3 {
+            for (_, v) in d {
+                if let nested = v as? [String: Any], let u = deepCover(nested, depth: depth + 1) { return u }
+            }
         }
         return nil
     }
 
     /// Баннер может прийти только в публичном профиле, поэтому спрашиваем его отдельно.
     private func loadCover(id: Int, token: String) async {
-        guard let data = try? await AnimelibAPI.shared.rawData("/user/\(id)", token: token),
-              let root = J.obj(data) as? [String: Any] else { return }
-        let d = (root["data"] as? [String: Any]) ?? root
-        if let u = AuthStore.coverURL(d) { user?.cover = u }
+        var log: [String] = []
+        let variants: [[String]] = [[], ["background"], ["cover"], ["banner"]]
+        for fields in variants {
+            let q = fields.map { URLQueryItem(name: "fields[]", value: $0) }
+            let label = fields.first ?? "без полей"
+            do {
+                let data = try await AnimelibAPI.shared.rawData("/user/\(id)", query: q, token: token)
+                guard let root = J.obj(data) as? [String: Any] else { log.append("\(label): не JSON"); continue }
+                let d = (root["data"] as? [String: Any]) ?? root
+                if let u = AuthStore.coverURL(d) { user?.cover = u; coverDebug = ""; return }
+                log.append("\(label): ключи " + d.keys.sorted().joined(separator: ","))
+            } catch APIError.http(let code, _) {
+                log.append("\(label): HTTP \(code)")
+            } catch {
+                log.append("\(label): сбой")
+            }
+        }
+        coverDebug = log.joined(separator: "\n")
     }
 
     func refreshUser() async {
@@ -4116,12 +4140,8 @@ struct ProfileView: View {
                                 if let c = u.cover {
                                     AnimatedRemoteImage(url: c, maxPixel: 900)
                                 } else {
-                                    ZStack {
-                                        Theme.accent.opacity(0.35)
-                                        AnimatedRemoteImage(url: u.avatar, maxPixel: 200)
-                                            .blur(radius: 30)
-                                            .opacity(0.55)
-                                    }
+                                    LinearGradient(colors: [Theme.accent.opacity(0.55), Theme.accent.opacity(0.15)],
+                                                   startPoint: .topLeading, endPoint: .bottomTrailing)
                                 }
                             }
                             .frame(height: 150)
@@ -4167,6 +4187,18 @@ struct ProfileView: View {
                         .background(Theme.card)
                         .clipShape(RoundedRectangle(cornerRadius: 22))
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.chip))
+
+                        if u.cover == nil && !auth.coverDebug.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Баннер профиля не найден. Пришли этот текст разработчику:")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                Text(auth.coverDebug)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
 
                         if !vm.folders.isEmpty {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 10)], spacing: 10) {
@@ -5541,6 +5573,7 @@ actor MangaImageStore {
 struct MangaPageView: View {
     let page: MangaPage
     var vertical = false
+    var dim: CGFloat = 1
     let onTap: (CGFloat) -> Void
     @State private var image: UIImage?
     @State private var failed = false
@@ -5612,6 +5645,7 @@ struct MangaPageView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
+                    .colorMultiply(Color(white: dim))
                     .frame(width: size.width, height: size.height)
                     .scaleEffect(scale)
                     .offset(offset)
@@ -5729,7 +5763,7 @@ struct BookPager: UIViewControllerRepresentable {
         func host(_ i: Int) -> Host? {
             guard i >= 0, i <= parent.pages.count else { return nil }
             let view: AnyView = i < parent.pages.count
-                ? AnyView(MangaPageView(page: parent.pages[i], onTap: parent.onTap).background(Color.black))
+                ? AnyView(MangaPageView(page: parent.pages[i], dim: 0.9, onTap: parent.onTap))
                 : parent.end
             let h = Host(rootView: view)
             h.index = i
@@ -5935,7 +5969,22 @@ struct MangaReaderView: View {
     private var pagedView: some View {
         switch anim {
         case "book":
-            BookPager(pages: pages, current: $current, onTap: handleTap, end: AnyView(endCard))
+            GeometryReader { geo in
+                let ref = pages[min(current, pages.count - 1)]
+                let ratio = ref.ratio > 0 ? ref.ratio : 1.5
+                let w0 = geo.size.width
+                let h0 = w0 * ratio
+                let fitH = min(h0, geo.size.height)
+                let fitW = h0 > geo.size.height ? fitH / ratio : w0
+                ZStack {
+                    Color.black
+                        .contentShape(Rectangle())
+                        .onTapGesture { handleTap(0.5) }
+                    BookPager(pages: pages, current: $current, onTap: handleTap, end: AnyView(endCard))
+                        .frame(width: fitW, height: fitH)
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+            }
         case "fade":
             ZStack {
                 if current < pages.count {
