@@ -5180,13 +5180,13 @@ actor MangaImageServers {
 
     /// Адрес «как есть»: сервер + путь без правок (так делают сайт и сторонние клиенты).
     static func raw(_ path: String, base: String) -> URL? {
-        if path.hasPrefix("http") || path.hasPrefix("//") { return nil }
-        return URL(string: base + path)
+        if path.hasPrefix("http") { return nil }
+        return URL(string: base + (path.hasPrefix("/") ? path : "/" + path))
     }
 
     static func resolve(_ path: String, base: String) -> URL? {
+        // Путь страницы приходит как «//manga/…»: это часть адреса на сервере картинок, а не хост.
         if path.hasPrefix("http") { return URL(string: path) }
-        if path.hasPrefix("//") { return URL(string: "https:" + path) }
         var b = base
         while b.hasSuffix("/") { b.removeLast() }
         var p = path
