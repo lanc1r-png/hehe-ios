@@ -4,6 +4,84 @@ import AVFoundation
 import Foundation
 import WebKit
 
+// MARK: - Тема и общие элементы дизайна
+
+enum Theme {
+    static let accent = Color(red: 0.66, green: 0.48, blue: 1.0)
+}
+
+struct AppBackground: View {
+    var body: some View {
+        ZStack {
+            Color.black
+            RadialGradient(colors: [Theme.accent.opacity(0.35), .clear],
+                           center: .topLeading, startRadius: 20, endRadius: 460)
+            RadialGradient(colors: [Color.pink.opacity(0.18), .clear],
+                           center: .bottomTrailing, startRadius: 20, endRadius: 460)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct Chip: View {
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.subheadline)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .foregroundStyle(selected ? Color.white : Color.primary)
+                .background(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct Pill: View {
+    let icon: String
+    let text: String
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+/// Раскладка «теги в несколько строк».
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowH: CGFloat = 0, width: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            if x + sz.width > maxW && x > 0 { y += rowH + spacing; x = 0; rowH = 0 }
+            x += sz.width + spacing
+            rowH = max(rowH, sz.height)
+            width = max(width, x - spacing)
+        }
+        return CGSize(width: width, height: y + rowH)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowH: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            if x + sz.width > bounds.maxX && x > bounds.minX { y += rowH + spacing; x = bounds.minX; rowH = 0 }
+            s.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            x += sz.width + spacing
+            rowH = max(rowH, sz.height)
+        }
+    }
+}
+
 // MARK: - Models
 
 struct Envelope<T: Decodable>: Decodable {
@@ -26,6 +104,16 @@ struct NamedItem: Codable, Hashable {
     let name: String?
     let label: String?
     var title: String { name ?? label ?? "" }
+
+    enum CodingKeys: String, CodingKey { case id, name, label }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(Int.self, forKey: .id))
+            ?? (try? c.decode(String.self, forKey: .id)).flatMap { Int($0) }
+        name = try? c.decode(String.self, forKey: .name)
+        label = try? c.decode(String.self, forKey: .label)
+    }
 }
 
 struct RichNode: Decodable {
@@ -227,6 +315,14 @@ struct PlayableVariant: Identifiable, Hashable {
     var isWeb = false
 }
 
+struct FilterOptions {
+    var genres: [NamedItem] = []
+    var tags: [NamedItem] = []
+    var types: [NamedItem] = []
+    var statuses: [NamedItem] = []
+    var isEmpty: Bool { genres.isEmpty && tags.isEmpty && types.isEmpty && statuses.isEmpty }
+}
+
 // MARK: - API
 enum APIError: LocalizedError {
     case badURL, http(Int, String), noVideo
@@ -242,7 +338,12 @@ enum APIError: LocalizedError {
 struct CatalogFilter: Equatable {
     var query: String = ""
     var sortBy: SortOption = .rating
-    var ongoingOnly = false
+    var genres: Set<Int> = []
+    var tags: Set<Int> = []
+    var types: Set<Int> = []
+    var statuses: Set<Int> = []
+
+    var activeCount: Int { genres.count + tags.count + types.count + statuses.count }
 
     enum SortOption: String, CaseIterable, Identifiable {
         case rating = "rate_avg"
@@ -311,13 +412,38 @@ actor AnimelibAPI {
             .init(name: "sort_type", value: "desc"),
         ]
         if withSite { q.append(.init(name: "site_id[]", value: "5")) }
-        if !filter.query.trimmingCharacters(in: .whitespaces).isEmpty {
-            q.append(.init(name: "q", value: filter.query))
-        }
-        if filter.ongoingOnly { q.append(.init(name: "status[]", value: "2")) }
+        let text = filter.query.trimmingCharacters(in: .whitespaces)
+        if !text.isEmpty { q.append(.init(name: "q", value: text)) }
+        for id in filter.genres.sorted() { q.append(.init(name: "genres[]", value: String(id))) }
+        for id in filter.tags.sorted() { q.append(.init(name: "tags[]", value: String(id))) }
+        for id in filter.types.sorted() { q.append(.init(name: "types[]", value: String(id))) }
+        for id in filter.statuses.sorted() { q.append(.init(name: "status[]", value: String(id))) }
         let r = try await get("/anime", query: q, as: Envelope<[Anime]>.self)
         let hasNext = r.meta?.hasNextPage ?? !r.data.isEmpty
         return (r.data, hasNext)
+    }
+
+    /// Списки жанров, тегов, типов и статусов берём у сайта.
+    func filterOptions() async -> FilterOptions {
+        var o = FilterOptions()
+        o.genres = await constantList("genres", keys: ["genres"])
+        o.tags = await constantList("tags", keys: ["tags"])
+        o.types = await constantList("types", keys: ["types", "type"])
+        o.statuses = await constantList("status", keys: ["status", "statuses"])
+        return o
+    }
+
+    private func constantList(_ field: String, keys: [String]) async -> [NamedItem] {
+        let q = [URLQueryItem(name: "fields[]", value: field)]
+        guard let dict = try? await get("/constants", query: q, as: Envelope<[String: [NamedItem]]>.self).data else {
+            return []
+        }
+        var list: [NamedItem] = []
+        for k in keys {
+            if let v = dict[k] { list = v; break }
+        }
+        if list.isEmpty { list = dict.values.first ?? [] }
+        return list.filter { $0.id != nil && !$0.title.isEmpty }
     }
 
     func rawText(_ path: String, query: [URLQueryItem] = []) async -> String {
@@ -337,9 +463,13 @@ actor AnimelibAPI {
     }
 
     func details(slug: String) async throws -> Anime {
-        let fields = ["summary", "genres", "authors", "otherNames"]
-        let q = fields.map { URLQueryItem(name: "fields[]", value: $0) }
-        return try await get("/anime/\(slug)", query: q, as: Envelope<Anime>.self).data
+        let base = ["summary", "genres", "authors", "otherNames"]
+        func query(_ f: [String]) -> [URLQueryItem] { f.map { URLQueryItem(name: "fields[]", value: $0) } }
+        do {
+            return try await get("/anime/\(slug)", query: query(base + ["rate_avg"]), as: Envelope<Anime>.self).data
+        } catch {
+            return try await get("/anime/\(slug)", query: query(base), as: Envelope<Anime>.self).data
+        }
     }
 
     func episodes(animeID: Int) async throws -> [EpisodeShort] {
@@ -475,25 +605,29 @@ final class FavoritesStore: ObservableObject {
 
 struct FavoritesView: View {
     @ObservedObject private var favorites = FavoritesStore.shared
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 12)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 if favorites.items.isEmpty {
-                    Text("Пока пусто. Откройте тайтл и нажмите сердечко.")
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 80).padding(.horizontal)
+                    VStack(spacing: 10) {
+                        Image(systemName: "heart.slash").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("Пока пусто.\nОткройте тайтл и нажмите сердечко.")
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.top, 100)
                 }
-                LazyVGrid(columns: columns, spacing: 16) {
+                LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(favorites.items) { anime in
                         NavigationLink(value: anime) { AnimeCard(anime: anime) }
                             .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 14)
             }
+            .background(AppBackground())
             .navigationTitle("Избранное")
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
         }
@@ -508,6 +642,8 @@ struct RootView: View {
             FavoritesView()
                 .tabItem { Label("Избранное", systemImage: "heart") }
         }
+        .tint(Theme.accent)
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -518,6 +654,8 @@ final class CatalogViewModel: ObservableObject {
     @Published var filter = CatalogFilter()
     @Published var isLoading = false
     @Published var error: String?
+    @Published var options = FilterOptions()
+    @Published var optionsLoading = false
 
     private var page = 1
     private var hasNext = true
@@ -526,6 +664,7 @@ final class CatalogViewModel: ObservableObject {
     func reload() async {
         generation += 1
         page = 1; hasNext = true; items = []; error = nil
+        isLoading = false
         await loadMore()
     }
 
@@ -546,52 +685,197 @@ final class CatalogViewModel: ObservableObject {
             self.error = error.localizedDescription
         }
     }
+
+    func toggle(_ kp: WritableKeyPath<CatalogFilter, Set<Int>>, _ id: Int) {
+        if filter[keyPath: kp].contains(id) {
+            filter[keyPath: kp].remove(id)
+        } else {
+            filter[keyPath: kp].insert(id)
+        }
+    }
+
+    func resetFilters() {
+        filter.genres = []; filter.tags = []; filter.types = []; filter.statuses = []
+    }
+
+    func loadOptionsIfNeeded(force: Bool = false) async {
+        guard !optionsLoading, force || options.isEmpty else { return }
+        optionsLoading = true
+        options = await AnimelibAPI.shared.filterOptions()
+        optionsLoading = false
+    }
 }
 
-struct CatalogView: View {
-    @StateObject private var vm = CatalogViewModel()
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 12)]
+struct SearchBar: View {
+    @Binding var text: String
+    var onSubmit: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Поиск по названию", text: $text)
+                .submitLabel(.search)
+                .onSubmit(onSubmit)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                    onSubmit()
+                } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+struct OptionBlock: View {
+    let title: String
+    let items: [NamedItem]
+    let keyPath: WritableKeyPath<CatalogFilter, Set<Int>>
+    @ObservedObject var vm: CatalogViewModel
+
+    var body: some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title).font(.headline)
+                FlowLayout(spacing: 8) {
+                    ForEach(items, id: \.id) { item in
+                        Chip(title: item.title,
+                             selected: item.id.map { vm.filter[keyPath: keyPath].contains($0) } ?? false) {
+                            if let id = item.id { vm.toggle(keyPath, id) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct FilterSheet: View {
+    @ObservedObject var vm: CatalogViewModel
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                if let e = vm.error, vm.items.isEmpty {
-                    VStack(spacing: 12) {
-                        Text(e).multilineTextAlignment(.center).foregroundStyle(.secondary)
-                        Button("Повторить") { Task { await vm.reload() } }
-                    }.padding(.top, 60).padding(.horizontal)
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Сортировка").font(.headline)
+                        FlowLayout(spacing: 8) {
+                            ForEach(CatalogFilter.SortOption.allCases) { opt in
+                                Chip(title: opt.title, selected: vm.filter.sortBy == opt) {
+                                    vm.filter.sortBy = opt
+                                }
+                            }
+                        }
+                    }
+
+                    if vm.optionsLoading {
+                        HStack { ProgressView(); Text("Загружаю жанры и теги…").foregroundStyle(.secondary) }
+                    } else if vm.options.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Не удалось загрузить жанры и теги.").foregroundStyle(.secondary)
+                            Button("Повторить") { Task { await vm.loadOptionsIfNeeded(force: true) } }
+                        }
+                    }
+
+                    OptionBlock(title: "Тип", items: vm.options.types, keyPath: \.types, vm: vm)
+                    OptionBlock(title: "Статус", items: vm.options.statuses, keyPath: \.statuses, vm: vm)
+                    OptionBlock(title: "Жанры", items: vm.options.genres, keyPath: \.genres, vm: vm)
+                    OptionBlock(title: "Теги", items: vm.options.tags, keyPath: \.tags, vm: vm)
                 }
-                LazyVGrid(columns: columns, spacing: 16) {
-                    ForEach(vm.items) { anime in
-                        NavigationLink(value: anime) { AnimeCard(anime: anime) }
-                            .buttonStyle(.plain)
-                            .onAppear {
-                                if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(AppBackground())
+            .navigationTitle("Фильтры")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Сбросить") { vm.resetFilters() }
+                        .disabled(vm.filter.activeCount == 0)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Показать") {
+                        dismiss()
+                        Task { await vm.reload() }
+                    }
+                    .bold()
+                }
+            }
+        }
+        .task { await vm.loadOptionsIfNeeded() }
+    }
+}
+
+struct CatalogView: View {
+    @StateObject private var vm = CatalogViewModel()
+    @State private var showFilters = false
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    SearchBar(text: $vm.filter.query) { Task { await vm.reload() } }
+                    Button { showFilters = true } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.title3)
+                            .frame(width: 44, height: 44)
+                            .background(vm.filter.activeCount > 0 ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Circle())
+                            .overlay(alignment: .topTrailing) {
+                                if vm.filter.activeCount > 0 {
+                                    Text("\(vm.filter.activeCount)")
+                                        .font(.caption2.bold())
+                                        .padding(4)
+                                        .background(Color.pink, in: Circle())
+                                        .offset(x: 4, y: -4)
+                                }
                             }
                     }
+                    .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 12)
-                if vm.isLoading { ProgressView().padding() }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+
+                ScrollView {
+                    if let e = vm.error, vm.items.isEmpty {
+                        VStack(spacing: 12) {
+                            Text(e).multilineTextAlignment(.center).foregroundStyle(.secondary)
+                            Button("Повторить") { Task { await vm.reload() } }
+                        }
+                        .padding(.top, 60).padding(.horizontal)
+                    } else if vm.items.isEmpty && !vm.isLoading {
+                        Text("Ничего не найдено")
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 80)
+                    }
+                    LazyVGrid(columns: columns, spacing: 18) {
+                        ForEach(vm.items) { anime in
+                            NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                                .buttonStyle(.plain)
+                                .onAppear {
+                                    if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                                }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    if vm.isLoading { ProgressView().padding() }
+                }
+                .scrollDismissesKeyboard(.immediately)
+                .refreshable { await vm.reload() }
             }
+            .background(AppBackground())
             .navigationTitle("Hehe")
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
-            .searchable(text: $vm.filter.query, prompt: "Поиск аниме")
-            .onSubmit(of: .search) { Task { await vm.reload() } }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Picker("Сортировка", selection: $vm.filter.sortBy) {
-                            ForEach(CatalogFilter.SortOption.allCases) { Text($0.title).tag($0) }
-                        }
-                        Toggle("Только онгоинги", isOn: $vm.filter.ongoingOnly)
-                    } label: { Image(systemName: "line.3.horizontal.decrease.circle") }
-                }
-            }
-            .onChange(of: vm.filter.sortBy) { _ in Task { await vm.reload() } }
-            .onChange(of: vm.filter.ongoingOnly) { _ in Task { await vm.reload() } }
-            .onChange(of: vm.filter.query) { q in if q.isEmpty { Task { await vm.reload() } } }
+            .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
-            .refreshable { await vm.reload() }
         }
     }
 }
@@ -599,11 +883,25 @@ struct CatalogView: View {
 struct AnimeCard: View {
     let anime: Anime
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             RemoteImage(url: anime.imageURL)
-            .aspectRatio(2/3, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            Text(anime.displayTitle).font(.footnote).lineLimit(2)
+                .aspectRatio(2/3, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .shadow(color: .black.opacity(0.4), radius: 6, y: 3)
+                .overlay(alignment: .bottomLeading) {
+                    if let r = anime.rateAvg {
+                        Label(r, systemImage: "star.fill")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(6)
+                    }
+                }
+            Text(anime.displayTitle)
+                .font(.footnote.weight(.medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
         }
     }
 }
@@ -637,58 +935,128 @@ final class DetailViewModel: ObservableObject {
 struct DetailView: View {
     @StateObject private var vm: DetailViewModel
     @State private var selected: EpisodeShort?
+    @State private var expanded = false
     @ObservedObject private var favorites = FavoritesStore.shared
 
     init(anime: Anime) { _vm = StateObject(wrappedValue: DetailViewModel(anime: anime)) }
 
+    private var backdrop: some View {
+        ZStack {
+            Color.black
+            RemoteImage(url: vm.anime.imageURL)
+                .blur(radius: 50)
+                .opacity(0.55)
+            LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
+        }
+        .ignoresSafeArea()
+    }
+
     var body: some View {
-        List {
-            Section {
-                HStack(alignment: .top, spacing: 12) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top, spacing: 14) {
                     RemoteImage(url: vm.anime.imageURL)
-                    .frame(width: 110, height: 165)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(vm.anime.displayTitle).font(.headline)
+                        .frame(width: 120, height: 180)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                        .shadow(color: .black.opacity(0.5), radius: 10, y: 5)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(vm.anime.displayTitle).font(.title3.bold())
                         if let n = vm.anime.name, n != vm.anime.displayTitle {
                             Text(n).font(.caption).foregroundStyle(.secondary)
                         }
-                        if let s = vm.anime.status?.title, !s.isEmpty { Label(s, systemImage: "dot.radiowaves.left.and.right") }
-                        if let t = vm.anime.type?.title, !t.isEmpty { Label(t, systemImage: "tv") }
-                        if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Label(a, systemImage: "exclamationmark.shield") }
-                        if let r = vm.anime.rateAvg { Label(r, systemImage: "star.fill") }
-                    }.font(.footnote)
-                }
-                if let g = vm.anime.genres, !g.isEmpty {
-                    Text(g.map(\.title).joined(separator: " · ")).font(.footnote).foregroundStyle(.secondary)
-                }
-                if let au = vm.anime.authors, !au.isEmpty {
-                    Text("Автор: " + au.map(\.title).joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
-                }
-                if let s = vm.anime.summary, !s.isEmpty {
-                    Text(s).font(.callout)
-                }
-            }
-            Section("Серии") {
-                if vm.isLoading { ProgressView() }
-                if let e = vm.error { Text(e).foregroundStyle(.red) }
-                ForEach(vm.episodes) { ep in
-                    Button { selected = ep } label: {
-                        HStack {
-                            Text(ep.title).foregroundStyle(.primary)
-                            Spacer()
-                            Image(systemName: "play.circle")
+                        FlowLayout(spacing: 6) {
+                            if let s = vm.anime.status?.title, !s.isEmpty { Pill(icon: "dot.radiowaves.left.and.right", text: s) }
+                            if let t = vm.anime.type?.title, !t.isEmpty { Pill(icon: "tv", text: t) }
+                            if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Pill(icon: "exclamationmark.shield", text: a) }
+                            if let r = vm.anime.rateAvg { Pill(icon: "star.fill", text: r) }
                         }
                     }
                 }
+
+                if let g = vm.anime.genres, !g.isEmpty {
+                    FlowLayout(spacing: 6) {
+                        ForEach(g, id: \.id) { item in
+                            Text(item.title)
+                                .font(.caption)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Theme.accent.opacity(0.28), in: Capsule())
+                        }
+                    }
+                }
+
+                if let s = vm.anime.summary, !s.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(s).font(.callout).lineLimit(expanded ? nil : 5)
+                        if s.count > 220 {
+                            Button(expanded ? "Свернуть" : "Читать полностью") {
+                                withAnimation { expanded.toggle() }
+                            }
+                            .font(.footnote.bold())
+                        }
+                        if let au = vm.anime.authors, !au.isEmpty {
+                            Text("Автор: " + au.map(\.title).joined(separator: ", "))
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+
+                if let slug = vm.anime.slugUrl, let url = URL(string: "https://v5.animelib.org/ru/anime/\(slug)") {
+                    Link(destination: url) {
+                        Label("Открыть на сайте", systemImage: "safari")
+                            .font(.subheadline)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                }
+
+                Text("Серии").font(.title3.bold())
+                if vm.isLoading { ProgressView() }
+                if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
+                if !vm.isLoading && vm.episodes.isEmpty && vm.error == nil {
+                    Text("Серий пока нет").foregroundStyle(.secondary)
+                }
+                LazyVStack(spacing: 8) {
+                    ForEach(vm.episodes) { ep in
+                        Button { selected = ep } label: {
+                            HStack(spacing: 12) {
+                                Text(ep.number ?? "–")
+                                    .font(.subheadline.bold())
+                                    .frame(width: 38, height: 38)
+                                    .background(Theme.accent.opacity(0.28), in: Circle())
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text((ep.name?.isEmpty == false ? ep.name! : "Серия \(ep.number ?? "")"))
+                                        .font(.subheadline)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                    if let s = ep.season, s != "1" {
+                                        Text("Сезон \(s)").font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: "play.fill").foregroundStyle(Theme.accent)
+                            }
+                            .padding(10)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
+            .padding(16)
         }
+        .background(backdrop)
         .navigationTitle(vm.anime.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { favorites.toggle(vm.anime) } label: {
                     Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
+                        .foregroundStyle(favorites.contains(vm.anime) ? Color.pink : Color.primary)
                 }
             }
         }
@@ -700,6 +1068,8 @@ struct DetailView: View {
 }
 
 // MARK: - Player
+/// Страница плеера Kodik встраивается как iframe на «странице сайта» (baseURL),
+/// так же, как это делает сам сайт.
 struct WebPlayerView: UIViewRepresentable {
     let url: URL
 
@@ -710,6 +1080,7 @@ struct WebPlayerView: UIViewRepresentable {
         let cfg = WKWebViewConfiguration()
         cfg.allowsInlineMediaPlayback = true
         let v = WKWebView(frame: .zero, configuration: cfg)
+        v.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         v.isOpaque = false
         v.backgroundColor = .black
         v.scrollView.isScrollEnabled = false
@@ -719,9 +1090,16 @@ struct WebPlayerView: UIViewRepresentable {
     func updateUIView(_ v: WKWebView, context: Context) {
         guard context.coordinator.loaded != url else { return }
         context.coordinator.loaded = url
-        var req = URLRequest(url: url)
-        req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
-        v.load(req)
+        let html = """
+        <!doctype html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+        <style>html,body{margin:0;height:100%;background:#000}
+        iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}</style>
+        </head><body>
+        <iframe src="\(url.absoluteString)" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
+        </body></html>
+        """
+        v.loadHTMLString(html, baseURL: URL(string: "https://v5.animelib.org/"))
     }
 }
 
@@ -742,8 +1120,7 @@ final class PlayerViewModel: ObservableObject {
         } catch {
             self.error = error.localizedDescription
             let a = await AnimelibAPI.shared.rawText("/episodes/\(episodeID)")
-            let b = await AnimelibAPI.shared.rawText("/constants", query: [URLQueryItem(name: "fields[]", value: "videoServers")])
-            debug = a + "\n---\n" + b
+            debug = a
         }
         isLoading = false
     }
@@ -793,29 +1170,42 @@ struct PlayerScreen: View {
                 }
                 .aspectRatio(16/9, contentMode: .fit)
 
-                List {
-                    if !vm.debug.isEmpty {
-                        Section("Отладка (пришлите скриншот)") {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !vm.debug.isEmpty {
                             Text(vm.debug)
                                 .font(.system(size: 9, design: .monospaced))
                                 .textSelection(.enabled)
                         }
-                    }
-                    Section("Озвучка и качество") {
+                        if !vm.variants.isEmpty {
+                            Text("Озвучка и качество").font(.headline).padding(.top, 8)
+                        }
                         ForEach(vm.variants) { v in
-                            Button {
-                                vm.select(v)
-                            } label: {
+                            Button { vm.select(v) } label: {
                                 HStack {
-                                    Text(v.title).foregroundStyle(.primary)
+                                    Text(v.title).foregroundStyle(.primary).multilineTextAlignment(.leading)
                                     Spacer()
-                                    if v.id == vm.current?.id { Image(systemName: "checkmark") }
+                                    if v.id == vm.current?.id {
+                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
+                                    }
                                 }
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                             }
+                            .buttonStyle(.plain)
+                        }
+                        if let v = vm.current, v.isWeb {
+                            Link(destination: v.url) {
+                                Label("Открыть этот плеер в Safari", systemImage: "safari")
+                                    .font(.footnote)
+                            }
+                            .padding(.top, 6)
                         }
                     }
+                    .padding(14)
                 }
             }
+            .background(AppBackground())
             .navigationTitle(episode.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
