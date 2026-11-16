@@ -15,6 +15,30 @@ enum Theme {
     }
 }
 
+/// Сайт сети Lib, с которым сейчас работает приложение (аниме или ранобэ).
+struct LibSite: Hashable {
+    let key: String
+    let id: String
+    let referer: String
+    let origin: String
+    let apiPath: String
+    let postType: String
+    let title: String
+
+    var isRanobe: Bool { key == "ranobe" }
+
+    static let anime = LibSite(key: "anime", id: "5", referer: "https://v5.animelib.org/",
+                               origin: "https://v5.animelib.org", apiPath: "/anime",
+                               postType: "anime", title: "Аниме")
+    static let ranobe = LibSite(key: "ranobe", id: "3", referer: "https://ranobelib.me/",
+                                origin: "https://ranobelib.me", apiPath: "/manga",
+                                postType: "manga", title: "Ранобэ")
+
+    static var current: LibSite {
+        UserDefaults.standard.string(forKey: "set.platform") == "ranobe" ? .ranobe : .anime
+    }
+}
+
 enum Settings {
     static func bool(_ key: String, _ def: Bool) -> Bool {
         (UserDefaults.standard.object(forKey: key) as? Bool) ?? def
@@ -180,7 +204,20 @@ struct Cover: Codable, Hashable {
     let md: String?
 }
 
+struct RatingBox: Decodable {
+    let average: String?
+    enum K: String, CodingKey { case average }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        if let s = try? c.decode(String.self, forKey: .average) { average = s }
+        else if let x = try? c.decode(Double.self, forKey: .average) { average = String(format: "%.1f", x) }
+        else { average = nil }
+    }
+}
+
 struct Anime: Codable, Identifiable, Hashable {
+    private enum RatingKeys: String, CodingKey { case rating }
+
     let id: Int
     let name: String?
     let rusName: String?
@@ -238,6 +275,9 @@ struct Anime: Codable, Identifiable, Hashable {
         releaseDateString = try? c.decode(String.self, forKey: .releaseDateString)
         if let s = try? c.decode(String.self, forKey: .rateAvg) { rateAvg = s }
         else if let d = try? c.decode(Double.self, forKey: .rateAvg) { rateAvg = String(format: "%.1f", d) }
+        else if let rc = try? decoder.container(keyedBy: RatingKeys.self),
+                let rb = try? rc.decode(RatingBox.self, forKey: .rating),
+                let av = rb.average { rateAvg = av }
         else { rateAvg = nil }
     }
 }
@@ -381,6 +421,24 @@ struct CatalogFilter: Equatable {
         case lastEpisode = "last_episode_at"
         case name = "name"
         var id: String { rawValue }
+
+        /// Названия полей сортировки у разных сайтов отличаются, пробуем по очереди.
+        func aliases(_ site: LibSite) -> [String] {
+            guard site.isRanobe else { return [rawValue] }
+            switch self {
+            case .rating: return ["rate_avg", "rating_score"]
+            case .views: return ["views"]
+            case .newest: return ["created_at"]
+            case .lastEpisode: return ["last_chapter_at", "last_episode_at"]
+            case .name: return ["name", "rus_name"]
+            }
+        }
+
+        func label(_ ranobe: Bool) -> String {
+            if ranobe && self == .lastEpisode { return "Свежие главы" }
+            if ranobe && self == .views { return "По чтению" }
+            return title
+        }
         var title: String {
             switch self {
             case .rating: return "По рейтингу"
@@ -407,6 +465,11 @@ actor AnimelibAPI {
         session = URLSession(configuration: cfg)
     }
 
+    nonisolated var siteHeaders: [String: String] {
+        let site = LibSite.current
+        return ["Referer": site.referer, "Origin": site.origin, "Site-Id": site.id]
+    }
+
     nonisolated var playbackHeaders: [String: String] {
         ["Referer": "https://v5.animelib.org/", "Origin": "https://v5.animelib.org"]
     }
@@ -416,7 +479,7 @@ actor AnimelibAPI {
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { throw APIError.badURL }
         var req = URLRequest(url: url)
-        for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, resp) = try await session.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -427,29 +490,57 @@ actor AnimelibAPI {
     }
 
     func catalog(filter: CatalogFilter, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
-        do {
-            return try await fetchCatalog(filter: filter, page: page, withSite: true)
-        } catch APIError.http(let code, _) where code == 422 {
-            return try await fetchCatalog(filter: filter, page: page, withSite: false)
+        let site = LibSite.current
+        var lastError: Error = APIError.badURL
+        for sort in filter.sortBy.aliases(site) {
+            for withSite in [true, false] {
+                do {
+                    return try await fetchCatalog(filter: filter, page: page, withSite: withSite, sort: sort, site: site)
+                } catch APIError.http(let code, let body) where code == 422 || code == 400 {
+                    lastError = APIError.http(code, body)
+                }
+            }
         }
+        throw lastError
     }
 
-    private func fetchCatalog(filter: CatalogFilter, page: Int, withSite: Bool) async throws -> (items: [Anime], hasNext: Bool) {
+    private func fetchCatalog(filter: CatalogFilter, page: Int, withSite: Bool, sort: String, site: LibSite) async throws -> (items: [Anime], hasNext: Bool) {
         var q: [URLQueryItem] = [
             .init(name: "page", value: String(page)),
-            .init(name: "sort_by", value: filter.sortBy.rawValue),
+            .init(name: "sort_by", value: sort),
             .init(name: "sort_type", value: "desc"),
         ]
-        if withSite { q.append(.init(name: "site_id[]", value: "5")) }
+        if withSite { q.append(.init(name: "site_id[]", value: site.id)) }
         let text = filter.query.trimmingCharacters(in: .whitespaces)
         if !text.isEmpty { q.append(.init(name: "q", value: text)) }
         for id in filter.genres.sorted() { q.append(.init(name: "genres[]", value: String(id))) }
         for id in filter.tags.sorted() { q.append(.init(name: "tags[]", value: String(id))) }
         for id in filter.types.sorted() { q.append(.init(name: "types[]", value: String(id))) }
         for id in filter.statuses.sorted() { q.append(.init(name: "status[]", value: String(id))) }
-        let r = try await get("/anime", query: q, as: Envelope<[Anime]>.self)
+        let r = try await get(site.apiPath, query: q, as: Envelope<[Anime]>.self)
         let hasNext = r.meta?.hasNextPage ?? !r.data.isEmpty
         return (r.data, hasNext)
+    }
+
+    /// Все тайтлы одного автора.
+    func byAuthor(_ id: Int, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
+        let site = LibSite.current
+        func run(withSite: Bool) async throws -> (items: [Anime], hasNext: Bool) {
+            var q: [URLQueryItem] = [
+                .init(name: "page", value: String(page)),
+                .init(name: "sort_by", value: "rate_avg"),
+                .init(name: "sort_type", value: "desc"),
+                .init(name: "authors[]", value: String(id))
+            ]
+            if withSite { q.append(.init(name: "site_id[]", value: site.id)) }
+            let r = try await get(site.apiPath, query: q, as: Envelope<[Anime]>.self)
+            return (r.data, r.meta?.hasNextPage ?? !r.data.isEmpty)
+        }
+        do {
+            return try await run(withSite: true)
+        } catch APIError.http(let code, _) where code == 422 {
+            return try await run(withSite: false)
+        }
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -481,9 +572,8 @@ actor AnimelibAPI {
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { throw APIError.badURL }
         var req = URLRequest(url: url)
-        for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("5", forHTTPHeaderField: "Site-Id")
         if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         req.httpMethod = method
         if let j = json {
@@ -502,9 +592,8 @@ actor AnimelibAPI {
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { return "bad url" }
         var req = URLRequest(url: url)
-        for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("5", forHTTPHeaderField: "Site-Id")
         if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         do {
             let (data, resp) = try await session.data(for: req)
@@ -518,10 +607,11 @@ actor AnimelibAPI {
     func details(slug: String) async throws -> Anime {
         let base = ["summary", "genres", "authors", "otherNames"]
         func query(_ f: [String]) -> [URLQueryItem] { f.map { URLQueryItem(name: "fields[]", value: $0) } }
+        let path = LibSite.current.apiPath + "/" + slug
         do {
-            return try await get("/anime/\(slug)", query: query(base + ["rate_avg"]), as: Envelope<Anime>.self).data
+            return try await get(path, query: query(base + ["rate_avg"]), as: Envelope<Anime>.self).data
         } catch {
-            return try await get("/anime/\(slug)", query: query(base), as: Envelope<Anime>.self).data
+            return try await get(path, query: query(base), as: Envelope<Anime>.self).data
         }
     }
 
@@ -614,7 +704,7 @@ struct RemoteImage: View {
             if Task.isCancelled { return }
             var req = URLRequest(url: url)
             req.timeoutInterval = 20
-            req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
+            req.setValue(LibSite.current.referer, forHTTPHeaderField: "Referer")
             req.setValue("image/*", forHTTPHeaderField: "Accept")
             if let (data, resp) = try? await URLSession.shared.data(for: req),
                (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
@@ -632,11 +722,13 @@ struct RemoteImage: View {
 // MARK: - Favorites
 @MainActor
 final class FavoritesStore: ObservableObject {
-    static let shared = FavoritesStore()
+    static let shared = FavoritesStore(key: "favorites.v1")
+    static let novels = FavoritesStore(key: "favorites.novels.v1")
     @Published private(set) var items: [Anime] = []
-    private let key = "favorites.v1"
+    private let key: String
 
-    init() {
+    init(key: String) {
+        self.key = key
         if let d = UserDefaults.standard.data(forKey: key),
            let a = try? JSONDecoder().decode([Anime].self, from: d) {
             items = a
@@ -663,7 +755,7 @@ final class FavoritesStore: ObservableObject {
 }
 
 struct FavoritesView: View {
-    @ObservedObject private var favorites = FavoritesStore.shared
+    @ObservedObject private var favorites: FavoritesStore = LibSite.current.isRanobe ? FavoritesStore.novels : FavoritesStore.shared
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     var body: some View {
@@ -680,7 +772,7 @@ struct FavoritesView: View {
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(favorites.items) { anime in
-                        NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                        TitleLink(anime: anime) { AnimeCard(anime: anime) }
                             .buttonStyle(.plain)
                     }
                 }
@@ -689,6 +781,7 @@ struct FavoritesView: View {
             .background(AppBackground())
             .navigationTitle("Избранное")
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
         }
     }
 }
@@ -709,7 +802,7 @@ struct SettingsView: View {
     private let platforms: [(String, String, String, Bool)] = [
         ("anime", "Аниме", "AnimeLib", true),
         ("manga", "Манга", "MangaLib", false),
-        ("ranobe", "Ранобэ", "RanobeLib", false),
+        ("ranobe", "Ранобэ", "RanobeLib", true),
         ("hentai", "Хентай", "HentaiLib · 18+", false)
     ]
 
@@ -782,10 +875,12 @@ struct SettingsView: View {
                             ImageCache.shared.removeAllObjects(); info = "Кэш обложек очищен"
                         }
                         Button("Сбросить историю просмотра") {
-                            ProgressStore.shared.clear(); HistoryStore.shared.clear(); info = "История просмотра сброшена"
+                            ProgressStore.shared.clear(); HistoryStore.shared.clear()
+                            HistoryStore.novels.clear(); ReadStore.shared.clear()
+                            info = "История просмотра и чтения сброшена"
                         }
                         Button("Очистить избранное") {
-                            FavoritesStore.shared.clear(); info = "Избранное очищено"
+                            FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); info = "Избранное очищено"
                         }
                         if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
                     }
@@ -840,15 +935,24 @@ struct HistoryItem: Codable, Identifiable {
 
 @MainActor
 final class HistoryStore: ObservableObject {
-    static let shared = HistoryStore()
+    static let shared = HistoryStore(key: "history.v1")
+    static let novels = HistoryStore(key: "history.novels.v1")
     @Published private(set) var items: [HistoryItem] = []
-    private let key = "history.v1"
+    private let key: String
 
-    init() {
+    init(key: String) {
+        self.key = key
         if let d = UserDefaults.standard.data(forKey: key),
            let v = try? JSONDecoder().decode([HistoryItem].self, from: d) {
             items = v
         }
+    }
+
+    func recordChapter(anime: Anime, chapterID: Int, title: String) {
+        items.removeAll { $0.anime.id == anime.id }
+        items.insert(HistoryItem(anime: anime, episodeID: chapterID, episodeTitle: title, updated: Date()), at: 0)
+        if items.count > 30 { items = Array(items.prefix(30)) }
+        save()
     }
 
     func record(anime: Anime, episode: EpisodeShort) {
@@ -1027,7 +1131,7 @@ struct AnimeRow: View {
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                Text([anime.type?.title, anime.episodesCount.map { "\($0) эп." }]
+                Text([anime.type?.title, LibSite.current.isRanobe ? nil : anime.episodesCount.map { "\($0) эп." }]
                     .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1049,7 +1153,7 @@ struct ContinueCard: View {
     @ObservedObject private var progress = ProgressStore.shared
 
     var body: some View {
-        let p = progress.get(item.episodeID)
+        let p = LibSite.current.isRanobe ? nil : progress.get(item.episodeID)
         HStack(spacing: 12) {
             RemoteImage(url: item.anime.imageURL)
                 .frame(width: 56, height: 84)
@@ -1084,15 +1188,16 @@ struct ContinueCard: View {
 
 struct HomeView: View {
     @StateObject private var vm = HomeViewModel()
-    @ObservedObject private var history = HistoryStore.shared
+    @ObservedObject private var history: HistoryStore = LibSite.current.isRanobe ? HistoryStore.novels : HistoryStore.shared
     @ObservedObject private var router = AppRouter.shared
     @State private var query = ""
+    private let ranobe = LibSite.current.isRanobe
 
     private func poster(_ list: [Anime]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(list) { a in
-                    NavigationLink(value: a) { PosterCard(anime: a) }
+                    TitleLink(anime: a) { PosterCard(anime: a) }
                         .buttonStyle(.plain)
                 }
             }
@@ -1106,7 +1211,7 @@ struct HomeView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Hehe")
+                            Text(LibSite.current.title)
                                 .font(.system(size: 32, weight: .heavy, design: .rounded))
                             SearchBar(text: $query) {
                                 let q = query.trimmingCharacters(in: .whitespaces)
@@ -1129,12 +1234,12 @@ struct HomeView: View {
 
                         if !history.items.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: "Продолжить смотреть",
+                                SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
                                               action: { history.clear() }, actionTitle: "Очистить")
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 12) {
                                         ForEach(history.items) { h in
-                                            NavigationLink(value: h.anime) { ContinueCard(item: h) }
+                                            TitleLink(anime: h.anime) { ContinueCard(item: h) }
                                                 .buttonStyle(.plain)
                                                 .contextMenu {
                                                     Button(role: .destructive) { history.remove(h.anime.id) } label: {
@@ -1150,17 +1255,17 @@ struct HomeView: View {
 
                         if !vm.fresh.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
+                                SectionHeader(title: ranobe ? "Свежие главы" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
                                 poster(Array(vm.fresh.prefix(14)))
                             }
                         }
 
                         if !vm.popular.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: "Сейчас смотрят") { router.openCatalog(sort: .views) }
+                                SectionHeader(title: ranobe ? "Сейчас читают" : "Сейчас смотрят") { router.openCatalog(sort: .views) }
                                 VStack(spacing: 8) {
                                     ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
-                                        NavigationLink(value: a) { AnimeRow(anime: a, rank: i + 1) }
+                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1) }
                                             .buttonStyle(.plain)
                                     }
                                     if vm.canLoadMorePopular {
@@ -1206,6 +1311,7 @@ struct HomeView: View {
             .background(AppBackground())
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .task { await vm.load() }
         }
     }
@@ -1213,6 +1319,7 @@ struct HomeView: View {
 
 struct RootView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
+    @AppStorage("set.platform") private var platform = "anime"
     @ObservedObject private var router = AppRouter.shared
 
     var body: some View {
@@ -1233,7 +1340,7 @@ struct RootView: View {
                 .tabItem { Label("Настройки", systemImage: "gearshape") }
                 .tag(4)
         }
-        .id(accentHex)
+        .id(accentHex + platform)
         .tint(Color(hex: accentHex))
         .preferredColorScheme(.dark)
     }
@@ -1361,7 +1468,7 @@ struct FilterSheet: View {
                         Text("Сортировка").font(.headline)
                         FlowLayout(spacing: 8) {
                             ForEach(CatalogFilter.SortOption.allCases) { opt in
-                                Chip(title: opt.title, selected: vm.filter.sortBy == opt) {
+                                Chip(title: opt.label(LibSite.current.isRanobe), selected: vm.filter.sortBy == opt) {
                                     vm.filter.sortBy = opt
                                 }
                             }
@@ -1438,7 +1545,7 @@ struct CatalogView: View {
             ScrollView {
                 VStack(spacing: 10) {
                     HStack {
-                        Text("Hehe")
+                        Text(LibSite.current.title)
                             .font(.system(size: 32, weight: .heavy, design: .rounded))
                         Spacer()
                         filterButton
@@ -1462,7 +1569,7 @@ struct CatalogView: View {
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { anime in
-                        NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                        TitleLink(anime: anime) { AnimeCard(anime: anime) }
                             .buttonStyle(.plain)
                             .onAppear {
                                 if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
@@ -1492,6 +1599,7 @@ struct CatalogView: View {
             .background(AppBackground())
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
             .onAppear {
@@ -1527,6 +1635,95 @@ struct AnimeCard: View {
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
         }
+    }
+}
+
+// MARK: - Автор: все его тайтлы
+struct AuthorRef: Hashable {
+    let id: Int
+    let name: String
+}
+
+@MainActor
+final class AuthorViewModel: ObservableObject {
+    @Published var items: [Anime] = []
+    @Published var isLoading = false
+    @Published var error: String?
+    private var page = 1
+    private var finished = false
+    let authorID: Int
+
+    init(authorID: Int) { self.authorID = authorID }
+
+    func loadMore() async {
+        guard !isLoading, !finished else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let r = try await AnimelibAPI.shared.byAuthor(authorID, page: page)
+            let known = Set(items.map { $0.id })
+            let fresh = r.items.filter { !known.contains($0.id) }
+            items += fresh
+            page += 1
+            if fresh.isEmpty || !r.hasNext { finished = true }
+            error = nil
+        } catch {
+            finished = true
+            if items.isEmpty { self.error = error.localizedDescription }
+        }
+    }
+}
+
+struct AuthorView: View {
+    let author: AuthorRef
+    @StateObject private var vm: AuthorViewModel
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    init(author: AuthorRef) {
+        self.author = author
+        _vm = StateObject(wrappedValue: AuthorViewModel(authorID: author.id))
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Theme.accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(author.name).font(.title3.bold())
+                        Text("Все тайтлы автора").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(14)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+                if let e = vm.error {
+                    Text(e).font(.footnote).foregroundStyle(.red)
+                    Button("Повторить") { Task { await vm.loadMore() } }
+                }
+                LazyVGrid(columns: columns, spacing: 18) {
+                    ForEach(vm.items) { a in
+                        TitleLink(anime: a) { AnimeCard(anime: a) }
+                            .buttonStyle(.plain)
+                            .onAppear {
+                                if a.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                            }
+                    }
+                }
+                if vm.isLoading { ProgressView().frame(maxWidth: .infinity) }
+                if vm.items.isEmpty && !vm.isLoading && vm.error == nil {
+                    Text("Тайтлов не найдено").foregroundStyle(.secondary).frame(maxWidth: .infinity)
+                }
+            }
+            .padding(14)
+        }
+        .background(AppBackground())
+        .navigationTitle(author.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await vm.loadMore() }
     }
 }
 
@@ -1621,14 +1818,39 @@ struct DetailView: View {
                             }
                             .font(.footnote.bold())
                         }
-                        if let au = vm.anime.authors, !au.isEmpty {
-                            Text("Автор: " + au.map(\.title).joined(separator: ", "))
-                                .font(.footnote).foregroundStyle(.secondary)
-                        }
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+
+                if let au = vm.anime.authors, !au.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Автор оригинала").font(.footnote.bold()).foregroundStyle(.secondary)
+                        FlowLayout(spacing: 8) {
+                            ForEach(Array(au.enumerated()), id: \.offset) { _, a in
+                                if let aid = a.id {
+                                    NavigationLink(value: AuthorRef(id: aid, name: a.title)) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "person.fill")
+                                            Text(a.title)
+                                            Image(systemName: "chevron.right").font(.caption2)
+                                        }
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(Theme.accent)
+                                        .padding(.horizontal, 12).padding(.vertical, 7)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                } else {
+                                    Text(a.title)
+                                        .font(.subheadline)
+                                        .padding(.horizontal, 12).padding(.vertical, 7)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if let slug = vm.anime.slugUrl, let url = URL(string: "https://animelib.org/ru/anime/\(slug)") {
@@ -1702,6 +1924,7 @@ struct DetailView: View {
         .background(backdrop)
         .navigationTitle(vm.anime.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button { showBookmark = true } label: { Image(systemName: "bookmark") }
@@ -1917,6 +2140,12 @@ struct WebPlayerView: UIViewRepresentable {
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
+        v.configuration.userContentController.removeScriptMessageHandler(forName: "hehe")
+        v.stopLoading()
+        v.loadHTMLString("", baseURL: nil)
+    }
+
     static let sniffer = """
     (function(){
       if (window.__heheSniff) return; window.__heheSniff = true;
@@ -1994,6 +2223,7 @@ final class PlayerViewModel: ObservableObject {
     var lastPosition: Double = 0
     private var timeObserver: Any?
     private var observedPlayer: AVPlayer?
+    private var stopped = false
 
     var usesWeb: Bool {
         guard let v = current, v.isWeb else { return false }
@@ -2002,6 +2232,7 @@ final class PlayerViewModel: ObservableObject {
 
     func load(episodeID: Int) async {
         isLoading = true; error = nil
+        stopped = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
@@ -2059,13 +2290,14 @@ final class PlayerViewModel: ObservableObject {
 
     /// Веб-плеер Kodik отдал адрес потока: переключаемся на родной плеер iOS.
     func webStream(_ u: URL) {
-        guard autoNative, showWeb, current?.kodik == true else { return }
+        guard !stopped, autoNative, showWeb, current?.kodik == true else { return }
         showWeb = false
         note = "Играет в родном плеере (\(u.host ?? "kodik"))"
         startAV(u, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
     }
 
     private func startAV(_ url: URL, headers: [String: String]) {
+        guard !stopped else { return }
         savePosition()
         if let t = player?.currentTime(), t.isValid, t.seconds > 1 { lastPosition = t.seconds }
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
@@ -2103,7 +2335,7 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
-    func stop() { savePosition(); detachObserver(); player?.pause(); player = nil }
+    func stop() { savePosition(); stopped = true; detachObserver(); player?.pause(); player = nil }
 }
 
 struct PlayerScreen: View {
@@ -2218,6 +2450,14 @@ enum J {
 
     static func str(_ v: Any?) -> String? {
         if let s = v as? String, !s.isEmpty { return s }
+        return nil
+    }
+
+    /// Строка из числа или строки (номера глав приходят и так, и так).
+    static func s(_ v: Any?) -> String? {
+        if let x = v as? String { return x.isEmpty ? nil : x }
+        if let i = v as? Int { return String(i) }
+        if let d = v as? Double { return d == d.rounded() ? String(Int(d)) : String(d) }
         return nil
     }
 
@@ -2401,13 +2641,13 @@ final class CommentsViewModel: ObservableObject {
     private func q(_ n: String, _ v: String) -> URLQueryItem { URLQueryItem(name: n, value: v) }
 
     private func firstPageQuery() -> [URLQueryItem] {
-        [q("post_id", String(animeID)), q("post_type", "anime"), q("page", "1")]
+        [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", "1")]
     }
 
     private func fetch(page: Int) async throws -> ([CommentItem], Bool?) {
         let attempts: [(String, [URLQueryItem])] = [
-            ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page))]),
-            ("/comments", [q("post_id", String(animeID)), q("post_type", "anime"), q("page", String(page)),
+            ("/comments", [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", String(page))]),
+            ("/comments", [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q("page", String(page)),
                            q("sort_by", "created_at"), q("sort_type", "desc")])
         ]
         var lastError: Error = APIError.badURL
@@ -2460,7 +2700,7 @@ final class CommentsViewModel: ObservableObject {
     /// Возвращает текст ошибки или nil при успехе.
     func send(_ text: String, parent: Int?) async -> String? {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
-        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": "anime"]
+        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": LibSite.current.postType]
         if let p = parent { base["parent_comment"] = p }
         var alt = base
         alt["is_spoiler"] = false
@@ -2501,7 +2741,7 @@ final class CommentsViewModel: ObservableObject {
         defer { loadingReplies.remove(c.id) }
         let known = Set(items.map { $0.id })
         for key in ["parent_comment", "parent_id", "parent_comment_id"] {
-            let query = [q("post_id", String(animeID)), q("post_type", "anime"), q(key, String(c.id))]
+            let query = [q("post_id", String(animeID)), q("post_type", LibSite.current.postType), q(key, String(c.id))]
             if let data = try? await AnimelibAPI.shared.rawData("/comments", query: query, token: AuthStore.shared.token),
                let root = J.obj(data) {
                 let list = CommentParser.parse(root).filter { $0.id != c.id && !known.contains($0.id) }
@@ -3038,9 +3278,9 @@ struct BookmarkSheet: View {
         busy = true
         defer { busy = false }
         let bodies: [[String: Any]] = [
-            ["id": anime.id, "type": f.id, "model": "anime"],
-            ["bookmark": ["type": f.id], "id": anime.id, "model": "anime"],
-            ["type": f.id, "relation_id": anime.id, "relation_type": "anime"]
+            ["id": anime.id, "type": f.id, "model": LibSite.current.postType],
+            ["bookmark": ["type": f.id], "id": anime.id, "model": LibSite.current.postType],
+            ["type": f.id, "relation_id": anime.id, "relation_type": LibSite.current.postType]
         ]
         var last = ""
         for b in bodies {
@@ -3060,7 +3300,7 @@ struct BookmarkSheet: View {
         guard let t = auth.token else { return }
         busy = true
         defer { busy = false }
-        for q in [[URLQueryItem(name: "type", value: "anime")], []] {
+        for q in [[URLQueryItem(name: "type", value: LibSite.current.postType)], []] {
             do {
                 _ = try await AnimelibAPI.shared.rawData("/bookmarks/\(anime.id)", query: q, token: t, method: "DELETE")
                 done = nil
@@ -3174,7 +3414,7 @@ struct ProfileView: View {
                         }
                         LazyVGrid(columns: columns, spacing: 18) {
                             ForEach(vm.items) { anime in
-                                NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                                TitleLink(anime: anime) { AnimeCard(anime: anime) }
                                     .buttonStyle(.plain)
                                     .onAppear {
                                         if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
@@ -3233,6 +3473,7 @@ struct ProfileView: View {
             .navigationTitle("Профиль")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .sheet(isPresented: $showLogin) { LoginSheet() }
             .task(id: auth.user?.id) {
                 if let u = auth.user, let t = auth.token {
@@ -3241,6 +3482,647 @@ struct ProfileView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Ранобэ: модели и сервис
+struct Novel: Codable, Identifiable, Hashable {
+    let anime: Anime
+    var id: Int { anime.id }
+    init(_ a: Anime) { anime = a }
+    init(from decoder: Decoder) throws { anime = try Anime(from: decoder) }
+    func encode(to encoder: Encoder) throws { try anime.encode(to: encoder) }
+}
+
+struct NovelChapter: Identifiable, Hashable {
+    let id: Int
+    let volume: String
+    let number: String
+    let name: String
+
+    init?(_ d: [String: Any]) {
+        guard let cid = J.int(d["id"]) else { return nil }
+        id = cid
+        volume = J.s(d["volume"]) ?? "1"
+        number = J.s(d["number"]) ?? "0"
+        name = J.str(d["name"]) ?? ""
+    }
+
+    var title: String { name.isEmpty ? "Глава \(number)" : "Глава \(number) · \(name)" }
+}
+
+enum ReaderBlock: Identifiable {
+    case paragraph(Int, String)
+    case heading(Int, String)
+    case quote(Int, String)
+    case image(Int, URL)
+    case rule(Int)
+
+    var id: Int {
+        switch self {
+        case .paragraph(let i, _), .heading(let i, _), .quote(let i, _), .image(let i, _): return i
+        case .rule(let i): return i
+        }
+    }
+}
+
+/// Текст главы приходит как документ ProseMirror (или как HTML-строка).
+enum ReaderParser {
+    static func absolute(_ s: String?) -> URL? {
+        guard var t = s, !t.isEmpty else { return nil }
+        if t.hasPrefix("//") { t = "https:" + t }
+        else if t.hasPrefix("/") { t = "https://ranobelib.me" + t }
+        else if !t.hasPrefix("http") { t = "https://ranobelib.me/" + t }
+        return URL(string: t)
+    }
+
+    static func parse(_ content: Any?, attachments: [[String: Any]]) -> [ReaderBlock] {
+        var out: [ReaderBlock] = []
+        var map: [String: URL] = [:]
+        for a in attachments {
+            guard let u = absolute(J.str(a["url"])) else { continue }
+            for k in ["name", "filename", "id"] {
+                if let key = J.s(a[k]) { map[key] = u }
+            }
+        }
+        if let s = content as? String {
+            let text = J.stripHTML(s.replacingOccurrences(of: "</p>", with: "\n"))
+            for line in text.components(separatedBy: "\n") {
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { out.append(.paragraph(out.count, t)) }
+            }
+        } else if let d = content as? [String: Any] {
+            walk(d, map: map, out: &out)
+        }
+        return out
+    }
+
+    private static func inline(_ node: [String: Any]) -> String {
+        let type = (node["type"] as? String) ?? ""
+        if type == "text" { return (node["text"] as? String) ?? "" }
+        if type == "hardBreak" { return "\n" }
+        let ch = (node["content"] as? [[String: Any]]) ?? []
+        return ch.map { inline($0) }.joined()
+    }
+
+    private static func walk(_ node: [String: Any], map: [String: URL], out: inout [ReaderBlock]) {
+        let type = (node["type"] as? String) ?? ""
+        let children = (node["content"] as? [[String: Any]]) ?? []
+        switch type {
+        case "paragraph":
+            let t = inline(node).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { out.append(.paragraph(out.count, t)) }
+        case "heading":
+            let t = inline(node).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { out.append(.heading(out.count, t)) }
+        case "blockquote":
+            let t = children.map { inline($0) }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { out.append(.quote(out.count, t)) }
+        case "listItem":
+            let t = inline(node).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { out.append(.paragraph(out.count, "• " + t)) }
+        case "horizontalRule":
+            out.append(.rule(out.count))
+        case "image":
+            let attrs = node["attrs"] as? [String: Any]
+            let imgs = (attrs?["images"] as? [[String: Any]]) ?? []
+            for im in imgs {
+                if let key = J.s(im["image"]), let u = map[key] { out.append(.image(out.count, u)) }
+            }
+            if imgs.isEmpty, let u = absolute(J.str(attrs?["src"])) { out.append(.image(out.count, u)) }
+        default:
+            for c in children { walk(c, map: map, out: &out) }
+        }
+    }
+}
+
+enum NovelService {
+    static func chapters(slug: String) async throws -> [NovelChapter] {
+        let data = try await AnimelibAPI.shared.rawData("/manga/\(slug)/chapters")
+        guard let root = J.obj(data) as? [String: Any],
+              let arr = root["data"] as? [[String: Any]] else { throw APIError.badURL }
+        return arr.compactMap { NovelChapter($0) }
+    }
+
+    static func chapterPath(slug: String) -> String { "/manga/\(slug)/chapter" }
+
+    static func chapterQuery(_ c: NovelChapter) -> [URLQueryItem] {
+        [URLQueryItem(name: "number", value: c.number), URLQueryItem(name: "volume", value: c.volume)]
+    }
+
+    static func content(slug: String, chapter c: NovelChapter) async throws -> [ReaderBlock] {
+        let data = try await AnimelibAPI.shared.rawData(chapterPath(slug: slug), query: chapterQuery(c))
+        guard let root = J.obj(data) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { throw APIError.badURL }
+        let att = (d["attachments"] as? [[String: Any]]) ?? []
+        return ReaderParser.parse(d["content"], attachments: att)
+    }
+}
+
+// MARK: - Ранобэ: что уже прочитано
+@MainActor
+final class ReadStore: ObservableObject {
+    static let shared = ReadStore()
+    @Published private(set) var read: [String: [Int]] = [:]
+    @Published private(set) var last: [String: Int] = [:]
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: "read.v1"),
+           let v = try? JSONDecoder().decode([String: [Int]].self, from: d) { read = v }
+        if let d = UserDefaults.standard.data(forKey: "readlast.v1"),
+           let v = try? JSONDecoder().decode([String: Int].self, from: d) { last = v }
+    }
+
+    func isRead(_ novel: Int, _ chapter: Int) -> Bool { read[String(novel)]?.contains(chapter) ?? false }
+    func lastChapter(_ novel: Int) -> Int? { last[String(novel)] }
+
+    func mark(_ novel: Int, _ chapter: Int) {
+        var list = read[String(novel)] ?? []
+        if !list.contains(chapter) { list.append(chapter) }
+        read[String(novel)] = list
+        last[String(novel)] = chapter
+        if let d = try? JSONEncoder().encode(read) { UserDefaults.standard.set(d, forKey: "read.v1") }
+        if let d = try? JSONEncoder().encode(last) { UserDefaults.standard.set(d, forKey: "readlast.v1") }
+    }
+
+    func clear() {
+        read = [:]; last = [:]
+        UserDefaults.standard.removeObject(forKey: "read.v1")
+        UserDefaults.standard.removeObject(forKey: "readlast.v1")
+    }
+}
+
+/// Ссылка на тайтл: для аниме ведёт на экран аниме, для ранобэ на экран ранобэ.
+struct TitleLink<Label: View>: View {
+    let anime: Anime
+    let label: () -> Label
+
+    init(anime: Anime, @ViewBuilder label: @escaping () -> Label) {
+        self.anime = anime
+        self.label = label
+    }
+
+    var body: some View {
+        if LibSite.current.isRanobe {
+            NavigationLink(value: Novel(anime)) { label() }
+        } else {
+            NavigationLink(value: anime) { label() }
+        }
+    }
+}
+
+struct FitImage: View {
+    let url: URL
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else if failed {
+                Label("Иллюстрация не загрузилась", systemImage: "photo")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 120)
+            }
+        }
+        .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        if let c = ImageCache.shared.object(forKey: url as NSURL) { image = c; return }
+        for attempt in 0..<3 {
+            if Task.isCancelled { return }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 25
+            req.setValue(LibSite.ranobe.referer, forHTTPHeaderField: "Referer")
+            if let (data, resp) = try? await URLSession.shared.data(for: req),
+               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
+               let img = UIImage(data: data) {
+                ImageCache.shared.setObject(img, forKey: url as NSURL)
+                image = img
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(500_000_000 * (attempt + 1)))
+        }
+        if !Task.isCancelled { failed = true }
+    }
+}
+
+// MARK: - Ранобэ: экран тайтла
+@MainActor
+final class NovelDetailViewModel: ObservableObject {
+    @Published var anime: Anime
+    @Published var chapters: [NovelChapter] = []
+    @Published var isLoading = true
+    @Published var error: String?
+
+    init(anime: Anime) { self.anime = anime }
+
+    func load() async {
+        isLoading = true
+        error = nil
+        guard let slug = anime.slugUrl else {
+            error = "У тайтла нет адреса"
+            isLoading = false
+            return
+        }
+        async let d = AnimelibAPI.shared.details(slug: slug)
+        async let c = NovelService.chapters(slug: slug)
+        if let full = try? await d { anime = full }
+        do { chapters = try await c } catch { self.error = error.localizedDescription }
+        isLoading = false
+    }
+
+    var volumeGroups: [(volume: String, indices: [Int])] {
+        var order: [String] = []
+        var map: [String: [Int]] = [:]
+        for (i, c) in chapters.enumerated() {
+            if map[c.volume] == nil { order.append(c.volume) }
+            map[c.volume, default: []].append(i)
+        }
+        return order.map { ($0, map[$0] ?? []) }
+    }
+}
+
+struct ReaderStart: Identifiable {
+    let id: Int
+}
+
+struct NovelDetailView: View {
+    @StateObject private var vm: NovelDetailViewModel
+    @ObservedObject private var read = ReadStore.shared
+    @ObservedObject private var favorites = FavoritesStore.novels
+    @State private var expanded = false
+    @State private var reversed = false
+    @State private var reader: ReaderStart?
+    @State private var showComments = false
+    @State private var showBookmark = false
+
+    init(novel: Novel) { _vm = StateObject(wrappedValue: NovelDetailViewModel(anime: novel.anime)) }
+
+    private var backdrop: some View {
+        ZStack {
+            Color.black
+            RemoteImage(url: vm.anime.imageURL).blur(radius: 50).opacity(0.55)
+            LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
+        }
+        .ignoresSafeArea()
+    }
+
+    private var resumeIndex: Int {
+        if let last = read.lastChapter(vm.anime.id),
+           let i = vm.chapters.firstIndex(where: { $0.id == last }) { return i }
+        return 0
+    }
+
+    private func row(_ i: Int) -> some View {
+        let c = vm.chapters[i]
+        let isRead = read.isRead(vm.anime.id, c.id)
+        return Button { reader = ReaderStart(id: i) } label: {
+            HStack(spacing: 12) {
+                Text(c.number)
+                    .font(.footnote.bold())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .foregroundStyle(isRead ? Color.secondary : Color.primary)
+                    .frame(width: 42, height: 42)
+                    .background(isRead ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(c.name.isEmpty ? "Глава \(c.number)" : c.name)
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    if isRead { Text("Прочитано").font(.caption2).foregroundStyle(.secondary) }
+                }
+                .foregroundStyle(isRead ? Color.secondary : Color.primary)
+                Spacer()
+                Image(systemName: isRead ? "checkmark.circle.fill" : "book.fill")
+                    .foregroundStyle(isRead ? Color.gray : Theme.accent)
+            }
+            .padding(10)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top, spacing: 14) {
+                    RemoteImage(url: vm.anime.imageURL)
+                        .frame(width: 120, height: 180)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                        .shadow(color: .black.opacity(0.5), radius: 10, y: 5)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(vm.anime.displayTitle).font(.title3.bold())
+                        if let n = vm.anime.name, n != vm.anime.displayTitle {
+                            Text(n).font(.caption).foregroundStyle(.secondary)
+                        }
+                        FlowLayout(spacing: 6) {
+                            if let s = vm.anime.status?.title, !s.isEmpty { Pill(icon: "dot.radiowaves.left.and.right", text: s) }
+                            if let t = vm.anime.type?.title, !t.isEmpty { Pill(icon: "book", text: t) }
+                            if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Pill(icon: "exclamationmark.shield", text: a) }
+                            if let r = vm.anime.rateAvg { Pill(icon: "star.fill", text: r) }
+                            if !vm.chapters.isEmpty { Pill(icon: "list.bullet", text: "\(vm.chapters.count) гл.") }
+                        }
+                    }
+                }
+
+                if !vm.chapters.isEmpty {
+                    Button { reader = ReaderStart(id: resumeIndex) } label: {
+                        HStack {
+                            Image(systemName: "book.fill")
+                            Text(read.lastChapter(vm.anime.id) == nil
+                                 ? "Начать читать"
+                                 : "Продолжить: Глава \(vm.chapters[resumeIndex].number)")
+                                .font(.headline)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Theme.accent, in: RoundedRectangle(cornerRadius: 16))
+                        .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let g = vm.anime.genres, !g.isEmpty {
+                    FlowLayout(spacing: 6) {
+                        ForEach(g, id: \.id) { item in
+                            Text(item.title)
+                                .font(.caption)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(Theme.accent.opacity(0.28), in: Capsule())
+                        }
+                    }
+                }
+
+                if let s = vm.anime.summary, !s.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(s).font(.callout).lineLimit(expanded ? nil : 5)
+                        if s.count > 220 {
+                            Button(expanded ? "Свернуть" : "Читать полностью") {
+                                withAnimation { expanded.toggle() }
+                            }
+                            .font(.footnote.bold())
+                        }
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+
+                if let au = vm.anime.authors, !au.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Автор").font(.footnote.bold()).foregroundStyle(.secondary)
+                        FlowLayout(spacing: 8) {
+                            ForEach(Array(au.enumerated()), id: \.offset) { _, a in
+                                if let aid = a.id {
+                                    NavigationLink(value: AuthorRef(id: aid, name: a.title)) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "person.fill")
+                                            Text(a.title)
+                                            Image(systemName: "chevron.right").font(.caption2)
+                                        }
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(Theme.accent)
+                                        .padding(.horizontal, 12).padding(.vertical, 7)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                } else {
+                                    Text(a.title)
+                                        .font(.subheadline)
+                                        .padding(.horizontal, 12).padding(.vertical, 7)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let slug = vm.anime.slugUrl, let url = URL(string: "https://ranobelib.me/ru/book/\(slug)") {
+                    Link(destination: url) {
+                        Label("Открыть на сайте", systemImage: "safari")
+                            .font(.subheadline)
+                            .padding(.horizontal, 14).padding(.vertical, 9)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                }
+
+                Button { showComments = true } label: {
+                    HStack {
+                        Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(Theme.accent)
+                        Text("Комментарии").font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .padding(14)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+
+                HStack {
+                    Text("Главы").font(.title3.bold())
+                    Spacer()
+                    if vm.chapters.count > 1 {
+                        Button { withAnimation { reversed.toggle() } } label: {
+                            Label(reversed ? "Сначала новые" : "Сначала старые", systemImage: "arrow.up.arrow.down")
+                                .font(.footnote)
+                        }
+                    }
+                }
+                if vm.isLoading { ProgressView() }
+                if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
+                if !vm.isLoading && vm.chapters.isEmpty && vm.error == nil {
+                    Text("Глав пока нет").foregroundStyle(.secondary)
+                }
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    let groups = reversed ? Array(vm.volumeGroups.reversed()) : vm.volumeGroups
+                    ForEach(Array(groups.enumerated()), id: \.offset) { _, g in
+                        Text("Том \(g.volume)")
+                            .font(.footnote.bold())
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                        ForEach(reversed ? Array(g.indices.reversed()) : g.indices, id: \.self) { i in
+                            row(i)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(backdrop)
+        .navigationTitle(vm.anime.displayTitle)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { showBookmark = true } label: { Image(systemName: "bookmark") }
+                Button { favorites.toggle(vm.anime) } label: {
+                    Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
+                        .foregroundStyle(favorites.contains(vm.anime) ? Color.pink : Color.primary)
+                }
+            }
+        }
+        .task { await vm.load() }
+        .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
+        .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
+        .fullScreenCover(item: $reader) { r in
+            NovelReaderView(novel: vm.anime, chapters: vm.chapters, start: r.id)
+        }
+    }
+}
+
+// MARK: - Ранобэ: читалка
+struct NovelReaderView: View {
+    let novel: Anime
+    let chapters: [NovelChapter]
+    @State private var index: Int
+    @State private var blocks: [ReaderBlock] = []
+    @State private var loading = true
+    @State private var error: String?
+    @State private var debug = ""
+    @AppStorage("reader.font") private var fontSize = 18.0
+    @AppStorage("reader.theme") private var theme = "dark"
+    @AppStorage("reader.serif") private var serif = true
+    @Environment(\.dismiss) private var dismiss
+
+    init(novel: Anime, chapters: [NovelChapter], start: Int) {
+        self.novel = novel
+        self.chapters = chapters
+        _index = State(initialValue: min(max(start, 0), max(chapters.count - 1, 0)))
+    }
+
+    private var bg: Color {
+        switch theme {
+        case "sepia": return Color(red: 0.96, green: 0.93, blue: 0.85)
+        case "light": return .white
+        default: return Color(white: 0.07)
+        }
+    }
+
+    private var fg: Color {
+        switch theme {
+        case "sepia": return Color(red: 0.23, green: 0.18, blue: 0.18)
+        case "light": return Color(white: 0.1)
+        default: return Color(white: 0.9)
+        }
+    }
+
+    private var bodyFont: Font { .system(size: fontSize, design: serif ? .serif : .default) }
+
+    @ViewBuilder
+    private func blockView(_ b: ReaderBlock) -> some View {
+        switch b {
+        case .paragraph(_, let t):
+            Text(t).font(bodyFont).lineSpacing(fontSize * 0.35)
+        case .heading(_, let t):
+            Text(t).font(.system(size: fontSize + 4, weight: .bold, design: serif ? .serif : .default))
+        case .quote(_, let t):
+            Text(t).font(bodyFont.italic()).lineSpacing(fontSize * 0.3)
+                .padding(.leading, 12)
+                .overlay(alignment: .leading) { Rectangle().fill(Theme.accent).frame(width: 3) }
+        case .image(_, let u):
+            FitImage(url: u).frame(maxWidth: .infinity)
+        case .rule:
+            Divider()
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: fontSize * 0.7) {
+                        Color.clear.frame(height: 1).id("top")
+                        if chapters.indices.contains(index) {
+                            Text(chapters[index].title)
+                                .font(.system(size: fontSize + 6, weight: .bold, design: serif ? .serif : .default))
+                        }
+                        if loading { ProgressView().frame(maxWidth: .infinity).padding(.top, 40) }
+                        ForEach(blocks) { b in blockView(b) }
+                        if let e = error {
+                            Text(e).font(.footnote).foregroundStyle(.orange)
+                        }
+                        if !debug.isEmpty {
+                            Text(debug)
+                                .font(.system(size: 9, design: .monospaced))
+                                .textSelection(.enabled)
+                                .opacity(0.6)
+                        }
+                        Color.clear.frame(height: 90)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 8)
+                    .foregroundStyle(fg)
+                }
+                .background(bg.ignoresSafeArea())
+                .task(id: index) {
+                    proxy.scrollTo("top", anchor: .top)
+                    await load()
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                HStack {
+                    Button { index -= 1 } label: { Image(systemName: "chevron.left").frame(width: 44, height: 40) }
+                        .disabled(index <= 0)
+                    Spacer()
+                    Text("\(index + 1) из \(chapters.count)").font(.footnote.weight(.semibold))
+                    Spacer()
+                    Button { index += 1 } label: { Image(systemName: "chevron.right").frame(width: 44, height: 40) }
+                        .disabled(index >= chapters.count - 1)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(.horizontal, 24).padding(.bottom, 4)
+            }
+            .navigationTitle(novel.displayTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarColorScheme(theme == "dark" ? .dark : .light, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button { fontSize = min(fontSize + 2, 34) } label: { Label("Крупнее", systemImage: "textformat.size.larger") }
+                        Button { fontSize = max(fontSize - 2, 12) } label: { Label("Мельче", systemImage: "textformat.size.smaller") }
+                        Toggle("Шрифт с засечками", isOn: $serif)
+                        Picker("Тема", selection: $theme) {
+                            Text("Тёмная").tag("dark")
+                            Text("Сепия").tag("sepia")
+                            Text("Светлая").tag("light")
+                        }
+                    } label: { Image(systemName: "textformat") }
+                }
+            }
+        }
+        .preferredColorScheme(theme == "dark" ? .dark : .light)
+    }
+
+    private func load() async {
+        guard chapters.indices.contains(index), let slug = novel.slugUrl else { return }
+        let ch = chapters[index]
+        loading = true
+        error = nil
+        debug = ""
+        blocks = []
+        ReadStore.shared.mark(novel.id, ch.id)
+        HistoryStore.novels.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        do {
+            let result = try await NovelService.content(slug: slug, chapter: ch)
+            if Task.isCancelled { return }
+            blocks = result
+            if result.isEmpty {
+                error = "Текст главы пуст или недоступен."
+                debug = await AnimelibAPI.shared.rawText(NovelService.chapterPath(slug: slug),
+                                                         query: NovelService.chapterQuery(ch))
+            }
+        } catch {
+            if Task.isCancelled { return }
+            self.error = error.localizedDescription
+        }
+        loading = false
     }
 }
 
