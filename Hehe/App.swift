@@ -744,9 +744,11 @@ actor AnimelibAPI {
 }
 
 enum Haptics {
-    static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-    static func select() { UISelectionFeedbackGenerator().selectionChanged() }
-    static func success() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+    private static var on: Bool { Settings.bool("set.haptics", true) }
+    static func tap() { if on { UIImpactFeedbackGenerator(style: .light).impactOccurred() } }
+    static func select() { if on { UISelectionFeedbackGenerator().selectionChanged() } }
+    static func success() { if on { UINotificationFeedbackGenerator().notificationOccurred(.success) } }
+    static func bump() { if on { UIImpactFeedbackGenerator(style: .medium).impactOccurred() } }
 }
 
 /// Адрес тайтла на сайте (для «Поделиться»).
@@ -873,6 +875,126 @@ extension ImageLoader {
     }
 }
 
+// MARK: - Анимированные картинки (GIF, WebP, APNG)
+enum AnimatedLoader {
+    private static let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 60_000_000
+        return c
+    }()
+
+    static func cached(_ url: URL, _ px: CGFloat) -> UIImage? {
+        cache.object(forKey: "\(url.absoluteString)#\(Int(px))" as NSString)
+    }
+
+    static func load(_ url: URL, maxPixel: CGFloat, referer: String) async -> UIImage? {
+        let key = "\(url.absoluteString)#\(Int(maxPixel))" as NSString
+        if let c = cache.object(forKey: key) { return c }
+        let img = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+            var req = URLRequest(url: url)
+            req.setValue(referer, forHTTPHeaderField: "Referer")
+            req.setValue("image/*", forHTTPHeaderField: "Accept")
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true
+            else { return nil }
+            return AnimatedLoader.decode(data, maxPixel: maxPixel)
+        }.value
+        if let img {
+            let frames = max(1, img.images?.count ?? 1)
+            cache.setObject(img, forKey: key, cost: Int(img.size.width * img.size.height * 4) * frames)
+        }
+        return img
+    }
+
+    nonisolated static func decode(_ data: Data, maxPixel: CGFloat) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let n = CGImageSourceGetCount(src)
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ]
+        if n <= 1 {
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+            return UIImage(cgImage: cg)
+        }
+        let sets: [(CFString, CFString, CFString)] = [
+            (kCGImagePropertyGIFDictionary, kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyGIFDelayTime),
+            (kCGImagePropertyWebPDictionary, kCGImagePropertyWebPUnclampedDelayTime, kCGImagePropertyWebPDelayTime),
+            (kCGImagePropertyAPNGDictionary, kCGImagePropertyAPNGUnclampedDelayTime, kCGImagePropertyAPNGDelayTime)
+        ]
+        func delay(_ i: Int) -> Double {
+            guard let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any] else { return 0.1 }
+            for (dict, unclamped, plain) in sets {
+                if let d = props[dict] as? [CFString: Any] {
+                    let v = (d[unclamped] as? Double) ?? (d[plain] as? Double) ?? 0
+                    return v < 0.02 ? 0.1 : v
+                }
+            }
+            return 0.1
+        }
+        // Слишком длинные анимации прореживаем, чтобы не съесть память.
+        let step = Int((Double(n) / 90).rounded(.up))
+        var frames: [UIImage] = []
+        var total = 0.0
+        var i = 0
+        while i < n {
+            if let cg = CGImageSourceCreateThumbnailAtIndex(src, i, opts as CFDictionary) {
+                frames.append(UIImage(cgImage: cg))
+            }
+            for j in i..<min(i + step, n) { total += delay(j) }
+            i += step
+        }
+        if frames.isEmpty { return nil }
+        if frames.count == 1 { return frames[0] }
+        return UIImage.animatedImage(with: frames, duration: max(total, 0.4))
+    }
+}
+
+struct AnimatedImageView: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let v = UIImageView()
+        v.contentMode = .scaleAspectFill
+        v.clipsToBounds = true
+        v.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        v.setContentHuggingPriority(.defaultLow, for: .vertical)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        v.image = image
+        return v
+    }
+
+    func updateUIView(_ v: UIImageView, context: Context) {
+        if v.image !== image { v.image = image }
+    }
+}
+
+/// Как RemoteImage, но GIF и другие анимации воспроизводятся.
+struct AnimatedRemoteImage: View {
+    let url: URL?
+    var maxPixel: CGFloat = 400
+    @State private var image: UIImage?
+
+    var body: some View {
+        Rectangle().fill(.quaternary)
+            .overlay {
+                if let image { AnimatedImageView(image: image).transition(.opacity) }
+            }
+            .clipped()
+            .task(id: url) {
+                guard let url else { return }
+                if let c = AnimatedLoader.cached(url, maxPixel) { image = c; return }
+                image = nil
+                if let img = await AnimatedLoader.load(url, maxPixel: maxPixel, referer: LibSite.current.referer) {
+                    withAnimation(.easeOut(duration: 0.25)) { image = img }
+                }
+            }
+    }
+}
+
 struct RemoteImage: View {
     let url: URL?
     var maxPixel: CGFloat = 480
@@ -991,6 +1113,11 @@ struct SettingsView: View {
     @AppStorage("set.autoNext") private var autoNext = true
     @AppStorage("set.theme") private var appTheme = "system"
     @AppStorage("set.platform") private var platform = "anime"
+    @AppStorage("set.haptics") private var haptics = true
+    @AppStorage("set.keepAwake") private var keepAwake = true
+    @AppStorage("manga.mode.default") private var mangaMode = "auto"
+    @AppStorage("manga.tapzones") private var tapZones = true
+    @AppStorage("manga.anim") private var mangaAnim = "slide"
     @AppStorage("off.wifi") private var offWifi = false
     @AppStorage("off.prefetch") private var offPrefetch = false
     @ObservedObject private var offline = OfflineStore.shared
@@ -1008,6 +1135,30 @@ struct SettingsView: View {
         ("ranobe", "Ранобэ", "RanobeLib", true),
         ("manga", "Манга", "MangaLib", true)
     ]
+
+    private func platformIcon(_ id: String) -> String {
+        switch id {
+        case "ranobe": return "text.book.closed.fill"
+        case "manga": return "books.vertical.fill"
+        default: return "play.rectangle.fill"
+        }
+    }
+
+    private var platformHint: String {
+        switch platform {
+        case "ranobe": return "Ранобэ: читалка с темами и шрифтами, скачивание глав для чтения без сети."
+        case "manga": return "Манга: страницы или лента, комментарии к главам, прогресс чтения."
+        default: return "Аниме: плеер с озвучкой и субтитрами, комментарии к сериям, автопереход."
+        }
+    }
+
+    private func choosePlatform(_ id: String) {
+        guard platform != id else { return }
+        Haptics.bump()
+        let name = platforms.first { $0.0 == id }?.1 ?? ""
+        AppRouter.shared.toast = "Платформа: \(name)"
+        withAnimation(.easeInOut(duration: 0.3)) { platform = id }
+    }
 
     private func card<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1053,25 +1204,68 @@ struct SettingsView: View {
                     }
 
                     card("Платформа") {
-                        ForEach(platforms, id: \.0) { pl in
-                            Button { if pl.3 { platform = pl.0 } } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(pl.1).foregroundStyle(pl.3 ? Color.primary : Color.secondary)
-                                        Text(pl.2).font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            ForEach(platforms, id: \.0) { pl in
+                                let on = platform == pl.0
+                                Button { choosePlatform(pl.0) } label: {
+                                    VStack(spacing: 6) {
+                                        Image(systemName: platformIcon(pl.0)).font(.title2)
+                                        Text(pl.1).font(.subheadline.weight(.semibold))
+                                        Text(pl.2).font(.caption2).opacity(0.7)
                                     }
-                                    Spacer()
-                                    if !pl.3 {
-                                        Text("Скоро").font(.caption2.bold())
-                                            .padding(.horizontal, 8).padding(.vertical, 4)
-                                            .background(Theme.chip, in: Capsule())
-                                    } else if platform == pl.0 {
-                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 14)
+                                    .foregroundStyle(on ? Color.white : Color.primary)
+                                    .background(
+                                        on ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.6)],
+                                                                          startPoint: .topLeading, endPoint: .bottomTrailing))
+                                           : AnyShapeStyle(Theme.chip),
+                                        in: RoundedRectangle(cornerRadius: 16))
+                                    .overlay(alignment: .topTrailing) {
+                                        if on {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .font(.footnote)
+                                                .foregroundStyle(.white)
+                                                .padding(7)
+                                                .transition(.scale.combined(with: .opacity))
+                                        }
                                     }
+                                    .scaleEffect(on ? 1 : 0.96)
                                 }
+                                .buttonStyle(.pressable)
                             }
-                            .buttonStyle(.pressable)
                         }
+                        Text(platformHint)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    card("Ощущения") {
+                        Toggle("Вибрация при нажатиях", isOn: $haptics)
+                            .onChange(of: haptics) { on in if on { Haptics.bump() } }
+                        Toggle("Не гасить экран при чтении", isOn: $keepAwake)
+                    }
+                    .tint(Theme.accent)
+
+                    if platform == "manga" {
+                        card("Чтение манги") {
+                            Picker("Режим по умолчанию", selection: $mangaMode) {
+                                Text("Авто").tag("auto")
+                                Text("Страницы").tag("pages")
+                                Text("Лента").tag("scroll")
+                            }
+                            .pickerStyle(.segmented)
+                            Picker("Листание", selection: $mangaAnim) {
+                                Text("Сдвиг").tag("slide")
+                                Text("Плавно").tag("fade")
+                                Text("Как в книге").tag("book")
+                            }
+                            .pickerStyle(.segmented)
+                            Toggle("Листать тапом по краям экрана", isOn: $tapZones)
+                            Text("Для каждого тайтла режим можно поменять прямо в читалке, он запомнится.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .tint(Theme.accent)
                     }
 
                     card("Воспроизведение") {
@@ -1158,6 +1352,7 @@ final class AppRouter: ObservableObject {
     @Published var tab = 0
     @Published var pendingQuery: String?
     @Published var pendingSort: CatalogFilter.SortOption?
+    @Published var toast: String?
 
     func openCatalog(query: String = "", sort: CatalogFilter.SortOption? = nil) {
         pendingQuery = query
@@ -1599,9 +1794,26 @@ struct RootView: View {
                 .tag(4)
         }
         .id(accentHex + platform)
+        .transition(.opacity)
         .tint(Color(hex: accentHex))
         .preferredColorScheme(scheme)
         .onChange(of: router.tab) { _ in Haptics.select() }
+        .overlay(alignment: .top) {
+            if let t = router.toast {
+                Text(t)
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .shadow(color: .black.opacity(0.25), radius: 10, y: 4)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task(id: t) {
+                        try? await Task.sleep(nanoseconds: 1_800_000_000)
+                        if router.toast == t { router.toast = nil }
+                    }
+            }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: router.toast)
     }
 }
 
@@ -3483,6 +3695,7 @@ struct ProfileUser {
     var maxStreak: Int? = nil
     var level: Int? = nil
     var premium = false
+    var cover: URL? = nil
 }
 
 @MainActor
@@ -3513,6 +3726,21 @@ final class AuthStore: ObservableObject {
                                                 modifiedSince: .distantPast) {}
     }
 
+    nonisolated static func coverURL(_ d: [String: Any]) -> URL? {
+        for k in ["cover", "background", "banner", "header", "profile_cover"] {
+            if let u = J.url(d[k]) { return u }
+        }
+        return nil
+    }
+
+    /// Баннер может прийти только в публичном профиле, поэтому спрашиваем его отдельно.
+    private func loadCover(id: Int, token: String) async {
+        guard let data = try? await AnimelibAPI.shared.rawData("/user/\(id)", token: token),
+              let root = J.obj(data) as? [String: Any] else { return }
+        let d = (root["data"] as? [String: Any]) ?? root
+        if let u = AuthStore.coverURL(d) { user?.cover = u }
+    }
+
     func refreshUser() async {
         guard let t = token else { return }
         do {
@@ -3527,8 +3755,10 @@ final class AuthStore: ObservableObject {
                                streak: J.int(st?["login_streak"]) ?? J.int(d["login_streak"]),
                                maxStreak: J.int(st?["max_login_streak"]),
                                level: J.int(d["level"]) ?? J.int((d["user_level"] as? [String: Any])?["level"]),
-                               premium: ((d["premium"] as? [String: Any])?["enabled"] as? Bool) ?? false)
+                               premium: ((d["premium"] as? [String: Any])?["enabled"] as? Bool) ?? false,
+                               cover: AuthStore.coverURL(d))
             error = nil
+            if user?.cover == nil { await loadCover(id: id, token: t) }
         } catch {
             if case APIError.http(let code, _) = error, code == 401 || code == 403 {
                 signOut()
@@ -3870,6 +4100,8 @@ struct ProfileView: View {
     private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
         Label(text, systemImage: icon)
             .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
             .foregroundStyle(tint)
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(.ultraThinMaterial, in: Capsule())
@@ -3880,37 +4112,61 @@ struct ProfileView: View {
             ScrollView {
                 if let u = auth.user {
                     VStack(spacing: 16) {
-                        VStack(spacing: 12) {
-                            HStack(spacing: 14) {
-                                RemoteImage(url: u.avatar)
-                                    .frame(width: 72, height: 72)
-                                    .clipShape(Circle())
-                                    .overlay(Circle().stroke(Theme.accent, lineWidth: 2))
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(u.username).font(.title3.bold())
-                                    if u.premium {
-                                        Label("Premium", systemImage: "crown.fill")
-                                            .font(.caption.bold())
-                                            .foregroundStyle(.yellow)
+                        VStack(spacing: 0) {
+                            Group {
+                                if let c = u.cover {
+                                    AnimatedRemoteImage(url: c, maxPixel: 900)
+                                } else {
+                                    ZStack {
+                                        Theme.accent.opacity(0.35)
+                                        AnimatedRemoteImage(url: u.avatar, maxPixel: 200)
+                                            .blur(radius: 30)
+                                            .opacity(0.55)
                                     }
-                                    Button("Выйти") { auth.signOut() }
-                                        .font(.footnote)
-                                        .foregroundStyle(.red)
                                 }
-                                Spacer()
                             }
-                            HStack(spacing: 8) {
-                                if let st = u.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
-                                if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
-                                if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
-                                Spacer(minLength: 0)
+                            .frame(height: 150)
+                            .clipped()
+                            .overlay(alignment: .bottom) {
+                                LinearGradient(colors: [.clear, Theme.base.opacity(0.85)], startPoint: .top, endPoint: .bottom)
+                                    .frame(height: 70)
                             }
+
+                            AnimatedRemoteImage(url: u.avatar, maxPixel: 360)
+                                .frame(width: 92, height: 92)
+                                .clipShape(RoundedRectangle(cornerRadius: 22))
+                                .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.base, lineWidth: 4))
+                                .overlay(alignment: .topTrailing) {
+                                    Circle().fill(Color.green)
+                                        .frame(width: 18, height: 18)
+                                        .overlay(Circle().stroke(Theme.base, lineWidth: 3))
+                                        .offset(x: 6, y: -6)
+                                }
+                                .padding(.top, -46)
+
+                            VStack(spacing: 10) {
+                                Text(u.username).font(.title2.bold())
+                                if u.premium {
+                                    Label("Premium", systemImage: "crown.fill")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.yellow)
+                                }
+                                HStack(spacing: 8) {
+                                    if let st = u.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
+                                    if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
+                                    if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
+                                }
+                                Button("Выйти") { auth.signOut() }
+                                    .font(.footnote)
+                                    .foregroundStyle(.red)
+                            }
+                            .padding(.top, 10)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 16)
                         }
-                        .padding(14)
-                        .background(
-                            LinearGradient(colors: [Theme.accent.opacity(0.35), Theme.card],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 22))
+                        .frame(maxWidth: .infinity)
+                        .background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 22))
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.chip))
 
                         if !vm.folders.isEmpty {
@@ -5455,9 +5711,83 @@ struct ChapterCommentsView: View {
     }
 }
 
+/// Перелистывание как в Apple Books: страница загибается и переворачивается за край.
+struct BookPager: UIViewControllerRepresentable {
+    let pages: [MangaPage]
+    @Binding var current: Int
+    let onTap: (CGFloat) -> Void
+    let end: AnyView
+
+    final class Host: UIHostingController<AnyView> {
+        var index = 0
+    }
+
+    final class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
+        var parent: BookPager
+        var shown = 0
+        init(_ p: BookPager) { parent = p }
+
+        func host(_ i: Int) -> Host? {
+            guard i >= 0, i <= parent.pages.count else { return nil }
+            let view: AnyView = i < parent.pages.count
+                ? AnyView(MangaPageView(page: parent.pages[i], onTap: parent.onTap).background(Color.black))
+                : parent.end
+            let h = Host(rootView: view)
+            h.index = i
+            h.view.backgroundColor = .black
+            return h
+        }
+
+        func pageViewController(_ pvc: UIPageViewController, viewControllerBefore vc: UIViewController) -> UIViewController? {
+            guard let h = vc as? Host else { return nil }
+            return host(h.index - 1)
+        }
+
+        func pageViewController(_ pvc: UIPageViewController, viewControllerAfter vc: UIViewController) -> UIViewController? {
+            guard let h = vc as? Host else { return nil }
+            return host(h.index + 1)
+        }
+
+        func pageViewController(_ pvc: UIPageViewController, didFinishAnimating finished: Bool,
+                                previousViewControllers: [UIViewController], transitionCompleted completed: Bool) {
+            guard completed, let h = pvc.viewControllers?.first as? Host else { return }
+            shown = h.index
+            if parent.current != h.index { parent.current = h.index }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIViewController(context: Context) -> UIPageViewController {
+        let pvc = UIPageViewController(transitionStyle: .pageCurl, navigationOrientation: .horizontal)
+        pvc.dataSource = context.coordinator
+        pvc.delegate = context.coordinator
+        pvc.isDoubleSided = false
+        pvc.view.backgroundColor = .black
+        // Свои зоны касаний у нас есть, встроенные отключаем, чтобы страницы не листались дважды.
+        for g in pvc.gestureRecognizers where g is UITapGestureRecognizer { g.isEnabled = false }
+        if let h = context.coordinator.host(current) {
+            pvc.setViewControllers([h], direction: .forward, animated: false)
+            context.coordinator.shown = current
+        }
+        return pvc
+    }
+
+    func updateUIViewController(_ pvc: UIPageViewController, context: Context) {
+        let c = context.coordinator
+        c.parent = self
+        if c.shown != current, let h = c.host(current) {
+            let dir: UIPageViewController.NavigationDirection = current > c.shown ? .forward : .reverse
+            c.shown = current
+            pvc.setViewControllers([h], direction: dir, animated: true)
+        }
+    }
+}
+
 struct MangaReaderSettings: View {
     @Binding var titleMode: String
     @Binding var defaultMode: String
+    @Binding var anim: String
     let detected: String
     @Environment(\.dismiss) private var dismiss
 
@@ -5479,6 +5809,18 @@ struct MangaReaderSettings: View {
                     Text("Для этого тайтла")
                 } footer: {
                     Text("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы и веб-комиксов: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)».")
+                }
+                Section {
+                    Picker("", selection: $anim) {
+                        Text("Сдвиг").tag("slide")
+                        Text("Плавно").tag("fade")
+                        Text("Как в книге").tag("book")
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Листание страниц")
+                } footer: {
+                    Text("«Сдвиг»: страница уезжает вбок. «Плавно»: одна страница мягко сменяет другую. «Как в книге»: тяни за край, и страница переворачивается. Работает в режиме «Страницы».")
                 }
                 Section {
                     picker($defaultMode)
@@ -5511,6 +5853,7 @@ struct MangaReaderView: View {
     @State private var titleMode: String
     @State private var showSettings = false
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
+    @AppStorage("manga.anim") private var anim = "slide"
     @Environment(\.dismiss) private var dismiss
 
     init(novel: Anime, chapters: [NovelChapter], start: Int) {
@@ -5556,7 +5899,10 @@ struct MangaReaderView: View {
     }
 
     private func handleTap(_ x: CGFloat) {
-        if vertical { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() }; return }
+        if vertical || !Settings.bool("manga.tapzones", true) {
+            withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() }
+            return
+        }
         if x < 0.3 { turn(-1) }
         else if x > 0.7 { turn(1) }
         else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
@@ -5583,6 +5929,41 @@ struct MangaReaderView: View {
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var pagedView: some View {
+        switch anim {
+        case "book":
+            BookPager(pages: pages, current: $current, onTap: handleTap, end: AnyView(endCard))
+        case "fade":
+            ZStack {
+                if current < pages.count {
+                    MangaPageView(page: pages[current], onTap: handleTap)
+                        .id(current)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 1.04)),
+                                                removal: .opacity))
+                } else {
+                    endCard.id(current).transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: current)
+            .gesture(
+                DragGesture(minimumDistance: 30).onEnded { v in
+                    let dx = v.translation.width
+                    guard abs(dx) > 60, abs(dx) > abs(v.translation.height) else { return }
+                    turn(dx < 0 ? 1 : -1)
+                }
+            )
+        default:
+            TabView(selection: $current) {
+                ForEach(pages) { p in
+                    MangaPageView(page: p, onTap: handleTap).tag(p.id)
+                }
+                endCard.tag(pages.count)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
         }
     }
 
@@ -5680,15 +6061,9 @@ struct MangaReaderView: View {
                     .id("v\(index)")
                     .ignoresSafeArea(edges: .bottom)
                 } else {
-                    TabView(selection: $current) {
-                        ForEach(pages) { p in
-                            MangaPageView(page: p, onTap: handleTap).tag(p.id)
-                        }
-                        endCard.tag(pages.count)
-                    }
-                    .tabViewStyle(.page(indexDisplayMode: .never))
-                    .id("p\(index)")
-                    .ignoresSafeArea()
+                    pagedView
+                        .id("p\(index)-\(anim)")
+                        .ignoresSafeArea()
                 }
             }
             if loading {
@@ -5725,13 +6100,13 @@ struct MangaReaderView: View {
             UserDefaults.standard.set(v, forKey: "manga.mode.\(novel.id)")
         }
         .sheet(isPresented: $showSettings) {
-            MangaReaderSettings(titleMode: $titleMode, defaultMode: $defaultMode,
+            MangaReaderSettings(titleMode: $titleMode, defaultMode: $defaultMode, anim: $anim,
                                 detected: autoVertical ? "лента" : "страницы")
         }
         .sheet(isPresented: $showComments) {
             if let c = chapter { ChapterCommentsView(novel: novel, chapter: c) }
         }
-        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             preloadTask?.cancel()
@@ -5965,7 +6340,7 @@ struct NovelReaderView: View {
             }
         }
         .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
-        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
     }
 
