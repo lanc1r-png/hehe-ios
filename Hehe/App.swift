@@ -4,8 +4,6 @@ import AVFoundation
 import Foundation
 
 // MARK: - Models
-// Все поля сделаны опциональными: структура JSON восстановлена из скомпилированного
-// расширения, поэтому декодер должен переживать отсутствие любого поля.
 
 struct Envelope<T: Decodable>: Decodable {
     let data: T
@@ -189,11 +187,11 @@ struct PlayableVariant: Identifiable, Hashable {
 
 // MARK: - API
 enum APIError: LocalizedError {
-    case badURL, http(Int), noVideo
+    case badURL, http(Int, String), noVideo
     var errorDescription: String? {
         switch self {
         case .badURL: return "Некорректный адрес запроса"
-        case .http(let c): return "Сервер вернул ошибку \(c)"
+        case .http(let c, let body): return "Сервер вернул ошибку \(c): \(body)"
         case .noVideo: return "Для этой серии нет доступного видео"
         }
     }
@@ -250,20 +248,27 @@ actor AnimelibAPI {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, resp) = try await session.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw APIError.http(http.statusCode)
+            let body = String(data: data.prefix(300), encoding: .utf8) ?? ""
+            throw APIError.http(http.statusCode, body)
         }
         return try decoder.decode(T.self, from: data)
     }
 
     func catalog(filter: CatalogFilter, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
+        do {
+            return try await fetchCatalog(filter: filter, page: page, withSite: true)
+        } catch APIError.http(let code, _) where code == 422 {
+            return try await fetchCatalog(filter: filter, page: page, withSite: false)
+        }
+    }
+
+    private func fetchCatalog(filter: CatalogFilter, page: Int, withSite: Bool) async throws -> (items: [Anime], hasNext: Bool) {
         var q: [URLQueryItem] = [
             .init(name: "page", value: String(page)),
             .init(name: "sort_by", value: filter.sortBy.rawValue),
             .init(name: "sort_type", value: "desc"),
-            .init(name: "site_id[]", value: "5"),
-            .init(name: "fields[]", value: "rate_avg"),
-            .init(name: "fields[]", value: "episodes_count"),
         ]
+        if withSite { q.append(.init(name: "site_id[]", value: "5")) }
         if !filter.query.trimmingCharacters(in: .whitespaces).isEmpty {
             q.append(.init(name: "q", value: filter.query))
         }
@@ -274,7 +279,7 @@ actor AnimelibAPI {
     }
 
     func details(slug: String) async throws -> Anime {
-        let fields = ["summary", "genres", "authors", "otherNames", "rate_avg", "episodes_count", "ageRestriction", "releaseDateString"]
+        let fields = ["summary", "genres", "authors", "otherNames"]
         let q = fields.map { URLQueryItem(name: "fields[]", value: $0) }
         return try await get("/anime/\(slug)", query: q, as: Envelope<Anime>.self).data
     }
