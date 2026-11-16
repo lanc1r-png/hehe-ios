@@ -15,6 +15,13 @@ enum Theme {
     private static var cachedHex = ""
     private static var cachedColor = Color(hex: defaultAccentHex)
 
+    /// Цвета, которые сами подстраиваются под светлую и тёмную тему.
+    static let card = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+        ? UIColor(white: 1, alpha: 0.08) : UIColor(white: 0, alpha: 0.06) })
+    static let chip = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+        ? UIColor(white: 1, alpha: 0.10) : UIColor(white: 0, alpha: 0.08) })
+    static let base = Color(uiColor: .systemBackground)
+
     static var accent: Color {
         let hex = UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex
         if hex != cachedHex {
@@ -73,12 +80,15 @@ extension Color {
 }
 
 struct AppBackground: View {
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
+        let dark = scheme == .dark
         ZStack {
-            Color.black
-            RadialGradient(colors: [Theme.accent.opacity(0.35), .clear],
+            Theme.base
+            RadialGradient(colors: [Theme.accent.opacity(dark ? 0.35 : 0.22), .clear],
                            center: .topLeading, startRadius: 20, endRadius: 460)
-            RadialGradient(colors: [Color.pink.opacity(0.18), .clear],
+            RadialGradient(colors: [Color.pink.opacity(dark ? 0.18 : 0.10), .clear],
                            center: .bottomTrailing, startRadius: 20, endRadius: 460)
         }
         .ignoresSafeArea()
@@ -91,13 +101,13 @@ struct Chip: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button { Haptics.select(); action() } label: {
             Text(title)
                 .font(.subheadline)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
                 .foregroundStyle(selected ? Color.white : Color.primary)
-                .background(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.white.opacity(0.1)), in: Capsule())
+                .background(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip), in: Capsule())
         }
         .buttonStyle(.pressable)
     }
@@ -111,7 +121,7 @@ struct Pill: View {
             .font(.caption)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(Color.white.opacity(0.1), in: Capsule())
+            .background(Theme.chip, in: Capsule())
     }
 }
 
@@ -165,9 +175,10 @@ struct NamedItem: Codable, Hashable {
     let id: Int?
     let name: String?
     let label: String?
+    let slug: String?
     var title: String { name ?? label ?? "" }
 
-    enum CodingKeys: String, CodingKey { case id, name, label }
+    enum CodingKeys: String, CodingKey { case id, name, label, slug = "slug_url" }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -175,6 +186,7 @@ struct NamedItem: Codable, Hashable {
             ?? (try? c.decode(String.self, forKey: .id)).flatMap { Int($0) }
         name = try? c.decode(String.self, forKey: .name)
         label = try? c.decode(String.self, forKey: .label)
+        slug = try? c.decode(String.self, forKey: .slug)
     }
 }
 
@@ -535,8 +547,8 @@ actor AnimelibAPI {
     private var authorParam: [String: String] = [:]
 
     /// Все тайтлы одного автора. Имя параметра фильтра сайт нигде не описывает,
-    /// поэтому пробуем варианты и принимаем тот, что реально меняет выдачу.
-    func byAuthor(_ id: Int, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
+    /// поэтому пробуем варианты (по id и по slug) и принимаем тот, что реально меняет выдачу.
+    func byAuthor(_ id: Int, slug: String?, page: Int) async throws -> (items: [Anime], hasNext: Bool) {
         let site = LibSite.current
         func run(_ extra: [URLQueryItem]) async throws -> (items: [Anime], hasNext: Bool) {
             for withSite in [true, false] {
@@ -555,20 +567,40 @@ actor AnimelibAPI {
             }
             throw APIError.badURL
         }
+        // Уже найденный параметр: имя и вид значения («id» или «slug»).
         if let known = authorParam[site.key] {
-            return try await run([.init(name: known, value: String(id))])
+            let parts = known.split(separator: "|").map(String.init)
+            let value = (parts.count > 1 && parts[1] == "slug") ? (slug ?? String(id)) : String(id)
+            return try await run([.init(name: parts[0], value: value)])
         }
         let baseline = (try? await run([]))?.items.map { $0.id } ?? []
-        var tried: [String] = []
-        for name in ["authors[]", "author[]", "author", "people[]", "person[]", "authors", "artists[]", "creators[]"] {
-            tried.append(name)
-            guard let r = try? await run([.init(name: name, value: String(id))]) else { continue }
-            if !r.items.isEmpty && r.items.map({ $0.id }) != baseline {
-                authorParam[site.key] = name
-                return r
+        let names = ["authors[]", "people[]", "author[]", "peoples[]", "persons[]", "authors", "people",
+                     "author", "person", "artists[]", "creators[]", "staff[]", "people_id", "author_id"]
+        var values: [(String, String)] = [("id", String(id))]
+        if let sl = slug, !sl.isEmpty { values.append(("slug", sl)) }
+        var log: [String] = []
+        for (kind, value) in values {
+            for name in names {
+                do {
+                    let r = try await run([.init(name: name, value: value)])
+                    let ids = r.items.map { $0.id }
+                    if !ids.isEmpty && ids != baseline {
+                        authorParam[site.key] = "\(name)|\(kind)"
+                        return r
+                    }
+                    log.append("\(name)=\(kind): \(ids.isEmpty ? "пусто" : "как в общем списке")")
+                } catch APIError.http(let code, _) {
+                    log.append("\(name)=\(kind): \(code)")
+                } catch {
+                    log.append("\(name)=\(kind): сбой")
+                }
             }
         }
-        throw APIError.http(404, "Сайт не отфильтровал тайтлы по автору. Пробовал параметры: \(tried.joined(separator: ", "))")
+        // Подсказка для разбора: как выглядит страница автора на сервере.
+        let key = (slug?.isEmpty == false) ? slug! : String(id)
+        let sample = await rawText("/people/\(key)")
+        throw APIError.http(404, "Фильтр по автору не сработал.\n" + log.prefix(12).joined(separator: "; ")
+                            + "\n/people/\(key): " + String(sample.prefix(260)))
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -700,6 +732,20 @@ actor AnimelibAPI {
     }
 }
 
+enum Haptics {
+    static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+    static func select() { UISelectionFeedbackGenerator().selectionChanged() }
+    static func success() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+}
+
+/// Адрес тайтла на сайте (для «Поделиться»).
+func titleURL(_ a: Anime) -> URL? {
+    guard let slug = a.slugUrl else { return nil }
+    return LibSite.current.isRanobe
+        ? URL(string: "https://ranobelib.me/ru/book/\(slug)")
+        : URL(string: "https://animelib.org/ru/anime/\(slug)")
+}
+
 struct PressableStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -787,6 +833,33 @@ actor ImageLoader {
     }
 }
 
+extension ImageLoader {
+    /// Заранее подгружает обложки, которые ещё не показаны на экране.
+    nonisolated static func prefetch(_ urls: [URL], maxPixel: CGFloat = 480) {
+        let list = Array(urls.prefix(40))
+        guard !list.isEmpty else { return }
+        let referer = LibSite.current.referer
+        Task.detached(priority: .utility) {
+            var start = 0
+            while start < list.count {
+                let chunk = Array(list[start..<min(start + 4, list.count)])
+                start += 4
+                await withTaskGroup(of: Void.self) { group in
+                    for u in chunk {
+                        group.addTask {
+                            let key = ImageCache.key(u, maxPixel)
+                            if ImageCache.shared.object(forKey: key) != nil { return }
+                            if let img = await ImageLoader.shared.image(u, referer: referer, maxPixel: maxPixel) {
+                                ImageCache.store(img, key)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct RemoteImage: View {
     let url: URL?
     var maxPixel: CGFloat = 480
@@ -849,6 +922,7 @@ final class FavoritesStore: ObservableObject {
     }
 
     func toggle(_ a: Anime) {
+        Haptics.tap()
         if let i = items.firstIndex(where: { $0.id == a.id }) {
             items.remove(at: i)
         } else {
@@ -896,6 +970,8 @@ struct SettingsView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.autoNative") private var autoNative = true
     @AppStorage("set.resume") private var resume = true
+    @AppStorage("set.autoNext") private var autoNext = true
+    @AppStorage("set.theme") private var appTheme = "system"
     @AppStorage("set.platform") private var platform = "anime"
     @AppStorage("off.wifi") private var offWifi = false
     @AppStorage("off.prefetch") private var offPrefetch = false
@@ -921,13 +997,22 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
+                    card("Оформление") {
+                        Picker("Тема", selection: $appTheme) {
+                            Text("Как в системе").tag("system")
+                            Text("Тёмная").tag("dark")
+                            Text("Светлая").tag("light")
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
                     card("Цвет акцента") {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 12) {
@@ -960,7 +1045,7 @@ struct SettingsView: View {
                                     if !pl.3 {
                                         Text("Скоро").font(.caption2.bold())
                                             .padding(.horizontal, 8).padding(.vertical, 4)
-                                            .background(Color.white.opacity(0.1), in: Capsule())
+                                            .background(Theme.chip, in: Capsule())
                                     } else if platform == pl.0 {
                                         Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
                                     }
@@ -973,6 +1058,7 @@ struct SettingsView: View {
                     card("Воспроизведение") {
                         Toggle("Родной плеер iOS, если получится", isOn: $autoNative)
                         Toggle("Продолжать с места остановки", isOn: $resume)
+                        Toggle("Следующая серия сама после конца", isOn: $autoNext)
                         Text("Если родной плеер выключен, серии всегда идут в веб-плеере Kodik.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -1150,6 +1236,7 @@ final class HomeViewModel: ObservableObject {
         if let r = rb { popular = r.items; popularPage = 1; popularHasNext = r.hasNext }
         if let r = rc { newest = r.items }
         if let r = rd { top = r.items }
+        ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.imageURL })
         error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
     }
 
@@ -1281,7 +1368,7 @@ struct AnimeRow: View {
             }
         }
         .padding(10)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
     }
 }
 
@@ -1318,8 +1405,8 @@ struct ContinueCard: View {
         }
         .padding(10)
         .frame(width: 290)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.08)))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Theme.card))
     }
 }
 
@@ -1353,6 +1440,7 @@ struct HomeView: View {
                             SearchBar(text: $query) {
                                 let q = query.trimmingCharacters(in: .whitespaces)
                                 guard !q.isEmpty else { return }
+                                SearchHistory.shared.add(q)
                                 router.openCatalog(query: q)
                                 query = ""
                             }
@@ -1400,7 +1488,7 @@ struct HomeView: View {
                         if !vm.popular.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Сейчас читают" : "Сейчас смотрят") { router.openCatalog(sort: .views) }
-                                VStack(spacing: 8) {
+                                LazyVStack(spacing: 8) {
                                     ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
                                         TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1) }
                                             .buttonStyle(.pressable)
@@ -1413,7 +1501,7 @@ struct HomeView: View {
                                             .font(.subheadline.weight(.semibold))
                                             .frame(maxWidth: .infinity)
                                             .padding(.vertical, 12)
-                                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                                            .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                                         }
                                         .buttonStyle(.pressable)
                                     }
@@ -1457,7 +1545,16 @@ struct HomeView: View {
 struct RootView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.platform") private var platform = "anime"
+    @AppStorage("set.theme") private var appTheme = "system"
     @ObservedObject private var router = AppRouter.shared
+
+    private var scheme: ColorScheme? {
+        switch appTheme {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
+    }
 
     var body: some View {
         TabView(selection: $router.tab) {
@@ -1479,7 +1576,30 @@ struct RootView: View {
         }
         .id(accentHex + platform)
         .tint(Color(hex: accentHex))
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(scheme)
+        .onChange(of: router.tab) { _ in Haptics.select() }
+    }
+}
+
+@MainActor
+final class SearchHistory: ObservableObject {
+    static let shared = SearchHistory()
+    @Published private(set) var items: [String] = []
+
+    init() { items = UserDefaults.standard.stringArray(forKey: "search.history") ?? [] }
+
+    func add(_ q: String) {
+        let t = q.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        items.removeAll { $0.lowercased() == t.lowercased() }
+        items.insert(t, at: 0)
+        items = Array(items.prefix(8))
+        UserDefaults.standard.set(items, forKey: "search.history")
+    }
+
+    func clear() {
+        items = []
+        UserDefaults.standard.removeObject(forKey: "search.history")
     }
 }
 
@@ -1496,9 +1616,11 @@ final class CatalogViewModel: ObservableObject {
     private var page = 1
     private var hasNext = true
     private var generation = 0
+    private(set) var loadedQuery = ""
 
     func reload() async {
         generation += 1
+        loadedQuery = filter.query
         page = 1; hasNext = true; items = []; error = nil
         isLoading = false
         await loadMore()
@@ -1513,7 +1635,9 @@ final class CatalogViewModel: ObservableObject {
             let r = try await AnimelibAPI.shared.catalog(filter: filter, page: page)
             guard gen == generation else { return }
             let known = Set(items.map(\.id))
-            items += r.items.filter { !known.contains($0.id) }
+            let fresh = r.items.filter { !known.contains($0.id) }
+            items += fresh
+            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
             hasNext = r.hasNext
             page += 1
         } catch {
@@ -1654,7 +1778,53 @@ struct CatalogView: View {
     @StateObject private var vm = CatalogViewModel()
     @ObservedObject private var router = AppRouter.shared
     @State private var showFilters = false
+    @ObservedObject private var searches = SearchHistory.shared
+    @State private var randomTarget: Anime?
+    @State private var showRandom = false
+    @State private var rolling = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    private func roll() {
+        guard !rolling else { return }
+        rolling = true
+        Haptics.tap()
+        let filter = vm.filter
+        Task { @MainActor in
+            var pick: Anime?
+            for _ in 0..<3 where pick == nil {
+                if let r = try? await AnimelibAPI.shared.catalog(filter: filter, page: Int.random(in: 1...25)) {
+                    pick = r.items.randomElement()
+                }
+            }
+            if pick == nil, let r = try? await AnimelibAPI.shared.catalog(filter: filter, page: 1) {
+                pick = r.items.randomElement()
+            }
+            rolling = false
+            if let a = pick {
+                randomTarget = a
+                showRandom = true
+                Haptics.success()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var randomDestination: some View {
+        if let a = randomTarget {
+            if LibSite.current.isRanobe { NovelDetailView(novel: Novel(a)) } else { DetailView(anime: a) }
+        }
+    }
+
+    private var randomButton: some View {
+        Button { roll() } label: {
+            Group {
+                if rolling { ProgressView() } else { Image(systemName: "dice.fill").font(.headline) }
+            }
+            .frame(width: 42, height: 42)
+            .background(Material.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.pressable)
+    }
 
     private var filterButton: some View {
         Button { showFilters = true } label: {
@@ -1685,9 +1855,30 @@ struct CatalogView: View {
                         Text(LibSite.current.title)
                             .font(.system(size: 32, weight: .heavy, design: .rounded))
                         Spacer()
+                        randomButton
                         filterButton
                     }
-                    SearchBar(text: $vm.filter.query) { Task { await vm.reload() } }
+                    SearchBar(text: $vm.filter.query) {
+                        searches.add(vm.filter.query)
+                        Task { await vm.reload() }
+                    }
+                    if vm.filter.query.isEmpty && !searches.items.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
+                                ForEach(searches.items, id: \.self) { q in
+                                    Chip(title: q, selected: false) {
+                                        vm.filter.query = q
+                                        Task { await vm.reload() }
+                                    }
+                                }
+                                Button { searches.clear() } label: {
+                                    Image(systemName: "xmark.circle").foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.pressable)
+                            }
+                        }
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, geo.safeAreaInsets.top + 4)
@@ -1709,7 +1900,7 @@ struct CatalogView: View {
                         TitleLink(anime: anime) { AnimeCard(anime: anime) }
                             .buttonStyle(.pressable)
                             .onAppear {
-                                if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                                if vm.items.suffix(8).contains(where: { $0.id == anime.id }) { Task { await vm.loadMore() } }
                             }
                     }
                 }
@@ -1737,8 +1928,16 @@ struct CatalogView: View {
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
+            .navigationDestination(isPresented: $showRandom) { randomDestination }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
+            .task(id: vm.filter.query) {
+                // живой поиск: ждём, пока вы закончите печатать
+                guard vm.filter.query != vm.loadedQuery else { return }
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                if Task.isCancelled || vm.filter.query == vm.loadedQuery { return }
+                await vm.reload()
+            }
             .onAppear {
                 var changed = false
                 if let q = router.pendingQuery { vm.filter.query = q; router.pendingQuery = nil; changed = true }
@@ -1779,6 +1978,7 @@ struct AnimeCard: View {
 struct AuthorRef: Hashable {
     let id: Int
     let name: String
+    var slug: String? = nil
 }
 
 @MainActor
@@ -1789,18 +1989,23 @@ final class AuthorViewModel: ObservableObject {
     private var page = 1
     private var finished = false
     let authorID: Int
+    let slug: String?
 
-    init(authorID: Int) { self.authorID = authorID }
+    init(authorID: Int, slug: String?) {
+        self.authorID = authorID
+        self.slug = slug
+    }
 
     func loadMore() async {
         guard !isLoading, !finished else { return }
         isLoading = true
         defer { isLoading = false }
         do {
-            let r = try await AnimelibAPI.shared.byAuthor(authorID, page: page)
+            let r = try await AnimelibAPI.shared.byAuthor(authorID, slug: slug, page: page)
             let known = Set(items.map { $0.id })
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
+            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
             page += 1
             if fresh.isEmpty || !r.hasNext { finished = true }
             error = nil
@@ -1818,7 +2023,7 @@ struct AuthorView: View {
 
     init(author: AuthorRef) {
         self.author = author
-        _vm = StateObject(wrappedValue: AuthorViewModel(authorID: author.id))
+        _vm = StateObject(wrappedValue: AuthorViewModel(authorID: author.id, slug: author.slug))
     }
 
     var body: some View {
@@ -1835,7 +2040,7 @@ struct AuthorView: View {
                     Spacer()
                 }
                 .padding(14)
-                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+                .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
 
                 if let e = vm.error {
                     Text(e).font(.footnote).foregroundStyle(.red)
@@ -1846,7 +2051,7 @@ struct AuthorView: View {
                         TitleLink(anime: a) { AnimeCard(anime: a) }
                             .buttonStyle(.pressable)
                             .onAppear {
-                                if a.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                                if vm.items.suffix(8).contains(where: { $0.id == a.id }) { Task { await vm.loadMore() } }
                             }
                     }
                 }
@@ -1903,11 +2108,11 @@ struct DetailView: View {
 
     private var backdrop: some View {
         ZStack {
-            Color.black
+            Theme.base
             RemoteImage(url: vm.anime.imageURL, maxPixel: 96)
                 .blur(radius: 16)
                 .opacity(0.55)
-            LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
     }
@@ -1958,7 +2163,7 @@ struct DetailView: View {
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
                 }
 
                 if let au = vm.anime.authors, !au.isEmpty {
@@ -1967,7 +2172,7 @@ struct DetailView: View {
                         FlowLayout(spacing: 8) {
                             ForEach(Array(au.enumerated()), id: \.offset) { _, a in
                                 if let aid = a.id {
-                                    NavigationLink(value: AuthorRef(id: aid, name: a.title)) {
+                                    NavigationLink(value: AuthorRef(id: aid, name: a.title, slug: a.slug)) {
                                         HStack(spacing: 6) {
                                             Image(systemName: "person.fill")
                                             Text(a.title)
@@ -1976,14 +2181,14 @@ struct DetailView: View {
                                         .font(.subheadline.weight(.medium))
                                         .foregroundStyle(Theme.accent)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Color.white.opacity(0.1), in: Capsule())
+                                        .background(Theme.chip, in: Capsule())
                                     }
                                     .buttonStyle(.pressable)
                                 } else {
                                     Text(a.title)
                                         .font(.subheadline)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Color.white.opacity(0.1), in: Capsule())
+                                        .background(Theme.chip, in: Capsule())
                                 }
                             }
                         }
@@ -1996,7 +2201,7 @@ struct DetailView: View {
                             .font(.subheadline)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
-                            .background(Color.white.opacity(0.1), in: Capsule())
+                            .background(Theme.chip, in: Capsule())
                     }
                 }
 
@@ -2008,7 +2213,7 @@ struct DetailView: View {
                         Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
                     }
                     .padding(14)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                 }
                 .buttonStyle(.pressable)
 
@@ -2050,7 +2255,7 @@ struct DetailView: View {
                                     .foregroundStyle(pr != nil ? Color.gray : Theme.accent)
                             }
                             .padding(10)
-                            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                            .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                         }
                         .buttonStyle(.pressable)
                     }
@@ -2064,6 +2269,9 @@ struct DetailView: View {
         .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if let u = titleURL(vm.anime) {
+                    ShareLink(item: u) { Image(systemName: "square.and.arrow.up") }
+                }
                 Button { showBookmark = true } label: { Image(systemName: "bookmark") }
                 Button { favorites.toggle(vm.anime) } label: {
                     Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
@@ -2091,7 +2299,7 @@ struct WatchProgress: Codable {
 @MainActor
 final class ProgressStore: ObservableObject {
     static let shared = ProgressStore()
-    @Published private(set) var items: [String: WatchProgress] = [:]
+    private(set) var items: [String: WatchProgress] = [:]
     private let key = "progress.v1"
 
     init() {
@@ -2102,6 +2310,7 @@ final class ProgressStore: ObservableObject {
     }
 
     func clear() {
+        objectWillChange.send()
         items = [:]
         UserDefaults.standard.removeObject(forKey: key)
     }
@@ -2111,13 +2320,20 @@ final class ProgressStore: ObservableObject {
 
     func opened(_ id: Int) {
         if items[String(id)] == nil {
+            objectWillChange.send()
             items[String(id)] = WatchProgress(position: 0, duration: 0, updated: Date())
             save()
         }
     }
 
     func update(_ id: Int, position: Double, duration: Double) {
-        items[String(id)] = WatchProgress(position: position, duration: duration, updated: Date())
+        let new = WatchProgress(position: position, duration: duration, updated: Date())
+        let old = items[String(id)]
+        // перерисовываем экраны только при заметных изменениях, а не каждые 5 секунд
+        if old == nil || old?.finished != new.finished || abs((old?.position ?? 0) - position) >= 30 {
+            objectWillChange.send()
+        }
+        items[String(id)] = new
         save()
     }
 
@@ -2356,6 +2572,8 @@ final class PlayerViewModel: ObservableObject {
     @Published var isLoading = true
     @Published var debug = ""
     var autoNative = true
+    var onEnd: (() -> Void)?
+    private var endObserver: NSObjectProtocol?
     var episodeID = 0
     var lastPosition: Double = 0
     private var timeObserver: Any?
@@ -2458,12 +2676,26 @@ final class PlayerViewModel: ObservableObject {
             }
         }
         observedPlayer = p
+        if let o = endObserver { NotificationCenter.default.removeObserver(o) }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: p.currentItem, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.finishedPlaying() }
+        }
         p.play()
+    }
+
+    private func finishedPlaying() {
+        guard !stopped else { return }
+        if let d = player?.currentItem?.duration.seconds, d.isFinite, d > 0 {
+            ProgressStore.shared.update(episodeID, position: d, duration: d)
+        }
+        if Settings.bool("set.autoNext", true) { onEnd?() }
     }
 
     private func detachObserver() {
         if let o = timeObserver, let p = observedPlayer { p.removeTimeObserver(o) }
         timeObserver = nil; observedPlayer = nil
+        if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
     }
 
     private func savePosition() {
@@ -2506,6 +2738,7 @@ struct PlayerScreen: View {
 
     private func go(_ ep: EpisodeShort?) {
         guard let ep = ep else { return }
+        Haptics.tap()
         vm.stop()
         current = ep
     }
@@ -2616,6 +2849,7 @@ struct PlayerScreen: View {
         }
         .task(id: current.id) {
             if let a = anime { HistoryStore.shared.record(anime: a, episode: current) }
+            vm.onEnd = { go(nextEpisode) }
             await vm.load(episodeID: current.id)
         }
         .onDisappear { vm.stop() }
@@ -2999,7 +3233,7 @@ struct CommentRow: View {
                     HStack(spacing: 16) {
                         Button {
                             Task {
-                                if let e = await vm.like(c.id) { note = e } else { liked = true; note = nil }
+                                if let e = await vm.like(c.id) { note = e } else { liked = true; note = nil; Haptics.tap() }
                             }
                         } label: {
                             Label("\(c.up + (liked ? 1 : 0))", systemImage: liked ? "hand.thumbsup.fill" : "hand.thumbsup")
@@ -3045,7 +3279,7 @@ struct CommentRow: View {
             }
         }
         .padding(12)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -3065,7 +3299,7 @@ struct ComposeSheet: View {
                     .scrollContentBackground(.hidden)
                     .padding(10)
                     .frame(minHeight: 180)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                 if let e = error {
                     Text(e).font(.footnote).foregroundStyle(.orange)
                 }
@@ -3510,7 +3744,7 @@ struct BookmarkSheet: View {
                                     }
                                 }
                                 .padding(14)
-                                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                                .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                             }
                             .buttonStyle(.pressable)
                             .disabled(busy)
@@ -3650,10 +3884,10 @@ struct ProfileView: View {
                         }
                         .padding(14)
                         .background(
-                            LinearGradient(colors: [Theme.accent.opacity(0.35), Color.white.opacity(0.05)],
+                            LinearGradient(colors: [Theme.accent.opacity(0.35), Theme.card],
                                            startPoint: .topLeading, endPoint: .bottomTrailing),
                             in: RoundedRectangle(cornerRadius: 22))
-                        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Color.white.opacity(0.12)))
+                        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.chip))
 
                         if !vm.folders.isEmpty {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 10)], spacing: 10) {
@@ -3680,7 +3914,7 @@ struct ProfileView: View {
                                                                                startPoint: .topLeading, endPoint: .bottomTrailing))
                                                 : AnyShapeStyle(Material.ultraThinMaterial),
                                             in: RoundedRectangle(cornerRadius: 16))
-                                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.1)))
+                                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
                                     }
                                     .buttonStyle(.pressable)
                                 }
@@ -4023,10 +4257,22 @@ struct TitleLink<Label: View>: View {
     }
 
     var body: some View {
-        if LibSite.current.isRanobe {
-            NavigationLink(value: Novel(anime)) { label() }
-        } else {
-            NavigationLink(value: anime) { label() }
+        Group {
+            if LibSite.current.isRanobe {
+                NavigationLink(value: Novel(anime)) { label() }
+            } else {
+                NavigationLink(value: anime) { label() }
+            }
+        }
+        .contextMenu {
+            let store = LibSite.current.isRanobe ? FavoritesStore.novels : FavoritesStore.shared
+            Button { store.toggle(anime) } label: {
+                Label(store.contains(anime) ? "Убрать из избранного" : "В избранное",
+                      systemImage: store.contains(anime) ? "heart.slash" : "heart")
+            }
+            if let u = titleURL(anime) {
+                ShareLink(item: u) { Label("Поделиться", systemImage: "square.and.arrow.up") }
+            }
         }
     }
 }
@@ -4307,6 +4553,7 @@ final class DownloadManager: ObservableObject {
         }
         if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
         if Task.isCancelled { return }
+        if done > 0 { Haptics.success() }
         current = nil
         status = ""
         total = 0
@@ -4540,9 +4787,9 @@ struct NovelDetailView: View {
 
     private var backdrop: some View {
         ZStack {
-            Color.black
+            Theme.base
             RemoteImage(url: vm.anime.imageURL, maxPixel: 96).blur(radius: 16).opacity(0.55)
-            LinearGradient(colors: [.clear, .black.opacity(0.85), .black], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
     }
@@ -4617,7 +4864,7 @@ struct NovelDetailView: View {
                 .font(.caption.bold())
         }
         .padding(12)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func row(_ i: Int) -> some View {
@@ -4656,7 +4903,7 @@ struct NovelDetailView: View {
             ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c)
         }
         .padding(10)
-        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
         .contextMenu {
             if saved {
                 Button(role: .destructive) { store.remove(novel: vm.anime.id, chapter: c.id) } label: {
@@ -4731,7 +4978,7 @@ struct NovelDetailView: View {
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
                 }
 
                 if let au = vm.anime.authors, !au.isEmpty {
@@ -4740,7 +4987,7 @@ struct NovelDetailView: View {
                         FlowLayout(spacing: 8) {
                             ForEach(Array(au.enumerated()), id: \.offset) { _, a in
                                 if let aid = a.id {
-                                    NavigationLink(value: AuthorRef(id: aid, name: a.title)) {
+                                    NavigationLink(value: AuthorRef(id: aid, name: a.title, slug: a.slug)) {
                                         HStack(spacing: 6) {
                                             Image(systemName: "person.fill")
                                             Text(a.title)
@@ -4749,14 +4996,14 @@ struct NovelDetailView: View {
                                         .font(.subheadline.weight(.medium))
                                         .foregroundStyle(Theme.accent)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Color.white.opacity(0.1), in: Capsule())
+                                        .background(Theme.chip, in: Capsule())
                                     }
                                     .buttonStyle(.pressable)
                                 } else {
                                     Text(a.title)
                                         .font(.subheadline)
                                         .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Color.white.opacity(0.1), in: Capsule())
+                                        .background(Theme.chip, in: Capsule())
                                 }
                             }
                         }
@@ -4768,7 +5015,7 @@ struct NovelDetailView: View {
                         Label("Открыть на сайте", systemImage: "safari")
                             .font(.subheadline)
                             .padding(.horizontal, 14).padding(.vertical, 9)
-                            .background(Color.white.opacity(0.1), in: Capsule())
+                            .background(Theme.chip, in: Capsule())
                     }
                 }
 
@@ -4780,7 +5027,7 @@ struct NovelDetailView: View {
                         Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
                     }
                     .padding(14)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                 }
                 .buttonStyle(.pressable)
 
@@ -4831,6 +5078,9 @@ struct NovelDetailView: View {
         .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if let u = titleURL(vm.anime) {
+                    ShareLink(item: u) { Image(systemName: "square.and.arrow.up") }
+                }
                 Button { showBookmark = true } label: { Image(systemName: "bookmark") }
                 Button { favorites.toggle(vm.anime) } label: {
                     Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
@@ -4878,7 +5128,11 @@ struct NovelReaderView: View {
 
     private var activeTheme: String {
         if theme == "auto" {
-            return UIScreen.main.traitCollection.userInterfaceStyle == .dark ? "dark" : "light"
+            switch UserDefaults.standard.string(forKey: "set.theme") ?? "system" {
+            case "light": return "light"
+            case "dark": return "dark"
+            default: return UIScreen.main.traitCollection.userInterfaceStyle == .dark ? "dark" : "light"
+            }
         }
         return theme
     }
@@ -4897,6 +5151,21 @@ struct NovelReaderView: View {
         case "light": return Color(white: 0.1)
         default: return Color(white: 0.9)
         }
+    }
+
+    private var readMinutes: Int {
+        var n = 0
+        for b in blocks {
+            switch b {
+            case .paragraph(_, let t), .heading(_, let t), .quote(_, let t):
+                n += t.split(separator: " ").count
+            case .rich(_, let t):
+                n += String(t.characters).split(separator: " ").count
+            default:
+                break
+            }
+        }
+        return max(1, Int((Double(n) / 180).rounded()))
     }
 
     private var bodyFont: Font { .system(size: fontSize, design: serif ? .serif : .default) }
@@ -4925,11 +5194,16 @@ struct NovelReaderView: View {
         NavigationStack {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: fontSize * (0.5 + lineGap)) {
+                    LazyVStack(alignment: .leading, spacing: fontSize * (0.5 + lineGap)) {
                         Color.clear.frame(height: 1).id("top")
                         if chapters.indices.contains(index) {
                             Text(chapters[index].title)
                                 .font(.system(size: fontSize + 6, weight: .bold, design: serif ? .serif : .default))
+                        }
+                        if !loading && !blocks.isEmpty {
+                            Text("≈ \(readMinutes) мин чтения")
+                                .font(.caption)
+                                .opacity(0.55)
                         }
                         if loading { ProgressView().frame(maxWidth: .infinity).padding(.top, 40) }
                         ForEach(blocks) { b in blockView(b) }
@@ -4973,12 +5247,12 @@ struct NovelReaderView: View {
             .safeAreaInset(edge: .bottom) {
                 if !chromeHidden {
                 HStack {
-                    Button { index -= 1 } label: { Image(systemName: "chevron.left").frame(width: 44, height: 40) }
+                    Button { Haptics.tap(); index -= 1 } label: { Image(systemName: "chevron.left").frame(width: 44, height: 40) }
                         .disabled(index <= 0)
                     Spacer()
                     Text("\(index + 1) из \(chapters.count)").font(.footnote.weight(.semibold))
                     Spacer()
-                    Button { index += 1 } label: { Image(systemName: "chevron.right").frame(width: 44, height: 40) }
+                    Button { Haptics.tap(); index += 1 } label: { Image(systemName: "chevron.right").frame(width: 44, height: 40) }
                         .disabled(index >= chapters.count - 1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -5029,6 +5303,8 @@ struct NovelReaderView: View {
             }
         }
         .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
     }
 
     private func load() async {
