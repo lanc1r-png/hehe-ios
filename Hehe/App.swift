@@ -8,7 +8,34 @@ import Security
 // MARK: - Тема и общие элементы дизайна
 
 enum Theme {
-    static let accent = Color(red: 0.66, green: 0.48, blue: 1.0)
+    static let defaultAccentHex = "A87AFF"
+    /// Акцентный цвет берётся из настроек и меняется на лету.
+    static var accent: Color {
+        Color(hex: UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex)
+    }
+}
+
+enum Settings {
+    static func bool(_ key: String, _ def: Bool) -> Bool {
+        (UserDefaults.standard.object(forKey: key) as? Bool) ?? def
+    }
+}
+
+extension Color {
+    init(hex: String) {
+        let t = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var v: UInt64 = 0
+        Scanner(string: t).scanHexInt64(&v)
+        self.init(red: Double((v >> 16) & 255) / 255,
+                  green: Double((v >> 8) & 255) / 255,
+                  blue: Double(v & 255) / 255)
+    }
+
+    var hexString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+    }
 }
 
 struct AppBackground: View {
@@ -448,7 +475,8 @@ actor AnimelibAPI {
         return list.filter { $0.id != nil && !$0.title.isEmpty }
     }
 
-    func rawData(_ path: String, query: [URLQueryItem] = [], token: String? = nil) async throws -> Data {
+    func rawData(_ path: String, query: [URLQueryItem] = [], token: String? = nil,
+                 method: String = "GET", json: [String: Any]? = nil) async throws -> Data {
         guard var comps = URLComponents(string: apiURL + path) else { throw APIError.badURL }
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { throw APIError.badURL }
@@ -457,6 +485,11 @@ actor AnimelibAPI {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("5", forHTTPHeaderField: "Site-Id")
         if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
+        req.httpMethod = method
+        if let j = json {
+            req.httpBody = try JSONSerialization.data(withJSONObject: j)
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         let (data, resp) = try await session.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw APIError.http(http.statusCode, String(data: data.prefix(300), encoding: .utf8) ?? "")
@@ -612,6 +645,11 @@ final class FavoritesStore: ObservableObject {
 
     func contains(_ a: Anime) -> Bool { items.contains { $0.id == a.id } }
 
+    func clear() {
+        items = []
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
     func toggle(_ a: Anime) {
         if let i = items.firstIndex(where: { $0.id == a.id }) {
             items.remove(at: i)
@@ -655,17 +693,148 @@ struct FavoritesView: View {
     }
 }
 
-struct RootView: View {
+struct SettingsView: View {
+    @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
+    @AppStorage("set.autoNative") private var autoNative = true
+    @AppStorage("set.resume") private var resume = true
+    @AppStorage("set.platform") private var platform = "anime"
+    @ObservedObject private var auth = AuthStore.shared
+    @State private var custom: Color = Theme.accent
+    @State private var info: String?
+
+    private let presets: [(String, String)] = [
+        ("Фиолетовый", "A87AFF"), ("Розовый", "FF6FA8"), ("Синий", "4F9DFF"),
+        ("Бирюзовый", "2EC4B6"), ("Зелёный", "5BD16A"), ("Оранжевый", "FF9F43"), ("Красный", "FF5A5F")
+    ]
+    private let platforms: [(String, String, String, Bool)] = [
+        ("anime", "Аниме", "AnimeLib", true),
+        ("manga", "Манга", "MangaLib", false),
+        ("ranobe", "Ранобэ", "RanobeLib", false),
+        ("hentai", "Хентай", "HentaiLib · 18+", false)
+    ]
+
+    private func card<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title.uppercased()).font(.caption.bold()).foregroundStyle(.secondary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
     var body: some View {
-        TabView {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 14) {
+                    card("Цвет акцента") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(presets, id: \.1) { p in
+                                    Circle()
+                                        .fill(Color(hex: p.1))
+                                        .frame(width: 36, height: 36)
+                                        .overlay {
+                                            if accentHex.uppercased() == p.1 {
+                                                Image(systemName: "checkmark").font(.footnote.bold()).foregroundStyle(.white)
+                                            }
+                                        }
+                                        .onTapGesture { accentHex = p.1 }
+                                }
+                            }
+                        }
+                        ColorPicker("Свой цвет", selection: $custom, supportsOpacity: false)
+                            .onChange(of: custom) { c in accentHex = c.hexString }
+                    }
+
+                    card("Платформа") {
+                        ForEach(platforms, id: \.0) { pl in
+                            Button { if pl.3 { platform = pl.0 } } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(pl.1).foregroundStyle(pl.3 ? Color.primary : Color.secondary)
+                                        Text(pl.2).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if !pl.3 {
+                                        Text("Скоро").font(.caption2.bold())
+                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                            .background(Color.white.opacity(0.1), in: Capsule())
+                                    } else if platform == pl.0 {
+                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    card("Воспроизведение") {
+                        Toggle("Родной плеер iOS, если получится", isOn: $autoNative)
+                        Toggle("Продолжать с места остановки", isOn: $resume)
+                        Text("Если родной плеер выключен, серии всегда идут в веб-плеере Kodik.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .tint(Theme.accent)
+
+                    card("Данные") {
+                        Button("Очистить кэш обложек") {
+                            ImageCache.shared.removeAllObjects(); info = "Кэш обложек очищен"
+                        }
+                        Button("Сбросить историю просмотра") {
+                            ProgressStore.shared.clear(); info = "История просмотра сброшена"
+                        }
+                        Button("Очистить избранное") {
+                            FavoritesStore.shared.clear(); info = "Избранное очищено"
+                        }
+                        if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
+                    }
+
+                    card("Аккаунт") {
+                        if let u = auth.user {
+                            Text("Вы вошли как \(u.username)")
+                            Button("Выйти", role: .destructive) { auth.signOut() }
+                        } else {
+                            Text("Вход выполняется во вкладке «Профиль».").foregroundStyle(.secondary)
+                        }
+                    }
+
+                    card("О приложении") {
+                        Text("Hehe · версия 1.0")
+                        Text("Данные: animelib.org. Приложение неофициальное.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(14)
+            }
+            .background(AppBackground())
+            .navigationTitle("Настройки")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+struct RootView: View {
+    @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
+    @State private var tab = 0
+
+    var body: some View {
+        TabView(selection: $tab) {
             CatalogView()
                 .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
+                .tag(0)
             FavoritesView()
                 .tabItem { Label("Избранное", systemImage: "heart") }
+                .tag(1)
             ProfileView()
                 .tabItem { Label("Профиль", systemImage: "person.crop.circle") }
+                .tag(2)
+            SettingsView()
+                .tabItem { Label("Настройки", systemImage: "gearshape") }
+                .tag(3)
         }
-        .tint(Theme.accent)
+        .id(accentHex)
+        .tint(Color(hex: accentHex))
         .preferredColorScheme(.dark)
     }
 }
@@ -984,6 +1153,7 @@ struct DetailView: View {
     @StateObject private var vm: DetailViewModel
     @State private var selected: EpisodeShort?
     @State private var showComments = false
+    @State private var showBookmark = false
     @ObservedObject private var progress = ProgressStore.shared
     @State private var expanded = false
     @ObservedObject private var favorites = FavoritesStore.shared
@@ -1126,7 +1296,8 @@ struct DetailView: View {
         .navigationTitle(vm.anime.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { showBookmark = true } label: { Image(systemName: "bookmark") }
                 Button { favorites.toggle(vm.anime) } label: {
                     Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
                         .foregroundStyle(favorites.contains(vm.anime) ? Color.pink : Color.primary)
@@ -1135,6 +1306,7 @@ struct DetailView: View {
         }
         .task { await vm.load() }
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
+        .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
         .fullScreenCover(item: $selected) { ep in
             PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle)
         }
@@ -1160,6 +1332,11 @@ final class ProgressStore: ObservableObject {
            let v = try? JSONDecoder().decode([String: WatchProgress].self, from: d) {
             items = v
         }
+    }
+
+    func clear() {
+        items = [:]
+        UserDefaults.standard.removeObject(forKey: key)
     }
 
     func get(_ id: Int) -> WatchProgress? { items[String(id)] }
@@ -1420,7 +1597,7 @@ final class PlayerViewModel: ObservableObject {
         isLoading = true; error = nil
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
-        lastPosition = ProgressStore.shared.position(episodeID)
+        lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
             if let first = variants.first { select(first) }
@@ -1435,13 +1612,13 @@ final class PlayerViewModel: ObservableObject {
     func select(_ v: PlayableVariant) {
         note = nil
         showWeb = false
-        autoNative = true
+        autoNative = Settings.bool("set.autoNative", true)
         qualities = []
         current = v
         if v.kodik {
             savePosition(); detachObserver()
             player?.pause(); player = nil
-            Task { await playKodik(v) }
+            if autoNative { Task { await playKodik(v) } } else { showWeb = true }
         } else if v.isWeb {
             savePosition(); detachObserver()
             player?.pause(); player = nil
@@ -1798,6 +1975,7 @@ final class CommentsViewModel: ObservableObject {
     @Published var debug = ""
     @Published var loadingReplies: Set<Int> = []
     @Published var repliesLoaded: [Int: [CommentItem]] = [:]
+    @Published var replyTarget: CommentItem?
 
     let animeID: Int
     let slug: String
@@ -1860,6 +2038,53 @@ final class CommentsViewModel: ObservableObject {
         }
     }
 
+    func reload() async {
+        items = []
+        repliesLoaded = [:]
+        page = 1
+        finished = false
+        await loadMore()
+    }
+
+    /// Возвращает текст ошибки или nil при успехе.
+    func send(_ text: String, parent: Int?) async -> String? {
+        guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
+        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": "anime"]
+        if let p = parent { base["parent_comment"] = p }
+        var alt = base
+        alt["is_spoiler"] = false
+        alt["attachments"] = [Any]()
+        var last = ""
+        for b in [base, alt] {
+            do {
+                _ = try await AnimelibAPI.shared.rawData("/comments", token: t, method: "POST", json: b)
+                return nil
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        return last
+    }
+
+    func like(_ id: Int) async -> String? {
+        guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
+        let attempts: [(String, [String: Any])] = [
+            ("/comments/\(id)/vote", ["type": "up"]),
+            ("/comments/\(id)/vote", ["vote": 1]),
+            ("/comments/\(id)/like", [:])
+        ]
+        var last = ""
+        for (path, body) in attempts {
+            do {
+                _ = try await AnimelibAPI.shared.rawData(path, token: t, method: "POST", json: body)
+                return nil
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        return last
+    }
+
     func loadReplies(_ c: CommentItem) async {
         loadingReplies.insert(c.id)
         defer { loadingReplies.remove(c.id) }
@@ -1881,6 +2106,8 @@ struct CommentRow: View {
     var depth = 0
     @ObservedObject var vm: CommentsViewModel
     @State private var expanded = false
+    @State private var liked = false
+    @State private var note: String?
 
     private var children: [CommentItem] {
         c.replies.isEmpty ? (vm.repliesLoaded[c.id] ?? []) : c.replies
@@ -1901,9 +2128,24 @@ struct CommentRow: View {
                         .font(.subheadline)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 16) {
-                        Label("\(c.up)", systemImage: "hand.thumbsup").font(.caption)
+                        Button {
+                            Task {
+                                if let e = await vm.like(c.id) { note = e } else { liked = true; note = nil }
+                            }
+                        } label: {
+                            Label("\(c.up + (liked ? 1 : 0))", systemImage: liked ? "hand.thumbsup.fill" : "hand.thumbsup")
+                                .font(.caption)
+                                .foregroundStyle(liked ? Theme.accent : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
                         if c.down > 0 {
                             Label("\(c.down)", systemImage: "hand.thumbsdown").font(.caption)
+                        }
+                        if AuthStore.shared.token != nil {
+                            Button { vm.replyTarget = c } label: {
+                                Text("Ответить").font(.caption.bold()).foregroundStyle(Theme.accent)
+                            }
+                            .buttonStyle(.plain)
                         }
                         if c.replyCount > 0 {
                             Button {
@@ -1919,6 +2161,9 @@ struct CommentRow: View {
                     }
                     .foregroundStyle(.secondary)
                     .padding(.top, 2)
+                    if let n = note {
+                        Text("Не вышло: " + n).font(.caption2).foregroundStyle(.orange)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -1935,10 +2180,55 @@ struct CommentRow: View {
     }
 }
 
+struct ComposeSheet: View {
+    let title: String
+    let send: (String) async -> String?
+    let onSent: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var error: String?
+    @State private var sending = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 10) {
+                TextEditor(text: $text)
+                    .scrollContentBackground(.hidden)
+                    .padding(10)
+                    .frame(minHeight: 180)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                if let e = error {
+                    Text(e).font(.footnote).foregroundStyle(.orange)
+                }
+                Spacer()
+            }
+            .padding(14)
+            .background(AppBackground())
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Отмена") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(sending ? "…" : "Отправить") {
+                        Task {
+                            sending = true
+                            error = await send(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                            sending = false
+                            if error == nil { onSent(); dismiss() }
+                        }
+                    }
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
+                }
+            }
+        }
+    }
+}
+
 struct CommentsView: View {
     let anime: Anime
     @StateObject private var vm: CommentsViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var showCompose = false
 
     init(anime: Anime) {
         self.anime = anime
@@ -1978,6 +2268,19 @@ struct CommentsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                }
+            }
+            .sheet(isPresented: $showCompose) {
+                ComposeSheet(title: "Новый комментарий",
+                             send: { await vm.send($0, parent: nil) },
+                             onSent: { Task { await vm.reload() } })
+            }
+            .sheet(item: $vm.replyTarget) { target in
+                ComposeSheet(title: "Ответ для \(target.username)",
+                             send: { await vm.send($0, parent: target.id) },
+                             onSent: { Task { await vm.reload() } })
             }
             .task { await vm.loadMore() }
         }
@@ -1989,6 +2292,10 @@ struct ProfileUser {
     let id: Int
     let username: String
     let avatar: URL?
+    var streak: Int? = nil
+    var maxStreak: Int? = nil
+    var level: Int? = nil
+    var premium = false
 }
 
 @MainActor
@@ -2026,9 +2333,14 @@ final class AuthStore: ObservableObject {
             guard let root = J.obj(data) as? [String: Any] else { throw APIError.badURL }
             let d = (root["data"] as? [String: Any]) ?? root
             guard let id = J.int(d["id"]) else { throw APIError.badURL }
+            let st = d["login_streak"] as? [String: Any]
             user = ProfileUser(id: id,
                                username: J.str(d["username"]) ?? J.str(d["name"]) ?? "Профиль",
-                               avatar: J.url(d["avatar"]))
+                               avatar: J.url(d["avatar"]),
+                               streak: J.int(st?["login_streak"]) ?? J.int(d["login_streak"]),
+                               maxStreak: J.int(st?["max_login_streak"]),
+                               level: J.int(d["level"]) ?? J.int((d["user_level"] as? [String: Any])?["level"]),
+                               premium: ((d["premium"] as? [String: Any])?["enabled"] as? Bool) ?? false)
             error = nil
         } catch {
             if case APIError.http(let code, _) = error, code == 401 || code == 403 {
@@ -2139,6 +2451,7 @@ final class ProfileViewModel: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
     @Published var debug = ""
+    var totalTitles: Int { folders.compactMap { $0.count }.reduce(0, +) }
 
     private var userID: Int?
     private var token: String?
@@ -2220,14 +2533,130 @@ final class ProfileViewModel: ObservableObject {
         var candidates: [[String: Any]] = []
         for v in d.values { if let sub = v as? [String: Any] { candidates.append(sub) } }
         candidates.append(d)
+        var best: (Int, Anime)?
         for c in candidates {
-            guard J.int(c["id"]) != nil,
-                  c["slug_url"] != nil || c["rus_name"] != nil || c["name"] != nil,
+            guard J.int(c["id"]) != nil else { continue }
+            var score = 0
+            if J.str(c["rus_name"]) != nil { score += 4 }
+            if J.str(c["name"]) != nil { score += 2 }
+            if c["cover"] != nil { score += 2 }
+            if J.str(c["slug_url"]) != nil { score += 1 }
+            guard score >= 3,
                   let data = try? JSONSerialization.data(withJSONObject: c),
                   let a = try? JSONDecoder().decode(Anime.self, from: data) else { continue }
-            return a
+            if best == nil || score > best!.0 { best = (score, a) }
         }
-        return nil
+        return best?.1
+    }
+}
+
+struct BookmarkSheet: View {
+    let anime: Anime
+    @ObservedObject private var auth = AuthStore.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var folders: [BookmarkFolder] = []
+    @State private var message: String?
+    @State private var done: Int?
+    @State private var busy = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 10) {
+                    if auth.token == nil {
+                        Text("Войдите во вкладке «Профиль», чтобы добавлять тайтлы в свои списки на сайте.")
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 40)
+                    } else {
+                        ForEach(folders) { f in
+                            Button { Task { await add(f) } } label: {
+                                HStack {
+                                    Text(f.name).foregroundStyle(.primary)
+                                    Spacer()
+                                    if done == f.id {
+                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent)
+                                    }
+                                }
+                                .padding(14)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(busy)
+                        }
+                        if !folders.isEmpty {
+                            Button(role: .destructive) { Task { await remove() } } label: {
+                                Text("Убрать из списков").frame(maxWidth: .infinity).padding(12)
+                            }
+                            .disabled(busy)
+                        }
+                    }
+                    if let m = message {
+                        Text(m).font(.footnote).foregroundStyle(.orange).padding(.top, 6)
+                    }
+                }
+                .padding(14)
+            }
+            .background(AppBackground())
+            .navigationTitle("В список")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } } }
+            .task { await loadFolders() }
+        }
+    }
+
+    private func loadFolders() async {
+        guard let t = auth.token, let uid = auth.user?.id else { return }
+        do {
+            let data = try await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t)
+            guard let root = J.obj(data) as? [String: Any],
+                  let arr = root["data"] as? [[String: Any]] else { return }
+            folders = arr.compactMap { d in
+                guard let id = J.int(d["id"]) else { return nil }
+                return BookmarkFolder(id: id, name: J.str(d["name"]) ?? J.str(d["title"]) ?? "Список", count: nil)
+            }
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func add(_ f: BookmarkFolder) async {
+        guard let t = auth.token else { return }
+        busy = true
+        defer { busy = false }
+        let bodies: [[String: Any]] = [
+            ["id": anime.id, "type": f.id, "model": "anime"],
+            ["bookmark": ["type": f.id], "id": anime.id, "model": "anime"],
+            ["type": f.id, "relation_id": anime.id, "relation_type": "anime"]
+        ]
+        var last = ""
+        for b in bodies {
+            do {
+                _ = try await AnimelibAPI.shared.rawData("/bookmarks", token: t, method: "POST", json: b)
+                done = f.id
+                message = nil
+                return
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        message = "Не получилось добавить: " + last
+    }
+
+    private func remove() async {
+        guard let t = auth.token else { return }
+        busy = true
+        defer { busy = false }
+        for q in [[URLQueryItem(name: "type", value: "anime")], []] {
+            do {
+                _ = try await AnimelibAPI.shared.rawData("/bookmarks/\(anime.id)", query: q, token: t, method: "DELETE")
+                done = nil
+                message = "Убрано из списков"
+                return
+            } catch {
+                message = "Не получилось убрать: " + error.localizedDescription
+            }
+        }
     }
 }
 
@@ -2237,25 +2666,51 @@ struct ProfileView: View {
     @State private var showLogin = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
+    private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
+        Label(text, systemImage: icon)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 if let u = auth.user {
                     VStack(spacing: 16) {
-                        HStack(spacing: 14) {
-                            RemoteImage(url: u.avatar)
-                                .frame(width: 64, height: 64)
-                                .clipShape(Circle())
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(u.username).font(.title3.bold())
-                                Button("Выйти") { auth.signOut() }
-                                    .font(.footnote)
-                                    .foregroundStyle(.red)
+                        VStack(spacing: 12) {
+                            HStack(spacing: 14) {
+                                RemoteImage(url: u.avatar)
+                                    .frame(width: 72, height: 72)
+                                    .clipShape(Circle())
+                                    .overlay(Circle().stroke(Theme.accent, lineWidth: 2))
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(u.username).font(.title3.bold())
+                                    if u.premium {
+                                        Label("Premium", systemImage: "crown.fill")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.yellow)
+                                    }
+                                    Button("Выйти") { auth.signOut() }
+                                        .font(.footnote)
+                                        .foregroundStyle(.red)
+                                }
+                                Spacer()
                             }
-                            Spacer()
+                            HStack(spacing: 8) {
+                                if let st = u.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
+                                if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
+                                if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
+                                Spacer(minLength: 0)
+                            }
                         }
                         .padding(14)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                        .background(
+                            LinearGradient(colors: [Theme.accent.opacity(0.35), Color.white.opacity(0.05)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 22))
+                        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Color.white.opacity(0.12)))
 
                         if !vm.folders.isEmpty {
                             ScrollView(.horizontal, showsIndicators: false) {
