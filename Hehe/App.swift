@@ -2,6 +2,7 @@ import SwiftUI
 import AVKit
 import AVFoundation
 import Foundation
+import WebKit
 
 // MARK: - Models
 
@@ -20,20 +21,50 @@ struct PageMeta: Decodable {
     }
 }
 
-struct NamedItem: Decodable, Hashable {
+struct NamedItem: Codable, Hashable {
     let id: Int?
     let name: String?
     let label: String?
     var title: String { name ?? label ?? "" }
 }
 
-struct Cover: Decodable, Hashable {
+struct RichNode: Decodable {
+    let type: String?
+    let text: String?
+    let content: [RichNode]?
+
+    var plainText: String {
+        if type == "text" { return text ?? "" }
+        let inner = (content ?? []).map { $0.plainText }.joined()
+        switch type {
+        case "paragraph", "heading": return inner + "\n"
+        case "hardBreak": return "\n"
+        default: return inner
+        }
+    }
+}
+
+struct RichText: Decodable {
+    let text: String
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) {
+            text = s
+        } else if let node = try? c.decode(RichNode.self) {
+            text = node.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            text = ""
+        }
+    }
+}
+
+struct Cover: Codable, Hashable {
     let thumbnail: String?
     let `default`: String?
     let md: String?
 }
 
-struct Anime: Decodable, Identifiable, Hashable {
+struct Anime: Codable, Identifiable, Hashable {
     let id: Int
     let name: String?
     let rusName: String?
@@ -80,7 +111,7 @@ struct Anime: Decodable, Identifiable, Hashable {
         engName = try? c.decode(String.self, forKey: .engName)
         slugUrl = try? c.decode(String.self, forKey: .slugUrl)
         cover = try? c.decode(Cover.self, forKey: .cover)
-        summary = try? c.decode(String.self, forKey: .summary)
+        summary = (try? c.decode(RichText.self, forKey: .summary))?.text
         genres = try? c.decode([NamedItem].self, forKey: .genres)
         authors = try? c.decode([NamedItem].self, forKey: .authors)
         otherNames = try? c.decode([String].self, forKey: .otherNames)
@@ -89,7 +120,6 @@ struct Anime: Decodable, Identifiable, Hashable {
         type = try? c.decode(NamedItem.self, forKey: .type)
         ageRestriction = try? c.decode(NamedItem.self, forKey: .ageRestriction)
         releaseDateString = try? c.decode(String.self, forKey: .releaseDateString)
-        // rate_avg приходит то строкой, то числом
         if let s = try? c.decode(String.self, forKey: .rateAvg) { rateAvg = s }
         else if let d = try? c.decode(Double.self, forKey: .rateAvg) { rateAvg = String(format: "%.1f", d) }
         else { rateAvg = nil }
@@ -161,6 +191,17 @@ struct EpisodePlayer: Decodable, Hashable {
         case id, player, team, video, subtitles, src
         case translationType = "translation_type"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try? c.decode(Int.self, forKey: .id)
+        player = try? c.decode(String.self, forKey: .player)
+        team = try? c.decode(Team.self, forKey: .team)
+        translationType = try? c.decode(NamedItem.self, forKey: .translationType)
+        video = try? c.decode(VideoInfo.self, forKey: .video)
+        subtitles = try? c.decode([SubtitleInfo].self, forKey: .subtitles)
+        src = try? c.decode(String.self, forKey: .src)
+    }
 }
 
 struct EpisodeDetail: Decodable {
@@ -183,6 +224,7 @@ struct PlayableVariant: Identifiable, Hashable {
     let title: String
     let url: URL
     let subtitle: URL?
+    var isWeb = false
 }
 
 // MARK: - API
@@ -278,7 +320,6 @@ actor AnimelibAPI {
         return (r.data, hasNext)
     }
 
-    /// Сырой ответ сервера для отладки (первые ~1800 символов).
     func rawText(_ path: String, query: [URLQueryItem] = []) async -> String {
         guard var comps = URLComponents(string: apiURL + path) else { return "bad url" }
         if !query.isEmpty { comps.queryItems = query }
@@ -323,19 +364,28 @@ actor AnimelibAPI {
         async let detailTask = episodeDetail(id: episodeID)
         async let serversTask = videoServers()
         let detail = try await detailTask
-        let servers = (try? await serversTask) ?? []
-        guard let base = servers.first?.url else { throw APIError.noVideo }
+        let base: String? = (try? await serversTask)?.first?.url
 
-        var result: [PlayableVariant] = []
-        for p in detail.players ?? [] where p.isNative {
-            let subURL: URL? = p.subtitles?.first?.src.flatMap { URL(string: absolute($0, base: base)) }
-            let qualities = (p.video?.quality ?? []).sorted { ($0.quality ?? 0) > ($1.quality ?? 0) }
-            for q in qualities {
-                guard let href = q.href, let url = URL(string: absolute(href, base: base)) else { continue }
-                let qt = q.quality.map { "\($0)p" } ?? ""
-                result.append(PlayableVariant(title: "\(p.label) · \(qt)", url: url, subtitle: subURL))
+        var native: [PlayableVariant] = []
+        var web: [PlayableVariant] = []
+        for p in detail.players ?? [] {
+            if p.isNative {
+                guard let base = base else { continue }
+                let subURL: URL? = p.subtitles?.first?.src.flatMap { URL(string: absolute($0, base: base)) }
+                let qualities = (p.video?.quality ?? []).sorted { ($0.quality ?? 0) > ($1.quality ?? 0) }
+                for q in qualities {
+                    guard let href = q.href, let url = URL(string: absolute(href, base: base)) else { continue }
+                    let qt = q.quality.map { "\($0)p" } ?? ""
+                    native.append(PlayableVariant(title: "\(p.label) · \(qt)", url: url, subtitle: subURL))
+                }
+            } else if let src = p.src {
+                let full = src.hasPrefix("//") ? "https:" + src : src
+                if let url = URL(string: full) {
+                    web.append(PlayableVariant(title: "\(p.label) · \(p.player ?? "Плеер")", url: url, subtitle: nil, isWeb: true))
+                }
             }
         }
+        let result = native + web
         if result.isEmpty { throw APIError.noVideo }
         return result
     }
@@ -376,14 +426,87 @@ struct RemoteImage: View {
     private func load() async {
         guard let url else { failed = true; return }
         if let cached = ImageCache.shared.object(forKey: url as NSURL) { image = cached; return }
-        var req = URLRequest(url: url)
-        req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
-        req.setValue("image/*", forHTTPHeaderField: "Accept")
-        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) {
-            ImageCache.shared.setObject(img, forKey: url as NSURL)
-            image = img
+        for attempt in 0..<3 {
+            if Task.isCancelled { return }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 20
+            req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
+            req.setValue("image/*", forHTTPHeaderField: "Accept")
+            if let (data, resp) = try? await URLSession.shared.data(for: req),
+               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
+               let img = UIImage(data: data) {
+                ImageCache.shared.setObject(img, forKey: url as NSURL)
+                image = img
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(500_000_000 * (attempt + 1)))
+        }
+        if !Task.isCancelled { failed = true }
+    }
+}
+
+// MARK: - Favorites
+@MainActor
+final class FavoritesStore: ObservableObject {
+    static let shared = FavoritesStore()
+    @Published private(set) var items: [Anime] = []
+    private let key = "favorites.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let a = try? JSONDecoder().decode([Anime].self, from: d) {
+            items = a
+        }
+    }
+
+    func contains(_ a: Anime) -> Bool { items.contains { $0.id == a.id } }
+
+    func toggle(_ a: Anime) {
+        if let i = items.firstIndex(where: { $0.id == a.id }) {
+            items.remove(at: i)
         } else {
-            failed = true
+            items.insert(a, at: 0)
+        }
+        if let d = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(d, forKey: key)
+        }
+    }
+}
+
+struct FavoritesView: View {
+    @ObservedObject private var favorites = FavoritesStore.shared
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 12)]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                if favorites.items.isEmpty {
+                    Text("Пока пусто. Откройте тайтл и нажмите сердечко.")
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 80).padding(.horizontal)
+                }
+                LazyVGrid(columns: columns, spacing: 16) {
+                    ForEach(favorites.items) { anime in
+                        NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                            .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            .navigationTitle("Избранное")
+            .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+        }
+    }
+}
+
+struct RootView: View {
+    var body: some View {
+        TabView {
+            CatalogView()
+                .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
+            FavoritesView()
+                .tabItem { Label("Избранное", systemImage: "heart") }
         }
     }
 }
@@ -492,7 +615,6 @@ final class DetailViewModel: ObservableObject {
     @Published var episodes: [EpisodeShort] = []
     @Published var isLoading = true
     @Published var error: String?
-    @Published var debug = ""
 
     init(anime: Anime) { self.anime = anime }
 
@@ -509,17 +631,13 @@ final class DetailViewModel: ObservableObject {
             }
         } catch { self.error = error.localizedDescription }
         isLoading = false
-        if let slug = anime.slugUrl {
-            let q = ["summary", "genres", "authors", "otherNames"].map { URLQueryItem(name: "fields[]", value: $0) }
-            let raw = await AnimelibAPI.shared.rawText("/anime/\(slug)", query: q)
-            debug = "cover: \(anime.imageURL?.absoluteString ?? "нет")\n" + raw
-        }
     }
 }
 
 struct DetailView: View {
     @StateObject private var vm: DetailViewModel
     @State private var selected: EpisodeShort?
+    @ObservedObject private var favorites = FavoritesStore.shared
 
     init(anime: Anime) { _vm = StateObject(wrappedValue: DetailViewModel(anime: anime)) }
 
@@ -537,21 +655,18 @@ struct DetailView: View {
                         }
                         if let s = vm.anime.status?.title, !s.isEmpty { Label(s, systemImage: "dot.radiowaves.left.and.right") }
                         if let t = vm.anime.type?.title, !t.isEmpty { Label(t, systemImage: "tv") }
+                        if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Label(a, systemImage: "exclamationmark.shield") }
                         if let r = vm.anime.rateAvg { Label(r, systemImage: "star.fill") }
                     }.font(.footnote)
                 }
                 if let g = vm.anime.genres, !g.isEmpty {
                     Text(g.map(\.title).joined(separator: " · ")).font(.footnote).foregroundStyle(.secondary)
                 }
+                if let au = vm.anime.authors, !au.isEmpty {
+                    Text("Автор: " + au.map(\.title).joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
+                }
                 if let s = vm.anime.summary, !s.isEmpty {
                     Text(s).font(.callout)
-                }
-            }
-            if !vm.debug.isEmpty {
-                Section("Отладка (пришлите скриншот)") {
-                    Text(vm.debug)
-                        .font(.system(size: 10, design: .monospaced))
-                        .textSelection(.enabled)
                 }
             }
             Section("Серии") {
@@ -570,6 +685,13 @@ struct DetailView: View {
         }
         .navigationTitle(vm.anime.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { favorites.toggle(vm.anime) } label: {
+                    Image(systemName: favorites.contains(vm.anime) ? "heart.fill" : "heart")
+                }
+            }
+        }
         .task { await vm.load() }
         .fullScreenCover(item: $selected) { ep in
             PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle)
@@ -578,6 +700,31 @@ struct DetailView: View {
 }
 
 // MARK: - Player
+struct WebPlayerView: UIViewRepresentable {
+    let url: URL
+
+    final class Coordinator { var loaded: URL? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let cfg = WKWebViewConfiguration()
+        cfg.allowsInlineMediaPlayback = true
+        let v = WKWebView(frame: .zero, configuration: cfg)
+        v.isOpaque = false
+        v.backgroundColor = .black
+        v.scrollView.isScrollEnabled = false
+        return v
+    }
+
+    func updateUIView(_ v: WKWebView, context: Context) {
+        guard context.coordinator.loaded != url else { return }
+        context.coordinator.loaded = url
+        var req = URLRequest(url: url)
+        req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
+        v.load(req)
+    }
+}
+
 @MainActor
 final class PlayerViewModel: ObservableObject {
     @Published var variants: [PlayableVariant] = []
@@ -602,6 +749,12 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func select(_ v: PlayableVariant) {
+        if v.isWeb {
+            player?.pause()
+            player = nil
+            current = v
+            return
+        }
         let time = player?.currentTime()
         current = v
         let asset = AVURLAsset(url: v.url, options: [
@@ -628,7 +781,9 @@ struct PlayerScreen: View {
             VStack(spacing: 0) {
                 ZStack {
                     Color.black
-                    if let p = vm.player {
+                    if let v = vm.current, v.isWeb {
+                        WebPlayerView(url: v.url)
+                    } else if let p = vm.player {
                         VideoPlayer(player: p)
                     } else if vm.isLoading {
                         ProgressView().tint(.white)
@@ -683,7 +838,7 @@ struct HeheApp: App {
 
     var body: some Scene {
         WindowGroup {
-            CatalogView()
+            RootView()
         }
     }
 }
