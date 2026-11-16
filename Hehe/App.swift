@@ -278,6 +278,23 @@ actor AnimelibAPI {
         return (r.data, hasNext)
     }
 
+    /// Сырой ответ сервера для отладки (первые ~1800 символов).
+    func rawText(_ path: String, query: [URLQueryItem] = []) async -> String {
+        guard var comps = URLComponents(string: apiURL + path) else { return "bad url" }
+        if !query.isEmpty { comps.queryItems = query }
+        guard let url = comps.url else { return "bad url" }
+        var req = URLRequest(url: url)
+        for (k, v) in playbackHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            return "HTTP \(code)\n" + (String(data: data.prefix(1800), encoding: .utf8) ?? "")
+        } catch {
+            return "Ошибка: \(error.localizedDescription)"
+        }
+    }
+
     func details(slug: String) async throws -> Anime {
         let fields = ["summary", "genres", "authors", "otherNames"]
         let q = fields.map { URLQueryItem(name: "fields[]", value: $0) }
@@ -328,6 +345,46 @@ actor AnimelibAPI {
         let b = base.hasSuffix("/") ? String(base.dropLast()) : base
         let h = href.hasPrefix("/") ? href : "/" + href
         return b + "/" + h
+    }
+}
+
+// MARK: - Images (с заголовком Referer)
+final class ImageCache {
+    static let shared = NSCache<NSURL, UIImage>()
+}
+
+struct RemoteImage: View {
+    let url: URL?
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Rectangle().fill(.quaternary)
+            .overlay {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else if failed {
+                    Image(systemName: "photo").foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                }
+            }
+            .clipped()
+            .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        guard let url else { failed = true; return }
+        if let cached = ImageCache.shared.object(forKey: url as NSURL) { image = cached; return }
+        var req = URLRequest(url: url)
+        req.setValue("https://v5.animelib.org/", forHTTPHeaderField: "Referer")
+        req.setValue("image/*", forHTTPHeaderField: "Accept")
+        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) {
+            ImageCache.shared.setObject(img, forKey: url as NSURL)
+            image = img
+        } else {
+            failed = true
+        }
     }
 }
 
@@ -420,12 +477,7 @@ struct AnimeCard: View {
     let anime: Anime
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AsyncImage(url: anime.imageURL) { phase in
-                switch phase {
-                case .success(let img): img.resizable().scaledToFill()
-                default: Rectangle().fill(.quaternary).overlay(ProgressView())
-                }
-            }
+            RemoteImage(url: anime.imageURL)
             .aspectRatio(2/3, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 10))
             Text(anime.displayTitle).font(.footnote).lineLimit(2)
@@ -440,6 +492,7 @@ final class DetailViewModel: ObservableObject {
     @Published var episodes: [EpisodeShort] = []
     @Published var isLoading = true
     @Published var error: String?
+    @Published var debug = ""
 
     init(anime: Anime) { self.anime = anime }
 
@@ -456,6 +509,11 @@ final class DetailViewModel: ObservableObject {
             }
         } catch { self.error = error.localizedDescription }
         isLoading = false
+        if let slug = anime.slugUrl {
+            let q = ["summary", "genres", "authors", "otherNames"].map { URLQueryItem(name: "fields[]", value: $0) }
+            let raw = await AnimelibAPI.shared.rawText("/anime/\(slug)", query: q)
+            debug = "cover: \(anime.imageURL?.absoluteString ?? "нет")\n" + raw
+        }
     }
 }
 
@@ -469,9 +527,7 @@ struct DetailView: View {
         List {
             Section {
                 HStack(alignment: .top, spacing: 12) {
-                    AsyncImage(url: vm.anime.imageURL) { $0.resizable().scaledToFill() } placeholder: {
-                        Rectangle().fill(.quaternary)
-                    }
+                    RemoteImage(url: vm.anime.imageURL)
                     .frame(width: 110, height: 165)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     VStack(alignment: .leading, spacing: 6) {
@@ -489,6 +545,13 @@ struct DetailView: View {
                 }
                 if let s = vm.anime.summary, !s.isEmpty {
                     Text(s).font(.callout)
+                }
+            }
+            if !vm.debug.isEmpty {
+                Section("Отладка (пришлите скриншот)") {
+                    Text(vm.debug)
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
                 }
             }
             Section("Серии") {
@@ -522,13 +585,19 @@ final class PlayerViewModel: ObservableObject {
     @Published var player: AVPlayer?
     @Published var error: String?
     @Published var isLoading = true
+    @Published var debug = ""
 
     func load(episodeID: Int) async {
         isLoading = true; error = nil
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
             if let first = variants.first { select(first) }
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            self.error = error.localizedDescription
+            let a = await AnimelibAPI.shared.rawText("/episodes/\(episodeID)")
+            let b = await AnimelibAPI.shared.rawText("/constants", query: [URLQueryItem(name: "fields[]", value: "videoServers")])
+            debug = a + "\n---\n" + b
+        }
         isLoading = false
     }
 
@@ -570,6 +639,13 @@ struct PlayerScreen: View {
                 .aspectRatio(16/9, contentMode: .fit)
 
                 List {
+                    if !vm.debug.isEmpty {
+                        Section("Отладка (пришлите скриншот)") {
+                            Text(vm.debug)
+                                .font(.system(size: 9, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                    }
                     Section("Озвучка и качество") {
                         ForEach(vm.variants) { v in
                             Button {
