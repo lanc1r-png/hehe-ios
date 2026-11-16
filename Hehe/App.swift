@@ -6,6 +6,7 @@ import WebKit
 import Security
 import Network
 import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Тема и общие элементы дизайна
 
@@ -1160,6 +1161,255 @@ struct FavoritesView: View {
     }
 }
 
+// MARK: - Резервная копия (прогресс, избранное, история, настройки)
+enum BackupManager {
+    private static let prefixes = ["favorites", "history", "progress", "read", "search.", "set.",
+                                   "accent.", "reader.", "manga.", "novel.", "off."]
+
+    private static func allowed(_ key: String) -> Bool {
+        prefixes.contains { key.hasPrefix($0) }
+    }
+
+    static var autoURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Yume-backup.plist")
+    }
+
+    static func snapshot() -> [String: Any] {
+        let all = UserDefaults.standard.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "") ?? [:]
+        return all.filter { allowed($0.key) }
+    }
+
+    static func data() -> Data? {
+        let root: [String: Any] = ["app": "Yume", "version": 1, "date": Date(), "defaults": snapshot()]
+        return try? PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+    }
+
+    // Папка, выбранная пользователем (например, в iCloud Drive). Запоминается закладкой.
+    private static let bmKey = "backup.folder.bookmark"
+
+    private static func resolveFolder() -> URL? {
+        guard let b = UserDefaults.standard.data(forKey: bmKey) else { return nil }
+        var stale = false
+        guard let u = try? URL(resolvingBookmarkData: b, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
+        if stale, u.startAccessingSecurityScopedResource() {
+            if let nb = try? u.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                UserDefaults.standard.set(nb, forKey: bmKey)
+            }
+            u.stopAccessingSecurityScopedResource()
+        }
+        return u
+    }
+
+    static var folderName: String? { resolveFolder()?.lastPathComponent }
+
+    static func setFolder(_ url: URL) -> Bool {
+        let ok = url.startAccessingSecurityScopedResource()
+        defer { if ok { url.stopAccessingSecurityScopedResource() } }
+        guard let b = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) else { return false }
+        UserDefaults.standard.set(b, forKey: bmKey)
+        return writeAuto() != nil
+    }
+
+    static func clearFolder() { UserDefaults.standard.removeObject(forKey: bmKey) }
+
+    static var lastFolderWrite: Date? {
+        UserDefaults.standard.object(forKey: "backup.folder.date") as? Date
+    }
+
+    private static func writeToFolder(_ d: Data) {
+        guard let dir = resolveFolder() else { return }
+        let ok = dir.startAccessingSecurityScopedResource()
+        defer { if ok { dir.stopAccessingSecurityScopedResource() } }
+        let target = dir.appendingPathComponent("Yume-backup.plist")
+        var err: NSError?
+        var wrote = false
+        NSFileCoordinator().coordinate(writingItemAt: target, options: .forReplacing, error: &err) { u in
+            wrote = (try? d.write(to: u, options: .atomic)) != nil
+        }
+        if wrote { UserDefaults.standard.set(Date(), forKey: "backup.folder.date") }
+    }
+
+    /// Пишет копию в папку приложения и, если выбрана, в папку пользователя (iCloud Drive).
+    @discardableResult
+    static func writeAuto() -> URL? {
+        guard let d = data() else { return nil }
+        writeToFolder(d)
+        do {
+            try d.write(to: autoURL, options: .atomic)
+            return autoURL
+        } catch {
+            return nil
+        }
+    }
+
+    static var lastAuto: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: autoURL.path))?[.modificationDate] as? Date
+    }
+
+    /// Возвращает число восстановленных записей.
+    static func restore(_ data: Data) -> Int? {
+        guard let root = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              (root["app"] as? String) == "Yume",
+              let defs = root["defaults"] as? [String: Any] else { return nil }
+        var n = 0
+        for (k, v) in defs where allowed(k) {
+            UserDefaults.standard.set(v, forKey: k)
+            n += 1
+        }
+        return n
+    }
+}
+
+struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ c: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - Журнал запросов сайта (чтобы найти, как сайт хранит прогресс)
+@MainActor
+final class SiteLog: ObservableObject {
+    @Published var lines: [String] = []
+
+    func add(_ s: String) {
+        if lines.count > 400 { lines.removeFirst(100) }
+        lines.append(s)
+    }
+}
+
+struct SiteWebView: UIViewRepresentable {
+    let url: URL
+    let log: SiteLog
+
+    static let script = """
+    (function(){
+      if (window.__heheLog) return; window.__heheLog = true;
+      function want(m, u){
+        if (m !== 'GET') return true;
+        return /(view|read|watch|progress|history|continue|last|chapter|episode)/i.test(String(u));
+      }
+      function send(m, u, b, s){
+        try {
+          window.webkit.messageHandlers.hlog.postMessage(JSON.stringify({
+            m: m, u: String(u), b: b ? String(b).slice(0, 400) : '', s: s || 0
+          }));
+        } catch (e) {}
+      }
+      var of = window.fetch;
+      if (of) window.fetch = function(a, o){
+        var u = typeof a === 'string' ? a : (a && a.url);
+        var m = ((o && o.method) || (a && a.method) || 'GET').toUpperCase();
+        var b = o && o.body;
+        var p = of.apply(this, arguments);
+        p.then(function(r){ if (want(m, u)) send(m, u, b, r.status); }).catch(function(){});
+        return p;
+      };
+      var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(m, u){ this.__m = String(m).toUpperCase(); this.__u = u; return oo.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function(b){
+        var x = this;
+        this.addEventListener('loadend', function(){ if (want(x.__m, x.__u)) send(x.__m, x.__u, b, x.status); });
+        return os.apply(this, arguments);
+      };
+    })();
+    """
+
+    final class Coordinator: NSObject, WKScriptMessageHandler {
+        let log: SiteLog
+        init(_ l: SiteLog) { log = l }
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard let t = m.body as? String,
+                  let d = t.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
+            let line = "\(o["m"] as? String ?? "?") \(o["u"] as? String ?? "") [\(o["s"] as? Int ?? 0)]"
+                + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + $0 } ?? "")
+            Task { @MainActor in self.log.add(line) }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(log) }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let cfg = WKWebViewConfiguration()
+        cfg.allowsInlineMediaPlayback = true
+        cfg.userContentController.add(context.coordinator, name: "hlog")
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Self.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        let v = WKWebView(frame: .zero, configuration: cfg)
+        v.customUserAgent = Kodik.ua
+        v.load(URLRequest(url: url))
+        return v
+    }
+
+    func updateUIView(_ v: WKWebView, context: Context) {}
+
+    static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
+        v.configuration.userContentController.removeScriptMessageHandler(forName: "hlog")
+    }
+}
+
+struct SiteLogView: View {
+    @StateObject private var log = SiteLog()
+    @State private var showLog = false
+
+    private var start: URL {
+        switch LibSite.current.key {
+        case "ranobe": return URL(string: "https://ranobelib.me/ru/")!
+        case "manga": return URL(string: "https://mangalib.me/ru/")!
+        default: return URL(string: "https://animelib.org/ru/")!
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SiteWebView(url: start, log: log)
+            Button { showLog = true } label: {
+                Label("Журнал запросов: \(log.lines.count)", systemImage: "list.bullet.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Theme.accent, in: RoundedRectangle(cornerRadius: 12))
+                    .foregroundStyle(.white)
+                    .padding(12)
+            }
+        }
+        .navigationTitle("Сайт")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showLog) {
+            NavigationStack {
+                ScrollView {
+                    Text(log.lines.isEmpty ? "Пока пусто. Открой на сайте главу или серию, отметь прочитанное и вернись сюда." : log.lines.joined(separator: "\n"))
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                .navigationTitle("Журнал")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { showLog = false } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        HStack {
+                            Button("Очистить") { log.lines = [] }
+                            Button("Копировать") { UIPasteboard.general.string = log.lines.joined(separator: "\n") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct SettingsView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.autoNative") private var autoNative = true
@@ -1182,6 +1432,10 @@ struct SettingsView: View {
     @ObservedObject private var auth = AuthStore.shared
     @State private var custom: Color = Theme.accent
     @State private var info: String?
+    @State private var shareItem: ShareItem?
+    @State private var showImporter = false
+    @State private var importMode = "restore"
+    @State private var backupInfo = ""
 
     private let presets: [(String, String)] = [
         ("Фиолетовый", "A87AFF"), ("Розовый", "FF6FA8"), ("Синий", "4F9DFF"),
@@ -1396,6 +1650,66 @@ struct SettingsView: View {
                             FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
                         }
                         if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
+                    }
+
+                    card("Резервная копия") {
+                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Выбери папку в iCloud Drive: копия будет обновляться сама при каждом сворачивании приложения и переживёт даже удаление Yume.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button { importMode = "folder"; showImporter = true } label: {
+                            Label(BackupManager.folderName.map { "iCloud-папка: \($0)" } ?? "Выбрать папку в iCloud Drive", systemImage: "icloud")
+                        }
+                        if BackupManager.folderName != nil {
+                            if let d = BackupManager.lastFolderWrite {
+                                Text("Последняя копия в папке: \(d.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Button("Отключить папку", role: .destructive) {
+                                BackupManager.clearFolder(); backupInfo = "Автокопия в папку отключена."
+                            }
+                        }
+                        Button {
+                            if let u = BackupManager.writeAuto() { shareItem = ShareItem(url: u) }
+                        } label: {
+                            Label("Сохранить копию в «Файлы» или отправить", systemImage: "square.and.arrow.up")
+                        }
+                        Button { importMode = "restore"; showImporter = true } label: {
+                            Label("Восстановить из копии", systemImage: "arrow.down.doc")
+                        }
+                        if !backupInfo.isEmpty {
+                            Text(backupInfo).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
+                    .fileImporter(isPresented: $showImporter,
+                                  allowedContentTypes: importMode == "folder" ? [.folder] : [.propertyList, .data]) { result in
+                        guard case .success(let url) = result else { return }
+                        if importMode == "folder" {
+                            if BackupManager.setFolder(url) {
+                                backupInfo = "Папка выбрана, первая копия записана."
+                                Haptics.success()
+                            } else {
+                                backupInfo = "Не удалось записать в эту папку. Выбери другую."
+                            }
+                            return
+                        }
+                        let access = url.startAccessingSecurityScopedResource()
+                        defer { if access { url.stopAccessingSecurityScopedResource() } }
+                        if let d = try? Data(contentsOf: url), let n = BackupManager.restore(d) {
+                            backupInfo = "Восстановлено записей: \(n). Закрой приложение полностью и открой заново."
+                            Haptics.success()
+                        } else {
+                            backupInfo = "Не удалось прочитать файл копии."
+                        }
+                    }
+
+                    card("Для разработчика") {
+                        NavigationLink {
+                            SiteLogView()
+                        } label: {
+                            Label("Журнал запросов сайта", systemImage: "waveform.path.ecg")
+                        }
+                        Text("Открывает сайт внутри приложения и записывает, какие запросы он отправляет, когда ты отмечаешь серию или главу. Нужен, чтобы настроить синхронизацию с сайтом.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
 
                     card("Аккаунт") {
@@ -1842,6 +2156,7 @@ struct RootView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.platform") private var platform = "anime"
     @AppStorage("set.theme") private var appTheme = "system"
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var router = AppRouter.shared
 
     private var scheme: ColorScheme? {
@@ -1875,6 +2190,10 @@ struct RootView: View {
         .tint(Color(hex: accentHex))
         .preferredColorScheme(scheme)
         .onChange(of: router.tab) { _ in Haptics.select() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .background || phase == .inactive { BackupManager.writeAuto() }
+        }
+        .task { BackupManager.writeAuto() }
         .overlay(alignment: .top) {
             if let t = router.toast {
                 Text(t)
