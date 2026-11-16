@@ -782,7 +782,7 @@ struct SettingsView: View {
                             ImageCache.shared.removeAllObjects(); info = "Кэш обложек очищен"
                         }
                         Button("Сбросить историю просмотра") {
-                            ProgressStore.shared.clear(); info = "История просмотра сброшена"
+                            ProgressStore.shared.clear(); HistoryStore.shared.clear(); info = "История просмотра сброшена"
                         }
                         Button("Очистить избранное") {
                             FavoritesStore.shared.clear(); info = "Избранное очищено"
@@ -814,24 +814,424 @@ struct SettingsView: View {
     }
 }
 
-struct RootView: View {
-    @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
-    @State private var tab = 0
+// MARK: - Навигация между вкладками
+@MainActor
+final class AppRouter: ObservableObject {
+    static let shared = AppRouter()
+    @Published var tab = 0
+    @Published var pendingQuery: String?
+    @Published var pendingSort: CatalogFilter.SortOption?
+
+    func openCatalog(query: String = "", sort: CatalogFilter.SortOption? = nil) {
+        pendingQuery = query
+        pendingSort = sort ?? .rating
+        tab = 1
+    }
+}
+
+// MARK: - История просмотра («Продолжить смотреть»)
+struct HistoryItem: Codable, Identifiable {
+    let anime: Anime
+    var episodeID: Int
+    var episodeTitle: String
+    var updated: Date
+    var id: Int { anime.id }
+}
+
+@MainActor
+final class HistoryStore: ObservableObject {
+    static let shared = HistoryStore()
+    @Published private(set) var items: [HistoryItem] = []
+    private let key = "history.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([HistoryItem].self, from: d) {
+            items = v
+        }
+    }
+
+    func record(anime: Anime, episode: EpisodeShort) {
+        items.removeAll { $0.anime.id == anime.id }
+        items.insert(HistoryItem(anime: anime, episodeID: episode.id,
+                                 episodeTitle: episode.title, updated: Date()), at: 0)
+        if items.count > 30 { items = Array(items.prefix(30)) }
+        save()
+    }
+
+    func remove(_ animeID: Int) {
+        items.removeAll { $0.anime.id == animeID }
+        save()
+    }
+
+    func clear() {
+        items = []
+        save()
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+// MARK: - Главная
+@MainActor
+final class HomeViewModel: ObservableObject {
+    @Published var fresh: [Anime] = []
+    @Published var popular: [Anime] = []
+    @Published var newest: [Anime] = []
+    @Published var top: [Anime] = []
+    @Published var isLoading = false
+    @Published var loadingMore = false
+    @Published var error: String?
+    private var popularPage = 1
+    private var popularHasNext = true
+
+    var canLoadMorePopular: Bool { popularHasNext && !popular.isEmpty }
+
+    private func fetch(_ sort: CatalogFilter.SortOption, page: Int = 1) async -> (items: [Anime], hasNext: Bool)? {
+        var f = CatalogFilter()
+        f.sortBy = sort
+        return try? await AnimelibAPI.shared.catalog(filter: f, page: page)
+    }
+
+    func load(force: Bool = false) async {
+        guard !isLoading else { return }
+        if !force && !fresh.isEmpty { return }
+        isLoading = true
+        defer { isLoading = false }
+        async let a = fetch(.lastEpisode)
+        async let b = fetch(.views)
+        async let c = fetch(.newest)
+        async let d = fetch(.rating)
+        let (ra, rb, rc, rd) = await (a, b, c, d)
+        if let r = ra { fresh = r.items }
+        if let r = rb { popular = r.items; popularPage = 1; popularHasNext = r.hasNext }
+        if let r = rc { newest = r.items }
+        if let r = rd { top = r.items }
+        error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
+    }
+
+    func morePopular() async {
+        guard !loadingMore, popularHasNext else { return }
+        loadingMore = true
+        defer { loadingMore = false }
+        if let r = await fetch(.views, page: popularPage + 1) {
+            let known = Set(popular.map { $0.id })
+            popular += r.items.filter { !known.contains($0.id) }
+            popularPage += 1
+            popularHasNext = r.hasNext && !r.items.isEmpty
+        } else {
+            popularHasNext = false
+        }
+    }
+}
+
+struct TopBlur: View {
+    let inset: CGFloat
+    var body: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .frame(height: inset + 14)
+            .mask(LinearGradient(stops: [
+                .init(color: .black, location: 0),
+                .init(color: .black, location: 0.75),
+                .init(color: .clear, location: 1)
+            ], startPoint: .top, endPoint: .bottom))
+            .allowsHitTesting(false)
+            .offset(y: -inset)
+    }
+}
+
+struct SectionHeader: View {
+    let title: String
+    var action: (() -> Void)? = nil
+    var actionTitle: String? = nil
 
     var body: some View {
-        TabView(selection: $tab) {
+        HStack {
+            if let action, actionTitle == nil {
+                Button(action: action) {
+                    HStack(spacing: 4) {
+                        Text(title).font(.title3.bold())
+                        Image(systemName: "chevron.right").font(.footnote.bold()).foregroundStyle(Theme.accent)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                Text(title).font(.title3.bold())
+            }
+            Spacer()
+            if let action, let t = actionTitle {
+                Button(t, action: action).font(.footnote).foregroundStyle(Theme.accent)
+            }
+        }
+        .padding(.horizontal, 14)
+    }
+}
+
+struct PosterCard: View {
+    let anime: Anime
+    var width: CGFloat = 124
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RemoteImage(url: anime.imageURL)
+                .frame(width: width, height: width * 1.5)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .shadow(color: .black.opacity(0.4), radius: 6, y: 3)
+                .overlay(alignment: .topLeading) {
+                    if let t = anime.type?.title, !t.isEmpty {
+                        Text(t)
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(6)
+                    }
+                }
+                .overlay(alignment: .bottomLeading) {
+                    if let r = anime.rateAvg {
+                        Label(r, systemImage: "star.fill")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(6)
+                    }
+                }
+            Text(anime.displayTitle)
+                .font(.footnote.weight(.medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(width: width, alignment: .leading)
+        }
+    }
+}
+
+struct AnimeRow: View {
+    let anime: Anime
+    var rank: Int? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let rank {
+                Text("\(rank)")
+                    .font(.headline.bold())
+                    .foregroundStyle(rank <= 3 ? Theme.accent : Color.secondary)
+                    .frame(width: 22)
+            }
+            RemoteImage(url: anime.imageURL)
+                .frame(width: 52, height: 78)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(anime.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Text([anime.type?.title, anime.episodesCount.map { "\($0) эп." }]
+                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if let r = anime.rateAvg {
+                Label(r, systemImage: "star.fill")
+                    .font(.caption.bold())
+                    .foregroundStyle(.yellow)
+            }
+        }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+struct ContinueCard: View {
+    let item: HistoryItem
+    @ObservedObject private var progress = ProgressStore.shared
+
+    var body: some View {
+        let p = progress.get(item.episodeID)
+        HStack(spacing: 12) {
+            RemoteImage(url: item.anime.imageURL)
+                .frame(width: 56, height: 84)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.anime.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Text(item.episodeTitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let p, p.position > 5 {
+                    Text(p.duration > 0 ? "\(formatTime(p.position)) из \(formatTime(p.duration))" : formatTime(p.position))
+                        .font(.caption2)
+                        .foregroundStyle(Theme.accent)
+                    if p.duration > 0 {
+                        ProgressView(value: min(p.position / p.duration, 1))
+                            .tint(Theme.accent)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(width: 290)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.08)))
+    }
+}
+
+struct HomeView: View {
+    @StateObject private var vm = HomeViewModel()
+    @ObservedObject private var history = HistoryStore.shared
+    @ObservedObject private var router = AppRouter.shared
+    @State private var query = ""
+
+    private func poster(_ list: [Anime]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(list) { a in
+                    NavigationLink(value: a) { PosterCard(anime: a) }
+                        .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            GeometryReader { geo in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Hehe")
+                                .font(.system(size: 32, weight: .heavy, design: .rounded))
+                            SearchBar(text: $query) {
+                                let q = query.trimmingCharacters(in: .whitespaces)
+                                guard !q.isEmpty else { return }
+                                router.openCatalog(query: q)
+                                query = ""
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.top, geo.safeAreaInsets.top + 4)
+
+                        if let e = vm.error, vm.fresh.isEmpty {
+                            VStack(spacing: 12) {
+                                Text(e).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                                Button("Повторить") { Task { await vm.load(force: true) } }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
+                        }
+
+                        if !history.items.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Продолжить смотреть",
+                                              action: { history.clear() }, actionTitle: "Очистить")
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(spacing: 12) {
+                                        ForEach(history.items) { h in
+                                            NavigationLink(value: h.anime) { ContinueCard(item: h) }
+                                                .buttonStyle(.plain)
+                                                .contextMenu {
+                                                    Button(role: .destructive) { history.remove(h.anime.id) } label: {
+                                                        Label("Убрать", systemImage: "trash")
+                                                    }
+                                                }
+                                        }
+                                    }
+                                    .padding(.horizontal, 14)
+                                }
+                            }
+                        }
+
+                        if !vm.fresh.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
+                                poster(Array(vm.fresh.prefix(14)))
+                            }
+                        }
+
+                        if !vm.popular.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Сейчас смотрят") { router.openCatalog(sort: .views) }
+                                VStack(spacing: 8) {
+                                    ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
+                                        NavigationLink(value: a) { AnimeRow(anime: a, rank: i + 1) }
+                                            .buttonStyle(.plain)
+                                    }
+                                    if vm.canLoadMorePopular {
+                                        Button { Task { await vm.morePopular() } } label: {
+                                            Group {
+                                                if vm.loadingMore { ProgressView() } else { Text("Показать ещё") }
+                                            }
+                                            .font(.subheadline.weight(.semibold))
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 12)
+                                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.horizontal, 14)
+                            }
+                        }
+
+                        if !vm.newest.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
+                                poster(vm.newest)
+                            }
+                        }
+
+                        if !vm.top.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Лучшее по рейтингу") { router.openCatalog(sort: .rating) }
+                                poster(vm.top)
+                            }
+                        }
+
+                        if vm.isLoading && vm.fresh.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.top, 30) }
+                        Color.clear.frame(height: 80)
+                    }
+                }
+                .scrollDismissesKeyboard(.immediately)
+                .refreshable { await vm.load(force: true) }
+                .ignoresSafeArea(edges: .top)
+                .overlay(alignment: .top) { TopBlur(inset: geo.safeAreaInsets.top) }
+            }
+            .background(AppBackground())
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
+            .task { await vm.load() }
+        }
+    }
+}
+
+struct RootView: View {
+    @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
+    @ObservedObject private var router = AppRouter.shared
+
+    var body: some View {
+        TabView(selection: $router.tab) {
+            HomeView()
+                .tabItem { Label("Главная", systemImage: "house.fill") }
+                .tag(0)
             CatalogView()
                 .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
-                .tag(0)
+                .tag(1)
             FavoritesView()
                 .tabItem { Label("Избранное", systemImage: "heart") }
-                .tag(1)
+                .tag(2)
             ProfileView()
                 .tabItem { Label("Профиль", systemImage: "person.crop.circle") }
-                .tag(2)
+                .tag(3)
             SettingsView()
                 .tabItem { Label("Настройки", systemImage: "gearshape") }
-                .tag(3)
+                .tag(4)
         }
         .id(accentHex)
         .tint(Color(hex: accentHex))
@@ -1008,6 +1408,7 @@ struct FilterSheet: View {
 
 struct CatalogView: View {
     @StateObject private var vm = CatalogViewModel()
+    @ObservedObject private var router = AppRouter.shared
     @State private var showFilters = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
@@ -1093,6 +1494,12 @@ struct CatalogView: View {
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
+            .onAppear {
+                var changed = false
+                if let q = router.pendingQuery { vm.filter.query = q; router.pendingQuery = nil; changed = true }
+                if let so = router.pendingSort { vm.filter.sortBy = so; router.pendingSort = nil; changed = true }
+                if changed { Task { await vm.reload() } }
+            }
         }
     }
 }
@@ -1308,7 +1715,7 @@ struct DetailView: View {
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
         .fullScreenCover(item: $selected) { ep in
-            PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle)
+            PlayerScreen(episode: ep, animeTitle: vm.anime.displayTitle, anime: vm.anime)
         }
     }
 }
@@ -1702,6 +2109,7 @@ final class PlayerViewModel: ObservableObject {
 struct PlayerScreen: View {
     let episode: EpisodeShort
     let animeTitle: String
+    var anime: Anime? = nil
     @StateObject private var vm = PlayerViewModel()
     @Environment(\.dismiss) private var dismiss
 
@@ -1789,7 +2197,10 @@ struct PlayerScreen: View {
                 }
             }
         }
-        .task { await vm.load(episodeID: episode.id) }
+        .task {
+            if let a = anime { HistoryStore.shared.record(anime: a, episode: episode) }
+            await vm.load(episodeID: episode.id)
+        }
         .onDisappear { vm.stop() }
     }
 }
@@ -2479,6 +2890,8 @@ final class ProfileViewModel: ObservableObject {
                                       name: J.str(d["name"]) ?? J.str(d["title"]) ?? "Список",
                                       count: J.int(d["count"]) ?? J.int(d["items_count"]) ?? J.int(d["titles_count"]))
             }
+            let nonEmpty = folders.filter { ($0.count ?? 1) > 0 }
+            if !nonEmpty.isEmpty { folders = nonEmpty }
             if selected == nil || !folders.contains(where: { $0.id == selected }) {
                 selected = folders.first?.id
             }
@@ -2666,6 +3079,18 @@ struct ProfileView: View {
     @State private var showLogin = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
+    private func folderIcon(_ name: String) -> String {
+        let n = name.lowercased()
+        if n.contains("любим") { return "heart.fill" }
+        if n.contains("смотрю") || n.contains("читаю") { return "play.circle.fill" }
+        if n.contains("план") { return "calendar" }
+        if n.contains("просмотр") || n.contains("прочитан") { return "checkmark.circle.fill" }
+        if n.contains("брош") { return "xmark.circle.fill" }
+        if n.contains("отлож") { return "pause.circle.fill" }
+        if n.contains("не нрав") { return "hand.thumbsdown.fill" }
+        return "bookmark.fill"
+    }
+
     private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
         Label(text, systemImage: icon)
             .font(.caption.weight(.semibold))
@@ -2713,17 +3138,33 @@ struct ProfileView: View {
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(Color.white.opacity(0.12)))
 
                         if !vm.folders.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    ForEach(vm.folders) { f in
-                                        Button { Task { await vm.select(f.id) } } label: {
-                                            Text(f.count.map { "\(f.name) · \($0)" } ?? f.name)
-                                                .font(.subheadline.weight(.semibold))
-                                                .padding(.horizontal, 14).padding(.vertical, 8)
-                                                .background(f.id == vm.selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 10)], spacing: 10) {
+                                ForEach(vm.folders) { f in
+                                    Button { Task { await vm.select(f.id) } } label: {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            HStack {
+                                                Image(systemName: folderIcon(f.name)).font(.subheadline)
+                                                Spacer()
+                                                Text(f.count.map(String.init) ?? "")
+                                                    .font(.title3.bold())
+                                            }
+                                            Text(f.name)
+                                                .font(.caption.weight(.semibold))
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.8)
                                         }
-                                        .buttonStyle(.plain)
+                                        .padding(12)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .foregroundStyle(f.id == vm.selected ? Color.white : Color.primary)
+                                        .background(
+                                            f.id == vm.selected
+                                                ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.6)],
+                                                                               startPoint: .topLeading, endPoint: .bottomTrailing))
+                                                : AnyShapeStyle(Material.ultraThinMaterial),
+                                            in: RoundedRectangle(cornerRadius: 16))
+                                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.1)))
                                     }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -2743,7 +3184,7 @@ struct ProfileView: View {
                         if vm.isLoading { ProgressView() }
                         if vm.items.isEmpty && !vm.isLoading {
                             Text("В этом списке пока ничего нет").foregroundStyle(.secondary)
-                            if !vm.debug.isEmpty {
+                            if !vm.debug.isEmpty && ((vm.folders.first { $0.id == vm.selected }?.count ?? 0) > 0) {
                                 Text(vm.debug)
                                     .font(.system(size: 9, design: .monospaced))
                                     .textSelection(.enabled)
