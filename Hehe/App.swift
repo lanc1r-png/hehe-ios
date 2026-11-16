@@ -919,17 +919,16 @@ enum AnimatedLoader {
             guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
             return UIImage(cgImage: cg)
         }
-        let sets: [(CFString, CFString, CFString)] = [
-            (kCGImagePropertyGIFDictionary, kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyGIFDelayTime),
-            (kCGImagePropertyWebPDictionary, kCGImagePropertyWebPUnclampedDelayTime, kCGImagePropertyWebPDelayTime),
-            (kCGImagePropertyAPNGDictionary, kCGImagePropertyAPNGUnclampedDelayTime, kCGImagePropertyAPNGDelayTime)
-        ]
+        // Ключи ImageIO для GIF, WebP и APNG записаны строками: так они есть во всех версиях SDK.
+        let dicts = ["{GIF}", "{WebP}", "{PNG}"]
         func delay(_ i: Int) -> Double {
-            guard let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any] else { return 0.1 }
-            for (dict, unclamped, plain) in sets {
-                if let d = props[dict] as? [CFString: Any] {
-                    let v = (d[unclamped] as? Double) ?? (d[plain] as? Double) ?? 0
-                    return v < 0.02 ? 0.1 : v
+            guard let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [String: Any] else { return 0.1 }
+            for name in dicts {
+                if let d = props[name] as? [String: Any] {
+                    let v = (d["UnclampedDelayTime"] as? Double) ?? (d["DelayTime"] as? Double) ?? 0
+                    if v > 0 || d["DelayTime"] != nil || d["UnclampedDelayTime"] != nil {
+                        return v < 0.02 ? 0.1 : v
+                    }
                 }
             }
             return 0.1
