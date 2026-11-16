@@ -313,6 +313,7 @@ struct PlayableVariant: Identifiable, Hashable {
     let url: URL
     let subtitle: URL?
     var isWeb = false
+    var kodik = false
 }
 
 struct FilterOptions {
@@ -511,7 +512,8 @@ actor AnimelibAPI {
             } else if let src = p.src {
                 let full = src.hasPrefix("//") ? "https:" + src : src
                 if let url = URL(string: full) {
-                    web.append(PlayableVariant(title: "\(p.label) · \(p.player ?? "Плеер")", url: url, subtitle: nil, isWeb: true))
+                    let isK = full.contains("kodik")
+                    web.append(PlayableVariant(title: "\(p.label) · \(p.player ?? "Плеер")", url: url, subtitle: nil, isWeb: true, kodik: isK))
                 }
             }
         }
@@ -821,58 +823,59 @@ struct CatalogView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    SearchBar(text: $vm.filter.query) { Task { await vm.reload() } }
+            ScrollView {
+                if let e = vm.error, vm.items.isEmpty {
+                    VStack(spacing: 12) {
+                        Text(e).multilineTextAlignment(.center).foregroundStyle(.secondary)
+                        Button("Повторить") { Task { await vm.reload() } }
+                    }
+                    .padding(.top, 60).padding(.horizontal)
+                } else if vm.items.isEmpty && !vm.isLoading {
+                    Text("Ничего не найдено")
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 80)
+                }
+                LazyVGrid(columns: columns, spacing: 18) {
+                    ForEach(vm.items) { anime in
+                        NavigationLink(value: anime) { AnimeCard(anime: anime) }
+                            .buttonStyle(.plain)
+                            .onAppear {
+                                if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                            }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
+                if vm.isLoading { ProgressView().padding() }
+            }
+            .scrollDismissesKeyboard(.immediately)
+            .refreshable { await vm.reload() }
+            .background(AppBackground())
+            .navigationTitle("Hehe")
+            .searchable(text: $vm.filter.query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Поиск по названию")
+            .onSubmit(of: .search) { Task { await vm.reload() } }
+            .onChange(of: vm.filter.query) { q in
+                if q.isEmpty { Task { await vm.reload() } }
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button { showFilters = true } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.title3)
-                            .frame(width: 44, height: 44)
-                            .background(vm.filter.activeCount > 0 ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Circle())
+                        Image(systemName: vm.filter.activeCount > 0
+                              ? "line.3.horizontal.decrease.circle.fill"
+                              : "line.3.horizontal.decrease.circle")
                             .overlay(alignment: .topTrailing) {
                                 if vm.filter.activeCount > 0 {
                                     Text("\(vm.filter.activeCount)")
-                                        .font(.caption2.bold())
-                                        .padding(4)
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(3)
                                         .background(Color.pink, in: Circle())
-                                        .offset(x: 4, y: -4)
+                                        .foregroundStyle(.white)
+                                        .offset(x: 8, y: -8)
                                 }
                             }
                     }
-                    .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-
-                ScrollView {
-                    if let e = vm.error, vm.items.isEmpty {
-                        VStack(spacing: 12) {
-                            Text(e).multilineTextAlignment(.center).foregroundStyle(.secondary)
-                            Button("Повторить") { Task { await vm.reload() } }
-                        }
-                        .padding(.top, 60).padding(.horizontal)
-                    } else if vm.items.isEmpty && !vm.isLoading {
-                        Text("Ничего не найдено")
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 80)
-                    }
-                    LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(vm.items) { anime in
-                            NavigationLink(value: anime) { AnimeCard(anime: anime) }
-                                .buttonStyle(.plain)
-                                .onAppear {
-                                    if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
-                                }
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    if vm.isLoading { ProgressView().padding() }
-                }
-                .scrollDismissesKeyboard(.immediately)
-                .refreshable { await vm.reload() }
             }
-            .background(AppBackground())
-            .navigationTitle("Hehe")
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
@@ -1004,7 +1007,7 @@ struct DetailView: View {
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 }
 
-                if let slug = vm.anime.slugUrl, let url = URL(string: "https://v5.animelib.org/ru/anime/\(slug)") {
+                if let slug = vm.anime.slugUrl, let url = URL(string: "https://animelib.org/ru/anime/\(slug)") {
                     Link(destination: url) {
                         Label("Открыть на сайте", systemImage: "safari")
                             .font(.subheadline)
@@ -1067,6 +1070,123 @@ struct DetailView: View {
     }
 }
 
+// MARK: - Kodik (прямое получение потока)
+enum KodikError: LocalizedError {
+    case page, params, noLinks, decode
+    var errorDescription: String? {
+        switch self {
+        case .page: return "не открылась страница плеера"
+        case .params: return "не найдены параметры плеера"
+        case .noLinks: return "плеер не вернул ссылки на видео"
+        case .decode: return "не удалось расшифровать ссылку"
+        }
+    }
+}
+
+enum Kodik {
+    static let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    static func match(_ pattern: String, in s: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
+              let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: s) else { return nil }
+        return String(s[r])
+    }
+
+    static func fetch(_ url: URL, referer: String) async throws -> String {
+        var req = URLRequest(url: url)
+        req.setValue(referer, forHTTPHeaderField: "Referer")
+        req.setValue(ua, forHTTPHeaderField: "User-Agent")
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let t = String(data: data, encoding: .utf8) else { throw KodikError.page }
+        return t
+    }
+
+    static func resolve(_ pageURL: URL) async throws -> [(Int, URL)] {
+        let html = try await fetch(pageURL, referer: "https://animelib.org/")
+        guard let paramsText = match("urlParams\\s*=\\s*'?(\\{[^;]*?\\})'?\\s*;", in: html),
+              let pd = paramsText.data(using: .utf8),
+              let params = (try? JSONSerialization.jsonObject(with: pd)) as? [String: Any]
+        else { throw KodikError.params }
+
+        let parts = pageURL.pathComponents.filter { $0 != "/" }
+        let type = match("videoInfo\\.type\\s*=\\s*'([^']+)'", in: html) ?? (parts.count > 0 ? parts[0] : "")
+        let id = match("videoInfo\\.id\\s*=\\s*'?([0-9]+)'?", in: html) ?? (parts.count > 1 ? parts[1] : "")
+        let hash = match("videoInfo\\.hash\\s*=\\s*'([^']+)'", in: html) ?? (parts.count > 2 ? parts[2] : "")
+        guard !type.isEmpty, !id.isEmpty, !hash.isEmpty else { throw KodikError.params }
+
+        // путь запроса прячется в скрипте плеера, по умолчанию /ftor
+        var path = "/ftor"
+        if let script = match("<script[^>]+src=\"(/assets/js/app\\.player[^\"]+)\"", in: html),
+           let su = URL(string: "https://" + (pageURL.host ?? "kodikplayer.com") + script),
+           let js = try? await fetch(su, referer: pageURL.absoluteString),
+           let b64 = match("url:\\s*atob\\(\\s*[\"']([^\"']+)[\"']\\s*\\)", in: js),
+           let d = Data(base64Encoded: b64), let p = String(data: d, encoding: .utf8), p.hasPrefix("/") {
+            path = p
+        }
+
+        var fields: [(String, String)] = []
+        for k in ["d", "d_sign", "pd", "pd_sign", "ref", "ref_sign"] {
+            fields.append((k, (params[k] as? String) ?? ""))
+        }
+        fields += [("bad_user", "true"), ("cdn_is_working", "true"),
+                   ("type", type), ("hash", hash), ("id", id), ("info", "{}")]
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let body = fields.map { k, v in
+            k + "=" + (v.addingPercentEncoding(withAllowedCharacters: allowed) ?? v)
+        }.joined(separator: "&")
+
+        guard let ftor = URL(string: "https://" + (pageURL.host ?? "kodikplayer.com") + path) else { throw KodikError.page }
+        var req = URLRequest(url: ftor)
+        req.httpMethod = "POST"
+        req.httpBody = body.data(using: .utf8)
+        req.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        req.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        req.setValue("https://" + (pageURL.host ?? "kodikplayer.com"), forHTTPHeaderField: "Origin")
+        req.setValue(pageURL.absoluteString, forHTTPHeaderField: "Referer")
+        req.setValue(ua, forHTTPHeaderField: "User-Agent")
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let links = obj["links"] as? [String: Any] else { throw KodikError.noLinks }
+
+        var result: [(Int, URL)] = []
+        for (q, v) in links {
+            guard let arr = v as? [[String: Any]], let src = arr.first?["src"] as? String,
+                  let quality = Int(q) else { continue }
+            guard var text = decode(src) else { throw KodikError.decode }
+            if text.hasPrefix("//") { text = "https:" + text }
+            if let u = URL(string: text) { result.append((quality, u)) }
+        }
+        if result.isEmpty { throw KodikError.noLinks }
+        return result.sorted { $0.0 > $1.0 }
+    }
+
+    /// Ссылка зашифрована сдвигом букв (ROT-N) и base64; перебираем сдвиг.
+    static func decode(_ s: String) -> String? {
+        if s.hasPrefix("http") || s.hasPrefix("//") { return s }
+        for shift in 0..<26 {
+            var out = ""
+            for c in s.unicodeScalars {
+                let v = c.value
+                if v >= 65 && v <= 90 {
+                    out.unicodeScalars.append(UnicodeScalar((v - 65 + UInt32(shift)) % 26 + 65)!)
+                } else if v >= 97 && v <= 122 {
+                    out.unicodeScalars.append(UnicodeScalar((v - 97 + UInt32(shift)) % 26 + 97)!)
+                } else {
+                    out.unicodeScalars.append(c)
+                }
+            }
+            var b = out.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+            while b.count % 4 != 0 { b += "=" }
+            if let d = Data(base64Encoded: b), let t = String(data: d, encoding: .utf8),
+               t.hasPrefix("http") || t.hasPrefix("//") {
+                return t
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - Player
 /// Страница плеера Kodik встраивается как iframe на «странице сайта» (baseURL),
 /// так же, как это делает сам сайт.
@@ -1099,7 +1219,7 @@ struct WebPlayerView: UIViewRepresentable {
         <iframe src="\(url.absoluteString)" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
         </body></html>
         """
-        v.loadHTMLString(html, baseURL: URL(string: "https://v5.animelib.org/"))
+        v.loadHTMLString(html, baseURL: URL(string: "https://animelib.org/"))
     }
 }
 
@@ -1108,9 +1228,19 @@ final class PlayerViewModel: ObservableObject {
     @Published var variants: [PlayableVariant] = []
     @Published var current: PlayableVariant?
     @Published var player: AVPlayer?
+    @Published var qualities: [PlayableVariant] = []
+    @Published var currentQuality: UUID?
+    @Published var showWeb = false
+    @Published var isResolving = false
+    @Published var note: String?
     @Published var error: String?
     @Published var isLoading = true
     @Published var debug = ""
+
+    var usesWeb: Bool {
+        guard let v = current, v.isWeb else { return false }
+        return !v.kodik || showWeb
+    }
 
     func load(episodeID: Int) async {
         isLoading = true; error = nil
@@ -1126,17 +1256,44 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func select(_ v: PlayableVariant) {
-        if v.isWeb {
-            player?.pause()
-            player = nil
-            current = v
-            return
-        }
-        let time = player?.currentTime()
+        note = nil
+        showWeb = false
+        qualities = []
         current = v
-        let asset = AVURLAsset(url: v.url, options: [
-            "AVURLAssetHTTPHeaderFieldsKey": AnimelibAPI.shared.playbackHeaders
-        ])
+        if v.kodik {
+            player?.pause(); player = nil
+            Task { await playKodik(v) }
+        } else if v.isWeb {
+            player?.pause(); player = nil
+            showWeb = true
+        } else {
+            startAV(v.url, headers: AnimelibAPI.shared.playbackHeaders)
+        }
+    }
+
+    func playKodik(_ v: PlayableVariant) async {
+        isResolving = true
+        defer { isResolving = false }
+        do {
+            let links = try await Kodik.resolve(v.url)
+            guard current?.id == v.id else { return }
+            qualities = links.map { PlayableVariant(title: "\($0.0)p", url: $0.1, subtitle: nil) }
+            if let best = qualities.first { pickQuality(best) }
+        } catch {
+            guard current?.id == v.id else { return }
+            note = "Прямой поток не получен (\(error.localizedDescription)). Показан веб-плеер."
+            showWeb = true
+        }
+    }
+
+    func pickQuality(_ q: PlayableVariant) {
+        currentQuality = q.id
+        startAV(q.url, headers: ["Referer": "https://kodikplayer.com/", "Origin": "https://kodikplayer.com", "User-Agent": Kodik.ua])
+    }
+
+    private func startAV(_ url: URL, headers: [String: String]) {
+        let time = player?.currentTime()
+        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let p = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         if let t = time, t.isValid, t.seconds > 1 { p.seek(to: t) }
         player?.pause()
@@ -1158,11 +1315,11 @@ struct PlayerScreen: View {
             VStack(spacing: 0) {
                 ZStack {
                     Color.black
-                    if let v = vm.current, v.isWeb {
+                    if vm.usesWeb, let v = vm.current {
                         WebPlayerView(url: v.url)
                     } else if let p = vm.player {
                         VideoPlayer(player: p)
-                    } else if vm.isLoading {
+                    } else if vm.isLoading || vm.isResolving {
                         ProgressView().tint(.white)
                     } else if let e = vm.error {
                         Text(e).foregroundStyle(.white).padding()
@@ -1177,8 +1334,27 @@ struct PlayerScreen: View {
                                 .font(.system(size: 9, design: .monospaced))
                                 .textSelection(.enabled)
                         }
+                        if let n = vm.note {
+                            Text(n).font(.footnote).foregroundStyle(.orange)
+                        }
+                        if vm.qualities.count > 0 {
+                            Text("Качество").font(.headline).padding(.top, 4)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack {
+                                    ForEach(vm.qualities) { q in
+                                        Button { vm.pickQuality(q) } label: {
+                                            Text(q.title)
+                                                .font(.subheadline.bold())
+                                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                                .background(q.id == vm.currentQuality ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Capsule())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
                         if !vm.variants.isEmpty {
-                            Text("Озвучка и качество").font(.headline).padding(.top, 8)
+                            Text("Озвучка").font(.headline).padding(.top, 8)
                         }
                         ForEach(vm.variants) { v in
                             Button { vm.select(v) } label: {
@@ -1195,6 +1371,10 @@ struct PlayerScreen: View {
                             .buttonStyle(.plain)
                         }
                         if let v = vm.current, v.isWeb {
+                            if v.kodik && !vm.showWeb {
+                                Button("Показать веб-плеер вместо прямого") { vm.showWeb = true }
+                                    .font(.footnote)
+                            }
                             Link(destination: v.url) {
                                 Label("Открыть этот плеер в Safari", systemImage: "safari")
                                     .font(.footnote)
