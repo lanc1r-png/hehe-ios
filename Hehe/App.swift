@@ -2024,21 +2024,77 @@ struct SettingsView: View {
         withAnimation(.easeInOut(duration: 0.3)) { platform = id }
     }
 
-    private func card<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title.uppercased()).font(.caption.bold()).foregroundStyle(.secondary)
+    private func card<Content: View>(_ title: String, icon: String = "gearshape.fill", tint: Color = Theme.accent,
+                                     @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(LinearGradient(colors: [tint, tint.opacity(0.6)], startPoint: .topLeading, endPoint: .bottomTrailing),
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                Text(title).font(.headline).lineLimit(1).minimumScaleFactor(0.8)
+            }
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
+        .padding(16)
+        .background(LinearGradient(colors: [tint.opacity(0.12), Theme.card], startPoint: .topLeading, endPoint: .bottomTrailing),
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(tint.opacity(0.18)))
+    }
+
+    private func groupTitle(_ t: String) -> some View {
+        Text(t.uppercased())
+            .font(.caption.weight(.bold))
+            .tracking(1.2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 10)
+            .padding(.leading, 6)
+    }
+
+    private var heroSubtitle: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let pl = platforms.first { $0.0 == platform }?.2 ?? "AnimeLib"
+        return "Версия \(v) · \(pl)"
+    }
+
+    private var hero: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "sparkles.tv.fill")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 66, height: 66)
+                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .shadow(color: Theme.accent.opacity(0.45), radius: 12, y: 6)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Yume").font(.title.bold())
+                Text(heroSubtitle).font(.footnote).foregroundStyle(.secondary)
+                if let u = auth.user {
+                    Label(u.username, systemImage: "person.crop.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .background(LinearGradient(colors: [Theme.accent.opacity(0.30), Theme.accent2.opacity(0.10)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
+                    in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Theme.accent.opacity(0.25)))
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    card("Оформление") {
+                    hero
+                    groupTitle("Внешний вид")
+                    card("Оформление", icon: "paintpalette.fill", tint: .pink) {
                         Picker("Тема", selection: $appTheme) {
                             Text("Как в системе").tag("system")
                             Text("Тёмная").tag("dark")
@@ -2047,7 +2103,7 @@ struct SettingsView: View {
                         .pickerStyle(.segmented)
                     }
 
-                    card("Цвет акцента") {
+                    card("Цвет акцента", icon: "drop.fill", tint: Theme.accent) {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 12) {
                                 ForEach(presets, id: \.1) { p in
@@ -2067,7 +2123,7 @@ struct SettingsView: View {
                             .onChange(of: custom) { c in accentHex = c.hexString }
                     }
 
-                    card("Платформа") {
+                    card("Платформа", icon: "square.stack.3d.up.fill", tint: .blue) {
                         HStack(spacing: 10) {
                             ForEach(platforms, id: \.0) { pl in
                                 let on = platform == pl.0
@@ -2104,7 +2160,8 @@ struct SettingsView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    card("Ощущения") {
+                    groupTitle("Чтение и просмотр")
+                    card("Ощущения", icon: "hand.tap.fill", tint: .orange) {
                         Toggle("Вибрация при нажатиях", isOn: $haptics)
                             .onChange(of: haptics) { on in if on { Haptics.bump() } }
                         Toggle("Не гасить экран при чтении", isOn: $keepAwake)
@@ -2112,7 +2169,7 @@ struct SettingsView: View {
                     .tint(Theme.accent)
 
                     if platform == "ranobe" {
-                        card("Чтение ранобэ") {
+                        card("Чтение ранобэ", icon: "text.book.closed.fill", tint: .teal) {
                             Picker("Режим", selection: $novelMode) {
                                 Text("Страницы").tag("pages")
                                 Text("Прокрутка").tag("scroll")
@@ -2131,7 +2188,7 @@ struct SettingsView: View {
                     }
 
                     if platform == "manga" {
-                        card("Чтение манги") {
+                        card("Чтение манги", icon: "books.vertical.fill", tint: .indigo) {
                             Picker("Режим по умолчанию", selection: $mangaMode) {
                                 Text("Авто").tag("auto")
                                 Text("Страницы").tag("pages")
@@ -2152,7 +2209,7 @@ struct SettingsView: View {
                         .tint(Theme.accent)
                     }
 
-                    card("Воспроизведение") {
+                    card("Воспроизведение", icon: "play.rectangle.fill", tint: .red) {
                         Toggle("Весь экран в родном плеере iOS", isOn: $autoNative)
                         Toggle("Kodik: сразу родной плеер, без веб-плеера", isOn: $kodikDirect)
                         Toggle("Продолжать с места остановки", isOn: $resume)
@@ -2162,7 +2219,8 @@ struct SettingsView: View {
                     }
                     .tint(Theme.accent)
 
-                    card("Загрузки · ранобэ и манга") {
+                    groupTitle("Данные")
+                    card("Загрузки · ранобэ и манга", icon: "arrow.down.circle.fill", tint: .green) {
                         if platform == "ranobe" || platform == "manga" {
                             NavigationLink {
                                 OfflineLibraryView()
@@ -2204,7 +2262,7 @@ struct SettingsView: View {
                         Button("Удалить", role: .destructive) { offline.removeAll() }
                     }
 
-                    card("Данные") {
+                    card("Данные", icon: "internaldrive.fill", tint: .gray) {
                         Button("Очистить кэш обложек") {
                             ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
                         }
@@ -2219,7 +2277,7 @@ struct SettingsView: View {
                         if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
                     }
 
-                    card("Статистика") {
+                    card("Статистика", icon: "chart.bar.xaxis", tint: .purple) {
                         NavigationLink {
                             StatsView()
                         } label: {
@@ -2229,7 +2287,7 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
 
-                    card("Резервная копия") {
+                    card("Резервная копия", icon: "icloud.and.arrow.up.fill", tint: .cyan) {
                         Text("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
                             .font(.caption).foregroundStyle(.secondary)
                         Label("Файлы → На iPhone → Yume", systemImage: "folder.fill")
@@ -2264,7 +2322,8 @@ struct SettingsView: View {
                         }
                     }
 
-                    card("Для разработчика") {
+                    groupTitle("Прочее")
+                    card("Для разработчика", icon: "hammer.fill", tint: .gray) {
                         NavigationLink {
                             SiteLogView()
                         } label: {
@@ -2274,7 +2333,7 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
 
-                    card("Аккаунт") {
+                    card("Аккаунт", icon: "person.crop.circle.fill", tint: .mint) {
                         if let u = auth.user {
                             Text("Вы вошли как \(u.username)")
                             Button("Выйти", role: .destructive) { auth.signOut() }
@@ -2283,7 +2342,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    card("О приложении") {
+                    card("О приложении", icon: "info.circle.fill", tint: .brown) {
                         Text("Yume · версия 1.0")
                         Text("Данные: animelib.org. Приложение неофициальное.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -5957,7 +6016,9 @@ struct FriendsView: View {
     }
 
     private func row(_ f: Friend) -> some View {
-        NavigationLink(value: f) {
+        NavigationLink {
+            FriendProfileView(friend: f)
+        } label: {
             HStack(spacing: 14) {
                 AnimatedRemoteImage(url: f.avatar, maxPixel: 200)
                     .frame(width: 54, height: 54)
@@ -6130,7 +6191,6 @@ struct FriendsView: View {
         .task {
             if !vm.loaded, let t = auth.token { await vm.load(userID: userID, token: t) }
         }
-        .navigationDestination(for: Friend.self) { FriendProfileView(friend: $0) }
         .navigationDestination(isPresented: $pushOpened) {
             if let f = opened { FriendProfileView(friend: f) }
         }
@@ -6812,12 +6872,12 @@ enum NovelService {
 @MainActor
 final class ReadStore: ObservableObject {
     static let shared = ReadStore()
-    @Published private(set) var read: [String: [Int]] = [:]
+    @Published private(set) var read: [String: Set<Int>] = [:]
     @Published private(set) var last: [String: Int] = [:]
 
     init() {
         if let d = UserDefaults.standard.data(forKey: "read.v1"),
-           let v = try? JSONDecoder().decode([String: [Int]].self, from: d) { read = v }
+           let v = try? JSONDecoder().decode([String: Set<Int>].self, from: d) { read = v }
         if let d = UserDefaults.standard.data(forKey: "readlast.v1"),
            let v = try? JSONDecoder().decode([String: Int].self, from: d) { last = v }
     }
@@ -6827,8 +6887,7 @@ final class ReadStore: ObservableObject {
 
     func mark(_ novel: Int, _ chapter: Int) {
         var list = read[String(novel)] ?? []
-        if !list.contains(chapter) {
-            list.append(chapter)
+        if list.insert(chapter).inserted {
             ActivityStore.shared.addChapter(manga: novel < 0)
         }
         read[String(novel)] = list
