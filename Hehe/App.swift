@@ -1631,126 +1631,78 @@ enum BackupManager {
         return all.filter { allowed($0.key) }
     }
 
-    static func data() -> Data? {
-        let root: [String: Any] = ["app": "Yume", "version": 1, "date": Date(), "defaults": snapshot()]
+    static func data(date: Date = Date()) -> Data? {
+        let root: [String: Any] = ["app": "Yume", "version": 1, "date": date, "defaults": snapshot()]
         return try? PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
     }
 
-    // Папка, выбранная пользователем (например, в iCloud Drive). Запоминается закладкой.
-    private static let bmKey = "backup.folder.bookmark"
+    // Копия живёт только в папке приложения (Файлы → На iPhone → Yume).
+    private static let mineKey = "backup.mine"   // дата последней копии, записанной самим приложением
+    /// После восстановления в работающем приложении копии не пишутся, чтобы старые данные в памяти не затёрли файл.
+    private static var frozen = false
 
-    private static func resolveFolder() -> URL? {
-        guard let b = UserDefaults.standard.data(forKey: bmKey) else { return nil }
-        var stale = false
-        guard let u = try? URL(resolvingBookmarkData: b, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
-        if stale, u.startAccessingSecurityScopedResource() {
-            if let nb = try? u.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
-                UserDefaults.standard.set(nb, forKey: bmKey)
-            }
-            u.stopAccessingSecurityScopedResource()
+    private static func fileDate(_ d: Data) -> Date? {
+        guard let root = (try? PropertyListSerialization.propertyList(from: d, format: nil)) as? [String: Any],
+              (root["app"] as? String) == "Yume" else { return nil }
+        return root["date"] as? Date
+    }
+
+    /// Дата копии в папке приложения, если её положил пользователь (а не записало само приложение).
+    static func externalCopyDate() -> Date? {
+        guard let d = try? Data(contentsOf: autoURL), !d.isEmpty, let fd = fileDate(d) else { return nil }
+        if let m = UserDefaults.standard.object(forKey: mineKey) as? Date, abs(m.timeIntervalSince(fd)) < 1.5 { return nil }
+        return fd
+    }
+
+    /// «Не нужно»: считаем лежащую копию своей, дальше она будет обычно обновляться.
+    static func acceptExternal() {
+        if let d = try? Data(contentsOf: autoURL), let fd = fileDate(d) {
+            UserDefaults.standard.set(fd, forKey: mineKey)
         }
-        return u
     }
 
-    static var folderName: String? { resolveFolder()?.lastPathComponent }
-
-    static func setFolder(_ url: URL) -> Bool {
-        let ok = url.startAccessingSecurityScopedResource()
-        defer { if ok { url.stopAccessingSecurityScopedResource() } }
-        guard let b = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) else { return false }
-        UserDefaults.standard.set(b, forKey: bmKey)
-        return writeAuto() != nil
+    /// Вызывается до создания хранилищ: тихо подхватывает копию, которую положили в папку приложения.
+    @discardableResult
+    static func restoreOnLaunch() -> Bool {
+        UserDefaults.standard.removeObject(forKey: "backup.folder.bookmark")
+        guard externalCopyDate() != nil, let d = try? Data(contentsOf: autoURL), restore(d) != nil else { return false }
+        acceptExternal()
+        frozen = false
+        return true
     }
 
-    static func clearFolder() { UserDefaults.standard.removeObject(forKey: bmKey) }
-
-    static var lastFolderWrite: Date? {
-        UserDefaults.standard.object(forKey: "backup.folder.date") as? Date
-    }
-
-    private static func writeToFolder(_ d: Data) {
-        guard let target = resolveFolder() else { return }
-        let ok = target.startAccessingSecurityScopedResource()
-        defer { if ok { target.stopAccessingSecurityScopedResource() } }
-        var err: NSError?
-        var wrote = false
-        NSFileCoordinator().coordinate(writingItemAt: target, options: .forReplacing, error: &err) { u in
-            wrote = (try? d.write(to: u)) != nil
-        }
-        UserDefaults.standard.set(!wrote, forKey: "backup.folder.fail")
-        if wrote { UserDefaults.standard.set(Date(), forKey: "backup.folder.date") }
-    }
-
-    static var lastFolderFailed: Bool { UserDefaults.standard.bool(forKey: "backup.folder.fail") }
-
-    /// Пишет копию в папку приложения и, если выбрана, в папку пользователя (iCloud Drive).
+    /// Пишет копию в папку приложения. Если там лежит чужая (новая) копия, не затирает её.
     @discardableResult
     static func writeAuto() -> URL? {
-        guard let d = data() else { return nil }
-        writeToFolder(d)
+        if frozen || externalCopyDate() != nil { return nil }
+        let stamp = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+        guard let d = data(date: stamp) else { return nil }
         do {
             try d.write(to: autoURL, options: .atomic)
+            UserDefaults.standard.set(stamp, forKey: mineKey)
             return autoURL
         } catch {
             return nil
         }
     }
 
+    /// Файл для кнопки «Отправить»: свежая копия или та, что уже лежит.
+    static func shareURL() -> URL? {
+        if let u = writeAuto() { return u }
+        return FileManager.default.fileExists(atPath: autoURL.path) ? autoURL : nil
+    }
+
     static var lastAuto: Date? {
         (try? FileManager.default.attributesOfItem(atPath: autoURL.path))?[.modificationDate] as? Date
     }
 
-    /// Читает файл копии; если он ещё не скачан из iCloud, просит систему загрузить его и ждёт до минуты.
-    nonisolated static func readFile(_ url: URL) -> Data? { readFileDetailed(url).0 }
-
-    nonisolated static func readFileDetailed(_ url: URL) -> (Data?, String) {
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-        let deadline = Date().addingTimeInterval(60)
-        var reason = ""
-        while true {
-            var result: Data?
-            var err: NSError?
-            var inner: Error?
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &err) { u in
-                do { result = try Data(contentsOf: u) } catch { inner = error }
-            }
-            if let r = result, !r.isEmpty { return (r, "") }
-            reason = (err as Error? ?? inner)?.localizedDescription ?? "файл пустой"
-            if Date() > deadline { return (nil, reason) }
-            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-            Thread.sleep(forTimeInterval: 2)
+    /// Читает копию из папки приложения.
+    static func readAppFolderCopy() -> (Data?, String) {
+        guard FileManager.default.fileExists(atPath: autoURL.path) else {
+            return (nil, "в папке приложения нет файла Yume-backup.plist")
         }
-    }
-
-    /// Ищет в выбранной папке файл Yume-backup (в том числе ещё не скачанный из iCloud) и читает самый свежий.
-    nonisolated static func readFromFolder(_ folder: URL) -> (Data?, String) {
-        let access = folder.startAccessingSecurityScopedResource()
-        defer { if access { folder.stopAccessingSecurityScopedResource() } }
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-        var real = Set<String>()
-        for n in names {
-            var t = n
-            if t.hasPrefix(".") { t.removeFirst() }
-            if t.hasSuffix(".icloud") { t.removeLast(7) }
-            if t.lowercased().contains("yume-backup") { real.insert(t) }
-        }
-        guard !real.isEmpty else {
-            return (nil, "В папке нет файла Yume-backup. Там лежит: " + (names.isEmpty ? "ничего" : names.prefix(6).joined(separator: ", ")))
-        }
-        var best: (Data, Date)?
-        var reason = ""
-        for name in real.sorted() {
-            let u = folder.appendingPathComponent(name)
-            let (d, r) = readFileDetailed(u)
-            guard let d else { reason = r; continue }
-            guard let root = (try? PropertyListSerialization.propertyList(from: d, format: nil)) as? [String: Any],
-                  (root["app"] as? String) == "Yume" else { reason = "файл не от Yume"; continue }
-            let date = (root["date"] as? Date) ?? Date.distantPast
-            if best == nil || date > best!.1 { best = (d, date) }
-        }
-        if let b = best { return (b.0, "") }
-        return (nil, reason)
+        guard let d = try? Data(contentsOf: autoURL), !d.isEmpty else { return (nil, "файл пустой или не читается") }
+        return (d, "")
     }
 
     /// Возвращает число восстановленных записей.
@@ -1764,6 +1716,7 @@ enum BackupManager {
             n += 1
         }
         UserDefaults.standard.synchronize()
+        frozen = true
         return n
     }
 
@@ -1987,7 +1940,7 @@ struct SettingsView: View {
 
     private func finishRestore(_ d: Data?, _ reason: String) {
         guard let d else {
-            backupInfo = "Файл не прочитался: \(reason). Если он в iCloud, открой «Файлы», подожди, пока исчезнет значок загрузки, и повтори."
+            backupInfo = "Файл не прочитался: \(reason)."
             return
         }
         let sum = BackupManager.summary(d)
@@ -2241,71 +2194,31 @@ struct SettingsView: View {
                     }
 
                     card("Резервная копия") {
-                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Один раз выбери место в iCloud Drive: файл будет обновляться сам при каждом сворачивании приложения и переживёт даже удаление Yume.")
+                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
                             .font(.caption).foregroundStyle(.secondary)
-                        Button { showExporter = true } label: {
-                            Label(BackupManager.folderName == nil ? "Выбрать место в iCloud Drive" : "Файл копии: \(BackupManager.folderName ?? "") (сменить)",
-                                  systemImage: "icloud")
+                        Label("Файлы → На iPhone → Yume", systemImage: "folder.fill")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Theme.accent)
+                        if let d = BackupManager.lastAuto {
+                            Text("Последнее обновление: \(d.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2).foregroundStyle(.secondary)
                         }
-                        .fileExporter(isPresented: $showExporter,
-                                      document: BackupDocument(data: BackupManager.data() ?? Data()),
-                                      contentType: .propertyList,
-                                      defaultFilename: "Yume-backup") { result in
-                            guard case .success(let url) = result else { return }
-                            if BackupManager.setFolder(url) {
-                                backupInfo = "Готово: копия будет обновляться сама."
-                                Haptics.success()
-                            } else {
-                                backupInfo = "Не удалось привязать файл. Попробуй выбрать другое место."
-                            }
-                        }
-                        if BackupManager.folderName != nil {
-                            if let d = BackupManager.lastFolderWrite {
-                                Text("Последнее обновление в iCloud: \(d.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption2).foregroundStyle(.secondary)
-                            }
-                            if BackupManager.lastFolderFailed {
-                                Text("Последняя запись не удалась. Выбери место заново.")
-                                    .font(.caption2).foregroundStyle(.red)
-                            }
-                            Button("Отключить автокопию", role: .destructive) {
-                                BackupManager.clearFolder(); backupInfo = "Автокопия в iCloud отключена."
-                            }
+                        Text("Перед удалением приложения скопируй этот файл. После новой установки положи его в ту же папку и заново открой Yume: всё подхватится само.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button {
+                            let r = BackupManager.readAppFolderCopy()
+                            BackupManager.acceptExternal()
+                            finishRestore(r.0, r.1)
+                        } label: {
+                            Label("Загрузить из файла в папке приложения", systemImage: "arrow.down.doc")
                         }
                         Button {
-                            if let u = BackupManager.writeAuto() { shareItem = ShareItem(url: u) }
+                            if let u = BackupManager.shareURL() { shareItem = ShareItem(url: u) }
+                            else { backupInfo = "Не удалось подготовить файл." }
                         } label: {
                             Label("Отправить копию (Telegram, Файлы…)", systemImage: "square.and.arrow.up")
                         }
                         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
-                        Button { showImporter = true } label: {
-                            Label("Восстановить из копии", systemImage: "arrow.down.doc")
-                        }
-                        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
-                            guard case .success(let url) = result else {
-                                if case .failure(let e) = result { backupInfo = "Файл не выбран: \(e.localizedDescription)" }
-                                return
-                            }
-                            backupInfo = "Читаю файл… если он в iCloud, подожди до минуты."
-                            Task {
-                                let r = await Task.detached { BackupManager.readFileDetailed(url) }.value
-                                finishRestore(r.0, r.1)
-                            }
-                        }
-                        Button { showFolderImporter = true } label: {
-                            Label("Восстановить: выбрать папку с копией", systemImage: "folder")
-                        }
-                        .fileImporter(isPresented: $showFolderImporter, allowedContentTypes: [.folder]) { result in
-                            guard case .success(let url) = result else {
-                                if case .failure(let e) = result { backupInfo = "Папка не выбрана: \(e.localizedDescription)" }
-                                return
-                            }
-                            backupInfo = "Ищу файл Yume-backup в папке и жду загрузки из iCloud (до минуты)…"
-                            Task {
-                                let r = await Task.detached { BackupManager.readFromFolder(url) }.value
-                                finishRestore(r.0, r.1)
-                            }
-                        }
                         if restored {
                             Button("Закрыть приложение, чтобы применить") { exit(0) }
                                 .foregroundStyle(Theme.accent)
@@ -2799,6 +2712,18 @@ struct RootView: View {
     @AppStorage("set.theme") private var appTheme = "system"
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var router = AppRouter.shared
+    @State private var showFound = false
+    @State private var showDone = false
+    @State private var foundText = ""
+
+    private func applyFound() {
+        let r = BackupManager.readAppFolderCopy()
+        if let d = r.0, BackupManager.restore(d) != nil {
+            BackupManager.acceptExternal()
+            Haptics.success()
+            showDone = true
+        }
+    }
 
     private var scheme: ColorScheme? {
         switch appTheme {
@@ -2834,8 +2759,26 @@ struct RootView: View {
         .onChange(of: scenePhase) { phase in
             if phase != .active { ProgressStore.shared.flush() }
             if phase == .background { BackupManager.writeAuto() }
+            if phase == .active, let d = BackupManager.externalCopyDate() {
+                foundText = d.formatted(date: .abbreviated, time: .shortened)
+                showFound = true
+            }
         }
         .task { BackupManager.writeAuto() }
+        .alert("Найдена копия в папке приложения", isPresented: $showFound) {
+            Button("Загрузить") { applyFound() }
+            Button("Не нужно", role: .cancel) { BackupManager.acceptExternal() }
+        } message: {
+            Text("Файл Yume-backup от \(foundText). Загрузить из него прогресс, избранное и настройки?")
+        }
+        .overlay {
+            Color.clear.allowsHitTesting(false)
+                .alert("Готово", isPresented: $showDone) {
+                    Button("Закрыть приложение") { exit(0) }
+                } message: {
+                    Text("Открой Yume заново, чтобы всё применилось.")
+                }
+        }
         .overlay(alignment: .top) {
             if let t = router.toast {
                 Text(t)
@@ -10401,6 +10344,7 @@ struct StatsView: View {
 @main
 struct HeheApp: App {
     init() {
+        BackupManager.restoreOnLaunch()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
     }
