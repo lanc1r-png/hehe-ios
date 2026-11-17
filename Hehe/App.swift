@@ -9583,7 +9583,20 @@ enum NovelPaginator {
 
     static func paginate(blocks: [ReaderBlock], title: String, size: CGSize, fontSize: CGFloat,
                          serif: Bool, lineGap: CGFloat, color: UIColor,
-                         bodyAlign: NSTextAlignment = .natural, firstIndent: CGFloat = 0) -> [NovelPage] {
+                         bodyAlign: NSTextAlignment = .natural, firstIndent: CGFloat = 0,
+                         family: String = "", allBold: Bool = false) -> [NovelPage] {
+        let fam = family, ab = allBold
+        func font(_ size: CGFloat, serif: Bool, bold: Bool = false, italic: Bool = false) -> UIFont {
+            let b = bold || ab
+            if !fam.isEmpty, let base = UIFont(name: fam, size: size) {
+                var traits = base.fontDescriptor.symbolicTraits
+                if b { traits.insert(.traitBold) }
+                if italic { traits.insert(.traitItalic) }
+                if let d = base.fontDescriptor.withSymbolicTraits(traits) { return UIFont(descriptor: d, size: size) }
+                return base
+            }
+            return NovelPaginator.font(size, serif: serif, bold: b, italic: italic)
+        }
         var pages: [NovelPage] = []
         let text = NSMutableAttributedString()
 
@@ -9790,10 +9803,28 @@ struct NovelPageCard: View {
 }
 
 // MARK: - Ранобэ: читалка
+func readerPalette(_ id: String) -> (bg: UIColor, fg: UIColor) {
+    switch id {
+    case "sepia": return (UIColor(red: 0.96, green: 0.93, blue: 0.85, alpha: 1), UIColor(red: 0.23, green: 0.18, blue: 0.18, alpha: 1))
+    case "light": return (.white, UIColor(white: 0.1, alpha: 1))
+    case "black": return (.black, UIColor(white: 0.85, alpha: 1))
+    case "quiet": return (UIColor(white: 0.27, alpha: 1), UIColor(white: 0.72, alpha: 1))
+    case "paper": return (UIColor(white: 0.93, alpha: 1), UIColor(white: 0.12, alpha: 1))
+    case "accent": return (.white, .black)
+    case "focus": return (UIColor(red: 0.99, green: 0.98, blue: 0.95, alpha: 1), UIColor(white: 0.1, alpha: 1))
+    default: return (UIColor(white: 0.07, alpha: 1), UIColor(white: 0.9, alpha: 1))
+    }
+}
+
+func readerThemeIsDark(_ id: String) -> Bool { id == "dark" || id == "black" || id == "quiet" }
+
+/// Панель «Темы и настройки» в стиле Apple Books.
 struct NovelReaderSettings: View {
     @Binding var fontSize: Double
     @Binding var lineGap: Double
     @Binding var serif: Bool
+    @Binding var family: String
+    @Binding var bold: Bool
     @Binding var theme: String
     @Binding var margin: Double
     @Binding var justify: Bool
@@ -9802,62 +9833,260 @@ struct NovelReaderSettings: View {
     @Binding var warm: Double
     @Binding var mode: String
     @Binding var anim: String
-    let previewBG: Color
-    let previewFG: Color
+    let activeTheme: String
     let canSearch: Bool
     let downloaded: Bool
     let onSearch: () -> Void
     let onBookmarks: () -> Void
     let onDownload: () -> Void
 
-    // Ползунки, влияющие на разбивку на страницы, применяются, когда палец отпущен.
-    @State private var lf: Double
-    @State private var lg: Double
-    @State private var mg: Double
+    struct Snap {
+        var fs = 18.0, lg = 0.4, serif = true, family = "", bold = false, margin = 24.0
+        var justify = false, indent = false, theme = "dark", mode = "pages", anim = "book"
+        var dim = 0.0, warm = 0.0
+    }
+
+    @State private var lg = 0.4
+    @State private var mg = 24.0
+    @State private var brightness = Double(UIScreen.main.brightness)
+    @State private var showCustom = false
+    @State private var layoutOn = false
+    @State private var snap = Snap()
     @Environment(\.dismiss) private var dismiss
 
-    private let panel = Color(white: 0.13)
-    private let canvas = Color(white: 0.06)
+    private var isDark: Bool { readerThemeIsDark(activeTheme) }
+    private var boldOn: Bool { bold || activeTheme == "accent" }
+    private let glass = Color.primary.opacity(0.08)
 
-    init(fontSize: Binding<Double>, lineGap: Binding<Double>, serif: Binding<Bool>, theme: Binding<String>,
-         margin: Binding<Double>, justify: Binding<Bool>, indent: Binding<Bool>,
-         dim: Binding<Double>, warm: Binding<Double>, mode: Binding<String>, anim: Binding<String>,
-         previewBG: Color, previewFG: Color, canSearch: Bool, downloaded: Bool,
-         onSearch: @escaping () -> Void, onBookmarks: @escaping () -> Void, onDownload: @escaping () -> Void) {
-        _fontSize = fontSize; _lineGap = lineGap; _serif = serif; _theme = theme
-        _margin = margin; _justify = justify; _indent = indent
-        _dim = dim; _warm = warm; _mode = mode; _anim = anim
-        self.previewBG = previewBG; self.previewFG = previewFG
-        self.canSearch = canSearch; self.downloaded = downloaded
-        self.onSearch = onSearch; self.onBookmarks = onBookmarks; self.onDownload = onDownload
-        _lf = State(initialValue: fontSize.wrappedValue)
-        _lg = State(initialValue: lineGap.wrappedValue)
-        _mg = State(initialValue: margin.wrappedValue)
-    }
+    private let tiles: [(id: String, title: String, serif: Bool, bold: Bool)] = [
+        ("light", "Оригинал", false, false), ("quiet", "Тишина", true, false), ("paper", "Бумага", false, false),
+        ("accent", "Акцент", false, true), ("sepia", "Покой", true, false), ("focus", "Фокус", true, false)
+    ]
 
-    private func box<C: View>(_ title: String, icon: String, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: icon)
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(Theme.accent)
-            content()
+    private let fonts: [(id: String, title: String)] = [
+        ("orig", "Исходный"), ("sans", "Без засечек"), ("Georgia", "Georgia"), ("Palatino-Roman", "Palatino"),
+        ("IowanOldStyle-Roman", "Iowan Old Style"), ("Charter-Roman", "Charter"), ("AvenirNext-Regular", "Avenir Next")
+    ]
+
+    // MARK: главная панель
+
+    var body: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 12) {
+                Button { dismiss() } label: { roundIcon("xmark") }.buttonStyle(.plain)
+                Text("Темы и настройки").font(.headline)
+                Spacer()
+            }
+
+            HStack(spacing: 12) {
+                HStack(spacing: 0) {
+                    Button { step(-1) } label: {
+                        Text("A").font(.system(size: 16, weight: .semibold)).frame(maxWidth: .infinity, minHeight: 50)
+                    }
+                    Divider().frame(height: 28)
+                    Button { step(1) } label: {
+                        Text("A").font(.system(size: 28, weight: .semibold)).frame(maxWidth: .infinity, minHeight: 50)
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .background(glass, in: Capsule())
+
+                HStack(spacing: 0) {
+                    modeMenu
+                    appearanceMenu
+                }
+                .frame(width: 150)
+                .background(glass, in: Capsule())
+            }
+
+            HStack(spacing: 12) {
+                Image(systemName: "sun.min").font(.system(size: 15))
+                Slider(value: $brightness, in: 0.02...1).tint(.primary)
+                Image(systemName: "sun.max").font(.system(size: 21))
+            }
+            .foregroundStyle(.primary)
+            .onChange(of: brightness) { v in UIScreen.main.brightness = CGFloat(v) }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+                ForEach(tiles, id: \.id) { tile($0) }
+            }
+
+            Button {
+                snap = Snap(fs: fontSize, lg: lineGap, serif: serif, family: family, bold: bold, margin: margin,
+                            justify: justify, indent: indent, theme: theme, mode: mode, anim: anim,
+                            dim: dim, warm: warm)
+                showCustom = true
+            } label: {
+                Label("Настроить", systemImage: "gearshape")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .foregroundStyle(.primary)
+                    .background(glass, in: Capsule())
+            }
+            .buttonStyle(.plain)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 18)
+        .padding(.top, 20)
+        .padding(.bottom, 10)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .preferredColorScheme(isDark ? .dark : .light)
+        .presentationDetents([.height(610)])
+        .presentationDragIndicator(.hidden)
+        .onAppear { lg = lineGap; mg = margin }
+        .sheet(isPresented: $showCustom) { customize }
     }
 
-    private func note(_ t: String) -> some View {
-        Text(t).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    private func roundIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.primary)
+            .frame(width: 46, height: 46)
+            .background(.regularMaterial, in: Circle())
+            .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
     }
 
-    private func slider(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, step: Double? = nil,
-                        _ fmt: String, commit: (() -> Void)? = nil) -> some View {
+    private func step(_ d: Double) {
+        let v = min(34, max(12, fontSize + d))
+        if v != fontSize { fontSize = v; Haptics.select() }
+    }
+
+    private func tile(_ t: (id: String, title: String, serif: Bool, bold: Bool)) -> some View {
+        let p = readerPalette(t.id)
+        let on = activeTheme == t.id
+        return Button {
+            Haptics.select()
+            theme = t.id
+        } label: {
+            VStack(spacing: 4) {
+                Text("Aa").font(.system(size: 40, weight: t.bold ? .bold : .regular, design: t.serif ? .serif : .default))
+                Text(t.title).font(.system(size: 15, weight: .medium, design: t.serif ? .serif : .default))
+            }
+            .foregroundStyle(Color(p.fg))
+            .frame(maxWidth: .infinity, minHeight: 112)
+            .background(Color(p.bg), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.primary, lineWidth: on ? 3.5 : 0))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var modeMenu: some View {
+        Menu {
+            Picker("Режим чтения", selection: $mode) {
+                Label("Горизонтально", systemImage: "rectangle.split.2x1").tag("pages")
+                Label("Вертикально", systemImage: "rectangle.split.1x2").tag("scroll")
+            }
+            if mode == "pages" {
+                Menu {
+                    Picker("Листание", selection: $anim) {
+                        Text("Сдвиг").tag("slide")
+                        Text("Плавно").tag("fade")
+                        Text("Как в книге").tag("book")
+                    }
+                } label: {
+                    Label("Анимация листания", systemImage: "book")
+                }
+            }
+        } label: {
+            Image(systemName: "doc.plaintext")
+                .font(.system(size: 22))
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+    }
+
+    private var appearance: String {
+        switch theme {
+        case "auto", "ambient", "black": return theme
+        case "dark", "quiet": return "dark"
+        default: return "light"
+        }
+    }
+
+    private var appearanceIcon: String {
+        switch appearance {
+        case "dark", "black": return "moon.stars"
+        case "auto": return "circle.lefthalf.filled"
+        case "ambient": return "sun.max"
+        default: return "sunrise"
+        }
+    }
+
+    private var appearanceMenu: some View {
+        Menu {
+            Picker("Оформление", selection: Binding(get: { appearance }, set: { v in
+                switch v {
+                case "light":
+                    if readerThemeIsDark(theme) || theme == "auto" || theme == "ambient" { theme = "light" }
+                case "dark":
+                    if theme != "quiet" { theme = "dark" }
+                default:
+                    theme = v
+                }
+            })) {
+                Label("Светлая", systemImage: "sunrise").tag("light")
+                Label("Тёмная", systemImage: "moon.stars").tag("dark")
+                Label("Чёрная (AMOLED)", systemImage: "moon.fill").tag("black")
+                Label("Как на устройстве", systemImage: "circle.lefthalf.filled").tag("auto")
+                Label("Как вокруг", systemImage: "sun.max").tag("ambient")
+            }
+        } label: {
+            Image(systemName: appearanceIcon)
+                .font(.system(size: 22))
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+    }
+
+    // MARK: экран «Настройка темы»
+
+    private var fontChoice: Binding<String> {
+        Binding(get: { family.isEmpty ? (serif ? "orig" : "sans") : family },
+                set: { v in
+                    switch v {
+                    case "orig": serif = true; family = ""
+                    case "sans": serif = false; family = ""
+                    default: family = v
+                    }
+                })
+    }
+
+    private var fontTitle: String { fonts.first { $0.id == fontChoice.wrappedValue }?.title ?? "Исходный" }
+
+    private func previewFont(_ size: CGFloat) -> Font {
+        let w: Font.Weight = boldOn ? .semibold : .regular
+        if !family.isEmpty { return Font.custom(family, size: size).weight(w) }
+        return .system(size: size, weight: w, design: serif ? .serif : .default)
+    }
+
+    private func sectionTitle(_ t: String) -> some View {
+        Text(t).font(.title3.weight(.bold)).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4)
+    }
+
+    private func card<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        VStack(spacing: 0) { content() }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private func toggleRow(_ title: String, icon: String? = nil, _ on: Binding<Bool>) -> some View {
+        HStack(spacing: 14) {
+            if let icon { Image(systemName: icon).font(.system(size: 18, weight: .semibold)).frame(width: 26) }
+            Toggle(title, isOn: on).tint(Theme.accent)
+        }
+        .font(.system(size: 17))
+        .frame(minHeight: 54)
+    }
+
+    private func sliderRow(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, step: Double? = nil,
+                           _ fmt: String, commit: (() -> Void)? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title).font(.footnote)
+                Text(title).font(.system(size: 16))
                 Spacer()
-                Text(fmt).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                Text(fmt).font(.system(size: 15).monospacedDigit()).foregroundStyle(.secondary)
             }
             if let step {
                 Slider(value: v, in: range, step: step) { if !$0 { commit?() } }.tint(Theme.accent)
@@ -9865,140 +10094,178 @@ struct NovelReaderSettings: View {
                 Slider(value: v, in: range) { if !$0 { commit?() } }.tint(Theme.accent)
             }
         }
+        .padding(.vertical, 10)
     }
 
-    private func action(_ title: String, _ icon: String, enabled: Bool = true, tint: Color = Theme.accent,
-                        _ run: @escaping () -> Void) -> some View {
+    private func actionRow(_ title: String, _ icon: String, enabled: Bool = true, tint: Color = .primary,
+                           _ run: @escaping () -> Void) -> some View {
         Button(action: run) {
-            VStack(spacing: 6) {
-                Image(systemName: icon).font(.title3)
-                Text(title).font(.caption2.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+            HStack(spacing: 14) {
+                Image(systemName: icon).font(.system(size: 18, weight: .semibold)).frame(width: 26)
+                Text(title).font(.system(size: 17))
+                Spacer()
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
             .foregroundStyle(enabled ? tint : Color.secondary)
-            .background(panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(minHeight: 54)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
     }
 
-    private let themes: [(String, String)] = [("auto", "Авто"), ("dark", "Тёмная"), ("black", "Чёрная"),
-                                              ("sepia", "Сепия"), ("light", "Светлая")]
-
-    private func swatch(_ id: String, _ title: String) -> some View {
-        let on = theme == id
-        let (bg, fg): (Color, Color) = {
-            switch id {
-            case "light": return (.white, Color(white: 0.1))
-            case "sepia": return (Color(red: 0.96, green: 0.93, blue: 0.85), Color(red: 0.23, green: 0.18, blue: 0.18))
-            case "black": return (.black, Color(white: 0.85))
-            default: return (Color(white: 0.07), Color(white: 0.9))
-            }
-        }()
-        return Button { Haptics.select(); theme = id } label: {
-            VStack(spacing: 6) {
-                ZStack {
-                    if id == "auto" {
-                        LinearGradient(colors: [Color(white: 0.07), Color.white], startPoint: .leading, endPoint: .trailing)
-                    } else {
-                        bg
-                    }
-                    Text("Aa").font(.system(size: 17, weight: .semibold, design: .serif))
-                        .foregroundStyle(id == "auto" ? Color.gray : fg)
-                }
-                .frame(width: 54, height: 54)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(on ? Theme.accent : Color.white.opacity(0.15), lineWidth: on ? 2.5 : 1))
-                Text(title).font(.caption2).foregroundStyle(on ? Theme.accent : Color.secondary)
-            }
-        }
-        .buttonStyle(.plain)
+    private func restore() {
+        fontSize = snap.fs; lineGap = snap.lg; serif = snap.serif; family = snap.family; bold = snap.bold
+        margin = snap.margin; justify = snap.justify; indent = snap.indent; theme = snap.theme
+        mode = snap.mode; anim = snap.anim; dim = snap.dim; warm = snap.warm
+        lg = snap.lg; mg = snap.margin
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Настройки читалки").font(.headline)
-                Spacer()
-                Button("Готово") { dismiss() }.font(.body.weight(.semibold))
+    private func reset() {
+        fontSize = 18; lineGap = 0.4; serif = true; family = ""; bold = false
+        margin = 24; justify = false; indent = false; theme = "auto"
+        dim = 0; warm = 0
+        lg = 0.4; mg = 24
+    }
+
+    private var customize: some View {
+        let p = readerPalette(activeTheme)
+        return VStack(spacing: 0) {
+            ZStack {
+                Text("Настройка темы").font(.headline)
+                HStack {
+                    Button { restore(); showCustom = false } label: { roundIcon("xmark") }.buttonStyle(.plain)
+                    Spacer()
+                    Button { showCustom = false } label: {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 19, weight: .bold))
+                            .foregroundStyle(Color(.systemBackground))
+                            .frame(width: 46, height: 46)
+                            .background(Color.primary, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            .padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 10)
+            .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 10)
 
             ScrollView {
-                VStack(spacing: 12) {
-                    HStack(spacing: 10) {
-                        action("Поиск", "magnifyingglass", enabled: canSearch, onSearch)
-                        action("Закладки", "bookmark", onBookmarks)
-                        action(downloaded ? "Удалить" : "Скачать", downloaded ? "trash" : "arrow.down.circle",
-                               tint: downloaded ? .red : Theme.accent) { onDownload(); Haptics.tap() }
+                VStack(spacing: 20) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Aa").font(.system(size: 46, weight: .bold)).padding(.leading, 4)
+                        Text("Жизнь — странная штука, однако: никогда не знаешь, чего от нее ждать… Достаточно подружиться с одной красавицей, как все твои лучшие друзья в одночасье")
+                            .font(previewFont(min(CGFloat(fontSize), 24)))
+                            .lineSpacing(min(CGFloat(fontSize), 24) * CGFloat(lg))
+                            .foregroundStyle(Color(p.fg))
+                            .padding(14)
+                            .frame(maxWidth: .infinity, minHeight: 150, maxHeight: 150, alignment: .topLeading)
+                            .background(Color(p.bg), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .clipped()
                     }
 
-                    Text("Он стоял у окна и смотрел, как дождь медленно стирает очертания города.")
-                        .font(.system(size: lf, design: serif ? .serif : .default))
-                        .lineSpacing(lf * lg)
-                        .foregroundStyle(previewFG)
-                        .padding(.horizontal, 16).padding(.vertical, 14)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(previewBG, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.12)))
-
-                    box("Текст", icon: "textformat.size") {
-                        slider("Размер шрифта", $lf, 12...34, step: 1, "\(Int(lf))") { fontSize = lf }
-                        slider("Межстрочный интервал", $lg, 0.15...0.9, "\(Int(lg * 100))%") { lineGap = lg }
-                        Picker("", selection: $serif) {
-                            Text("С засечками").tag(true)
-                            Text("Без засечек").tag(false)
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    box("Страница", icon: "doc.plaintext") {
-                        slider("Поля", $mg, 8...48, step: 2, "\(Int(mg))") { margin = mg }
-                        Toggle("Выравнивание по ширине", isOn: $justify).tint(Theme.accent)
-                        Toggle("Красная строка", isOn: $indent).tint(Theme.accent)
-                        note("Выравнивание и красная строка работают в режиме «Страницы».")
-                    }
-
-                    box("Тема", icon: "paintpalette") {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 12) {
-                                ForEach(themes, id: \.0) { swatch($0.0, $0.1) }
+                    sectionTitle("Текст")
+                    card {
+                        Menu {
+                            Picker("Шрифт", selection: fontChoice) {
+                                ForEach(fonts, id: \.id) { Text($0.title).tag($0.id) }
                             }
-                            .padding(.vertical, 2)
+                        } label: {
+                            HStack(spacing: 14) {
+                                Text("Aa").font(.system(size: 18, weight: .semibold)).frame(width: 26)
+                                Text("Шрифт").font(.system(size: 17))
+                                Spacer()
+                                Text(fontTitle).foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
+                            }
+                            .foregroundStyle(.primary)
+                            .frame(minHeight: 54)
                         }
+                        Divider().padding(.leading, 40)
+                        toggleRow("Жирный шрифт", icon: "bold", $bold)
                     }
 
-                    box("Экран", icon: "sun.max") {
-                        slider("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
-                        slider("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
+                    sectionTitle("Универсальный доступ и макет")
+                    card {
+                        toggleRow("Настроить", $layoutOn.animation())
+                        if layoutOn {
+                            Divider()
+                            sliderRow("Межстрочный интервал", $lg, 0.15...0.9, "\(Int(lg * 100))%") { lineGap = lg }
+                            Divider()
+                            sliderRow("Поля", $mg, 8...48, step: 2, "\(Int(mg))") { margin = mg }
+                            Divider()
+                            toggleRow("Выравнивание по ширине", $justify)
+                            Divider()
+                            toggleRow("Красная строка", $indent)
+                        }
+                    }
+                    if layoutOn {
+                        Text("Выравнивание и красная строка работают при горизонтальном чтении.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
+                            .offset(y: -10)
                     }
 
-                    box("Режим чтения", icon: "book") {
-                        Picker("", selection: $mode) {
-                            Text("Страницы").tag("pages")
-                            Text("Прокрутка").tag("scroll")
-                        }
-                        .pickerStyle(.segmented)
-                        if mode == "pages" {
-                            Picker("", selection: $anim) {
-                                Text("Сдвиг").tag("slide")
-                                Text("Плавно").tag("fade")
-                                Text("Как в книге").tag("book")
+                    sectionTitle("Режим чтения")
+                    card {
+                        VStack(spacing: 12) {
+                            Picker("", selection: $mode) {
+                                Text("Горизонтально").tag("pages")
+                                Text("Вертикально").tag("scroll")
                             }
                             .pickerStyle(.segmented)
+                            if mode == "pages" {
+                                Picker("", selection: $anim) {
+                                    Text("Сдвиг").tag("slide")
+                                    Text("Плавно").tag("fade")
+                                    Text("Как в книге").tag("book")
+                                }
+                                .pickerStyle(.segmented)
+                            }
+                        }
+                        .padding(.vertical, 14)
+                    }
+
+                    sectionTitle("Экран")
+                    card {
+                        sliderRow("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
+                        Divider()
+                        sliderRow("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
+                    }
+
+                    sectionTitle("Глава")
+                    card {
+                        actionRow("Поиск по главе", "magnifyingglass", enabled: canSearch) {
+                            showCustom = false
+                            onSearch()
+                        }
+                        Divider().padding(.leading, 40)
+                        actionRow("Закладки и заметки", "bookmark") {
+                            showCustom = false
+                            onBookmarks()
+                        }
+                        Divider().padding(.leading, 40)
+                        actionRow(downloaded ? "Удалить главу с телефона" : "Скачать главу",
+                                  downloaded ? "trash" : "arrow.down.circle",
+                                  tint: downloaded ? .red : .primary) {
+                            onDownload()
+                            Haptics.tap()
                         }
                     }
+
+                    Button(role: .destructive) { reset() } label: {
+                        Text("Сбросить тему")
+                            .font(.system(size: 17))
+                            .frame(maxWidth: .infinity, minHeight: 54)
+                            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                    .padding(.bottom, 20)
                 }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 24)
+                .padding(.horizontal, 16)
             }
         }
-        .background(canvas.ignoresSafeArea())
-        .preferredColorScheme(.dark)
-        .presentationDetents([.medium, .large])
-        .modifier(SolidSheetBackground(color: canvas))
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
+        .preferredColorScheme(isDark ? .dark : .light)
+        .presentationDetents([.large])
     }
 }
 
@@ -10013,6 +10280,8 @@ struct NovelReaderView: View {
     @AppStorage("reader.font") private var fontSize = 18.0
     @AppStorage("reader.theme") private var theme = "dark"
     @AppStorage("reader.serif") private var serif = true
+    @AppStorage("reader.family") private var family = ""
+    @AppStorage("reader.bold") private var bold = false
     @AppStorage("reader.lh") private var lineGap = 0.4
     @AppStorage("reader.margin") private var margin = 24.0
     @AppStorage("reader.justify") private var justify = false
@@ -10046,6 +10315,7 @@ struct NovelReaderView: View {
     }
 
     private var activeTheme: String {
+        if theme == "ambient" { return UIScreen.main.brightness < 0.35 ? "dark" : "light" }
         if theme == "auto" {
             switch UserDefaults.standard.string(forKey: "set.theme") ?? "system" {
             case "light": return "light"
@@ -10056,23 +10326,8 @@ struct NovelReaderView: View {
         return theme
     }
 
-    private var bg: Color {
-        switch activeTheme {
-        case "sepia": return Color(red: 0.96, green: 0.93, blue: 0.85)
-        case "light": return .white
-        case "black": return .black
-        default: return Color(white: 0.07)
-        }
-    }
-
-    private var fg: Color {
-        switch activeTheme {
-        case "sepia": return Color(red: 0.23, green: 0.18, blue: 0.18)
-        case "light": return Color(white: 0.1)
-        case "black": return Color(white: 0.85)
-        default: return Color(white: 0.9)
-        }
-    }
+    private var bg: Color { Color(readerPalette(activeTheme).bg) }
+    private var fg: Color { Color(readerPalette(activeTheme).fg) }
 
     private var readMinutes: Int {
         var n = 0
@@ -10089,16 +10344,15 @@ struct NovelReaderView: View {
         return max(1, Int((Double(n) / 180).rounded()))
     }
 
-    private var bodyFont: Font { .system(size: fontSize, design: serif ? .serif : .default) }
-
-    private var fgUI: UIColor {
-        switch activeTheme {
-        case "sepia": return UIColor(red: 0.23, green: 0.18, blue: 0.18, alpha: 1)
-        case "light": return UIColor(white: 0.1, alpha: 1)
-        case "black": return UIColor(white: 0.85, alpha: 1)
-        default: return UIColor(white: 0.9, alpha: 1)
-        }
+    private var boldOn: Bool { bold || activeTheme == "accent" }
+    private func rf(_ size: CGFloat, heavy: Bool = false) -> Font {
+        let w: Font.Weight = heavy ? .bold : (boldOn ? .semibold : .regular)
+        if !family.isEmpty { return Font.custom(family, size: size).weight(w) }
+        return .system(size: size, weight: w, design: serif ? .serif : .default)
     }
+    private var bodyFont: Font { rf(fontSize) }
+
+    private var fgUI: UIColor { readerPalette(activeTheme).fg }
 
     private var windowInsets: UIEdgeInsets {
         let w = UIApplication.shared.connectedScenes
@@ -10224,9 +10478,11 @@ struct NovelReaderView: View {
         let fs = CGFloat(fontSize), sf = serif, lg = CGFloat(lineGap), col = fgUI
         let al: NSTextAlignment = justify ? .justified : .natural
         let ind: CGFloat = indentOn ? CGFloat(fontSize) * 1.4 : 0
+        let fam = family, ab = boldOn
         let result = await Task.detached(priority: .userInitiated) {
             NovelPaginator.paginate(blocks: list, title: title, size: size, fontSize: fs,
-                                    serif: sf, lineGap: lg, color: col, bodyAlign: al, firstIndent: ind)
+                                    serif: sf, lineGap: lg, color: col, bodyAlign: al, firstIndent: ind,
+                                    family: fam, allBold: ab)
         }.value
         if Task.isCancelled { return }
         let old = pages.count
@@ -10316,7 +10572,7 @@ struct NovelReaderView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .id("\(index)-\(novelAnim)-\(activeTheme)-\(hlRev)")
-            .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(lineGap)-\(margin)-\(justify)-\(indentOn)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
+            .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(family)-\(boldOn)-\(lineGap)-\(margin)-\(justify)-\(indentOn)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
                 await paginate(geo.size)
             }
         }
@@ -10332,7 +10588,7 @@ struct NovelReaderView: View {
         case .rich(_, let t):
             Text(t).font(bodyFont).lineSpacing(fontSize * lineGap)
         case .heading(_, let t):
-            Text(t).font(.system(size: fontSize + 4, weight: .bold, design: serif ? .serif : .default))
+            Text(t).font(rf(fontSize + 4, heavy: true))
         case .quote(_, let t):
             Text(t).font(bodyFont.italic()).lineSpacing(fontSize * lineGap)
                 .padding(.leading, 12)
@@ -10354,7 +10610,7 @@ struct NovelReaderView: View {
                         Color.clear.frame(height: 1).id("top")
                         if chapters.indices.contains(index) {
                             Text(chapters[index].title)
-                                .font(.system(size: fontSize + 6, weight: .bold, design: serif ? .serif : .default))
+                                .font(rf(fontSize + 6, heavy: true))
                         }
                         if !loading && !blocks.isEmpty {
                             Text("≈ \(readMinutes) мин чтения")
@@ -10426,7 +10682,7 @@ struct NovelReaderView: View {
             .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(activeTheme == "dark" || activeTheme == "black" ? .dark : .light, for: .navigationBar)
+            .toolbarColorScheme(readerThemeIsDark(activeTheme) ? .dark : .light, for: .navigationBar)
             .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
@@ -10443,7 +10699,7 @@ struct NovelReaderView: View {
                 }
             }
         }
-        .preferredColorScheme(activeTheme == "dark" || activeTheme == "black" ? .dark : .light)
+        .preferredColorScheme(readerThemeIsDark(activeTheme) ? .dark : .light)
         .overlay {
             ZStack {
                 if dimV > 0.001 { Color.black.opacity(dimV).ignoresSafeArea() }
@@ -10452,10 +10708,10 @@ struct NovelReaderView: View {
             .allowsHitTesting(false)
         }
         .sheet(isPresented: $showReaderSettings) {
-            NovelReaderSettings(fontSize: $fontSize, lineGap: $lineGap, serif: $serif, theme: $theme,
-                                margin: $margin, justify: $justify, indent: $indentOn,
-                                dim: $dimV, warm: $warmV, mode: $mode, anim: $novelAnim,
-                                previewBG: bg, previewFG: fg,
+            NovelReaderSettings(fontSize: $fontSize, lineGap: $lineGap, serif: $serif, family: $family,
+                                bold: $bold, theme: $theme, margin: $margin, justify: $justify,
+                                indent: $indentOn, dim: $dimV, warm: $warmV, mode: $mode, anim: $novelAnim,
+                                activeTheme: activeTheme,
                                 canSearch: mode == "pages",
                                 downloaded: chapters.indices.contains(index) && store.isDownloaded(novel.id, chapters[index].id),
                                 onSearch: {
