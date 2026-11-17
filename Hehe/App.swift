@@ -3438,45 +3438,6 @@ struct DetailView: View {
                     .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
                 }
 
-                if let au = vm.anime.authors, !au.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Автор оригинала").font(.footnote.bold()).foregroundStyle(.secondary)
-                        FlowLayout(spacing: 8) {
-                            ForEach(Array(au.enumerated()), id: \.offset) { _, a in
-                                if let aid = a.id {
-                                    NavigationLink(value: AuthorRef(id: aid, name: a.title, slug: a.slug)) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "person.fill")
-                                            Text(a.title)
-                                            Image(systemName: "chevron.right").font(.caption2)
-                                        }
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(Theme.accent)
-                                        .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Theme.chip, in: Capsule())
-                                    }
-                                    .buttonStyle(.pressable)
-                                } else {
-                                    Text(a.title)
-                                        .font(.subheadline)
-                                        .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Theme.chip, in: Capsule())
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let slug = vm.anime.slugUrl, let url = URL(string: "https://animelib.org/ru/anime/\(slug)") {
-                    Link(destination: url) {
-                        Label("Открыть на сайте", systemImage: "safari")
-                            .font(.subheadline)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 9)
-                            .background(Theme.chip, in: Capsule())
-                    }
-                }
-
                 TitleActionsRow(anime: vm.anime) { showComments = true }
 
                 Text("Серии").font(.title3.bold())
@@ -3532,6 +3493,7 @@ struct DetailView: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if let u = titleURL(vm.anime) {
+                    Link(destination: u) { Image(systemName: "safari") }
                     ShareLink(item: u) { Image(systemName: "square.and.arrow.up") }
                 }
                 Button { showBookmark = true } label: { Image(systemName: "bookmark") }
@@ -7347,44 +7309,6 @@ struct NovelDetailView: View {
                     .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
                 }
 
-                if let au = vm.anime.authors, !au.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Автор").font(.footnote.bold()).foregroundStyle(.secondary)
-                        FlowLayout(spacing: 8) {
-                            ForEach(Array(au.enumerated()), id: \.offset) { _, a in
-                                if let aid = a.id {
-                                    NavigationLink(value: AuthorRef(id: aid, name: a.title, slug: a.slug)) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "person.fill")
-                                            Text(a.title)
-                                            Image(systemName: "chevron.right").font(.caption2)
-                                        }
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(Theme.accent)
-                                        .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Theme.chip, in: Capsule())
-                                    }
-                                    .buttonStyle(.pressable)
-                                } else {
-                                    Text(a.title)
-                                        .font(.subheadline)
-                                        .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(Theme.chip, in: Capsule())
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let url = titleURL(vm.anime) {
-                    Link(destination: url) {
-                        Label("Открыть на сайте", systemImage: "safari")
-                            .font(.subheadline)
-                            .padding(.horizontal, 14).padding(.vertical, 9)
-                            .background(Theme.chip, in: Capsule())
-                    }
-                }
-
                 TitleActionsRow(anime: vm.anime) { showComments = true }
 
                 HStack {
@@ -7438,6 +7362,7 @@ struct NovelDetailView: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if let u = titleURL(vm.anime) {
+                    Link(destination: u) { Image(systemName: "safari") }
                     ShareLink(item: u) { Image(systemName: "square.and.arrow.up") }
                 }
                 Button { showBookmark = true } label: { Image(systemName: "bookmark") }
@@ -9854,46 +9779,59 @@ struct TitleActionsRow: View {
     @State private var pushed: Anime?
     @State private var pushActive = false
 
-    private func card(_ icon: String, _ title: String, _ count: Int?, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                ZStack(alignment: .topTrailing) {
-                    Image(systemName: icon)
-                        .font(.title3)
-                        .foregroundStyle(Theme.accent)
-                        .frame(width: 44, height: 36)
-                    if let c = count {
-                        Text("\(min(c, 99))")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 5).padding(.vertical, 2)
-                            .background(Theme.accent, in: Capsule())
-                            .offset(x: 4, y: -2)
-                    }
-                }
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+    private func chipLabel(_ icon: String, _ title: String, _ count: Int?) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+            Text(title)
+            if let c = count {
+                Text("\(c)")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Theme.accent.opacity(0.22), in: Capsule())
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
         }
-        .buttonStyle(.pressable)
+        .font(.subheadline.weight(.medium))
+        .foregroundStyle(Theme.accent)
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(Theme.chip, in: Capsule())
+    }
+
+    private func chip(_ icon: String, _ title: String, _ count: Int?, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) { chipLabel(icon, title, count) }
+            .buttonStyle(.pressable)
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            card("bubble.left.and.bubble.right.fill", "Комментарии", nil, onComments)
+        FlowLayout(spacing: 8) {
+            ForEach(Array((anime.authors ?? []).enumerated()), id: \.offset) { _, a in
+                if let aid = a.id {
+                    NavigationLink(value: AuthorRef(id: aid, name: a.title, slug: a.slug)) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "person.fill")
+                            Text(a.title)
+                        }
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Theme.accent)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Theme.chip, in: Capsule())
+                    }
+                    .buttonStyle(.pressable)
+                } else {
+                    Text(a.title)
+                        .font(.subheadline)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Theme.chip, in: Capsule())
+                }
+            }
+            chip("bubble.left.and.bubble.right.fill", "Комментарии", nil, onComments)
             if !vm.related.isEmpty {
-                card("link", "Связанное", vm.related.count) { startTab = 0; showSheet = true }
+                chip("link", "Связанное", vm.related.count) { startTab = 0; showSheet = true }
             }
             if !vm.similar.isEmpty {
-                card("sparkles", "Похожие", vm.similar.count) { startTab = vm.related.isEmpty ? 0 : 1; showSheet = true }
+                chip("sparkles", "Похожие", vm.similar.count) { startTab = vm.related.isEmpty ? 0 : 1; showSheet = true }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: anime.id) { await vm.load(anime) }
         .sheet(isPresented: $showSheet) {
             SimilarSheet(related: vm.related, similar: vm.similar, start: startTab) { a in
