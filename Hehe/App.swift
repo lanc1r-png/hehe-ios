@@ -927,7 +927,7 @@ extension ButtonStyle where Self == PressableStyle {
 final class ImageCache {
     static let shared: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
-        c.totalCostLimit = 140 * 1024 * 1024
+        c.totalCostLimit = 260 * 1024 * 1024
         c.countLimit = 500
         return c
     }()
@@ -981,6 +981,20 @@ actor ImageLoader {
         let r = await t.value
         inflight[key] = nil
         return r
+    }
+
+    /// Для страниц манги: уменьшаем по ширине (не больше width пикселей), а длинным лентам разрешаем большую высоту.
+    nonisolated static func downsampleWidth(_ data: Data, width: CGFloat, maxSide: CGFloat) -> UIImage? {
+        let srcOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let src = CGImageSourceCreateWithData(data as CFData, srcOpts) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let pw = props[kCGImagePropertyPixelWidth] as? CGFloat,
+              let ph = props[kCGImagePropertyPixelHeight] as? CGFloat, pw > 0, ph > 0 else {
+            return downsample(data, maxPixel: 4096)
+        }
+        let scale = min(1, width / pw)
+        let side = min(max(pw, ph) * scale, maxSide)
+        return downsample(data, maxPixel: max(side, 64))
     }
 
     nonisolated static func downsample(_ data: Data, maxPixel: CGFloat) -> UIImage? {
@@ -7603,7 +7617,7 @@ actor MangaImageStore {
                 for u in urls {
                     if u.isFileURL {
                         if let data = try? Data(contentsOf: u),
-                           let img = ImageLoader.downsample(data, maxPixel: px) {
+                           let img = ImageLoader.downsampleWidth(data, width: 1300, maxSide: 16000) {
                             ImageCache.store(img, key)
                             return (img, "")
                         }
@@ -7618,7 +7632,7 @@ actor MangaImageStore {
                         let (data, resp) = try await MangaImageStore.session.data(for: req)
                         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                         if (200..<300).contains(code) {
-                            if let img = ImageLoader.downsample(data, maxPixel: px) {
+                            if let img = ImageLoader.downsampleWidth(data, width: 1300, maxSide: 16000) {
                                 ImageCache.store(img, key)
                                 return (img, "")
                             }
@@ -8071,7 +8085,11 @@ final class AutoScroller {
     }
     var speed: CGFloat = 60
     var canAdvance: () -> Bool = { true }
-    var onEnd: () -> Void = {}
+    /// Возвращает true, если конец главы обработан; иначе проверка повторится.
+    var onEnd: () -> Bool = { true }
+    var onBlocked: (Bool) -> Void = { _ in }
+    private var blocked = false
+    private var ticks = 0
     private var link: CADisplayLink?
     private var last: CFTimeInterval = 0
     private var blockedSince: CFTimeInterval = 0
@@ -8094,10 +8112,29 @@ final class AutoScroller {
         link = nil
     }
 
+    /// Запасной поиск ленты по всем окнам, если привязка через SwiftUI не сработала.
+    private func locate() {
+        var best: UIScrollView?
+        func walk(_ v: UIView) {
+            if let sv = v as? UIScrollView, !sv.isHidden, sv.alpha > 0.01, sv.bounds.width > 200,
+               sv.contentSize.height > sv.bounds.height * 1.2 {
+                if best == nil || sv.contentSize.height > best!.contentSize.height { best = sv }
+            }
+            for c in v.subviews { walk(c) }
+        }
+        for scene in UIApplication.shared.connectedScenes {
+            guard let ws = scene as? UIWindowScene else { continue }
+            for w in ws.windows where !w.isHidden { walk(w) }
+        }
+        if let b = best { scrollView = b }
+    }
+
     @objc private func tick(_ l: CADisplayLink) {
         let now = l.timestamp
         let dt = last == 0 ? 0 : min(now - last, 0.1)
         last = now
+        ticks += 1
+        if scrollView == nil, ticks % 30 == 0 { locate() }
         guard dt > 0, let sv = scrollView else { return }
         if sv.isTracking || sv.isDragging || sv.isDecelerating {
             pos = sv.contentOffset.y
@@ -8105,16 +8142,15 @@ final class AutoScroller {
         }
         if canAdvance() {
             blockedSince = 0
+            if blocked { blocked = false; onBlocked(false) }
         } else {
             if blockedSince == 0 { blockedSince = now }
-            if now - blockedSince < 4 { return }
+            if !blocked { blocked = true; onBlocked(true) }
+            if now - blockedSince < 3 { return }
         }
         let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
         if sv.contentSize.height > sv.bounds.height, sv.contentOffset.y >= maxY - 1 {
-            if !atEnd {
-                atEnd = true
-                onEnd()
-            }
+            if !atEnd, onEnd() { atEnd = true }
             return
         }
         atEnd = false
@@ -8147,6 +8183,8 @@ struct MangaReaderView: View {
     @State private var sliderValue = 0.0
     @State private var scroller = AutoScroller()
     @State private var autoOn = false
+    @State private var reachedEnd = false
+    @State private var autoNote = ""
     @AppStorage("manga.auto.speed") private var autoSpeed = 60.0
     @AppStorage("manga.auto.next") private var autoNext = true
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
@@ -8198,7 +8236,7 @@ struct MangaReaderView: View {
     private func pagesReady() -> Bool {
         guard !pages.isEmpty else { return false }
         let lo = min(max(scrollPage, 0), pages.count - 1)
-        let hi = min(lo + 2, pages.count - 1)
+        let hi = min(lo + 1, pages.count - 1)
         for k in lo...hi {
             let p = pages[k]
             if ImageCache.shared.object(forKey: ImageCache.key(p.url, p.maxPixel)) == nil { return false }
@@ -8212,6 +8250,7 @@ struct MangaReaderView: View {
             scroller.speed = CGFloat(autoSpeed)
             scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && pagesReady() }
             scroller.onEnd = {
+                guard reachedEnd else { return false }
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     guard autoOn else { return }
@@ -8222,11 +8261,19 @@ struct MangaReaderView: View {
                         chromeHidden = false
                     }
                 }
+                return true
             }
+            scroller.onBlocked = { b in autoNote = b ? "Жду загрузки страниц…" : "" }
+            autoNote = ""
             withAnimation(.easeInOut(duration: 0.2)) { chromeHidden = true }
             scroller.start()
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                if autoOn && scroller.scrollView == nil { autoNote = "Не нашёл ленту для прокрутки" }
+            }
         } else {
             scroller.stop()
+            autoNote = ""
         }
     }
 
@@ -8410,6 +8457,9 @@ struct MangaReaderView: View {
                     Text("\(Int(autoSpeed))").font(.caption2.monospacedDigit()).frame(width: 28)
                 }
                 .padding(.horizontal, 16)
+                if !autoNote.isEmpty {
+                    Text(autoNote).font(.caption2).opacity(0.7)
+                }
             }
             if pages.count > 1 {
                 Slider(value: $sliderValue, in: 0...Double(pages.count - 1), step: 1) { editing in
@@ -8461,6 +8511,7 @@ struct MangaReaderView: View {
                                         .onAppear { scrollPage = p.id }
                                 }
                                 endCard.frame(height: 360).id(pages.count)
+                                    .onAppear { reachedEnd = true }
                             }
                             .background(ScrollFinder { scroller.scrollView = $0 })
                         }
@@ -8592,6 +8643,7 @@ struct MangaReaderView: View {
         pages = []
         current = 0
         scrollPage = 0
+        reachedEnd = false
         ReadStore.shared.mark(novel.readKey, ch.id)
         scheduleHistory(ch)
         do {
