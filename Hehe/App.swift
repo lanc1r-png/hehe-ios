@@ -3463,19 +3463,7 @@ struct DetailView: View {
                     }
                 }
 
-                Button { showComments = true } label: {
-                    HStack {
-                        Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(Theme.accent)
-                        Text("Комментарии").font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
-                    }
-                    .padding(14)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
-                }
-                .buttonStyle(.pressable)
-
-                SimilarSection(anime: vm.anime)
+                TitleActionsRow(anime: vm.anime) { showComments = true }
 
                 Text("Серии").font(.title3.bold())
                 if vm.isLoading { ProgressView() }
@@ -7383,19 +7371,7 @@ struct NovelDetailView: View {
                     }
                 }
 
-                Button { showComments = true } label: {
-                    HStack {
-                        Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(Theme.accent)
-                        Text("Комментарии").font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
-                    }
-                    .padding(14)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
-                }
-                .buttonStyle(.pressable)
-
-                SimilarSection(anime: vm.anime)
+                TitleActionsRow(anime: vm.anime) { showComments = true }
 
                 HStack {
                     Text("Главы").font(.title3.bold())
@@ -9810,6 +9786,125 @@ final class SimilarViewModel: ObservableObject {
         note = r.note
         loaded = true
         ImageLoader.prefetch((r.similar + r.related).compactMap { $0.imageURL })
+    }
+}
+
+/// Ряд кнопок под описанием: комментарии, связанное, похожие. Списки открываются снизу, а не лежат на странице.
+struct TitleActionsRow: View {
+    let anime: Anime
+    let onComments: () -> Void
+    @StateObject private var vm = SimilarViewModel()
+    @State private var showSheet = false
+    @State private var startTab = 0
+    @State private var pushed: Anime?
+    @State private var pushActive = false
+
+    private func card(_ icon: String, _ title: String, _ count: Int?, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: icon)
+                        .font(.title3)
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 44, height: 36)
+                    if let c = count {
+                        Text("\(min(c, 99))")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Theme.accent, in: Capsule())
+                            .offset(x: 4, y: -2)
+                    }
+                }
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
+        }
+        .buttonStyle(.pressable)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            card("bubble.left.and.bubble.right.fill", "Комментарии", nil, onComments)
+            if !vm.related.isEmpty {
+                card("link", "Связанное", vm.related.count) { startTab = 0; showSheet = true }
+            }
+            if !vm.similar.isEmpty {
+                card("sparkles", "Похожие", vm.similar.count) { startTab = vm.related.isEmpty ? 0 : 1; showSheet = true }
+            }
+        }
+        .task(id: anime.id) { await vm.load(anime) }
+        .sheet(isPresented: $showSheet) {
+            SimilarSheet(related: vm.related, similar: vm.similar, start: startTab) { a in
+                showSheet = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    pushed = a
+                    pushActive = true
+                }
+            }
+        }
+        .navigationDestination(isPresented: $pushActive) {
+            if let a = pushed {
+                if LibSite.current.isBook { NovelDetailView(novel: Novel(a)) } else { DetailView(anime: a) }
+            }
+        }
+    }
+}
+
+struct SimilarSheet: View {
+    let related: [Anime]
+    let similar: [Anime]
+    let start: Int
+    let onPick: (Anime) -> Void
+    @State private var tab = 0
+    @Environment(\.dismiss) private var dismiss
+    private let columns = [GridItem(.adaptive(minimum: 104), spacing: 14)]
+
+    private var tabs: [(String, [Anime])] {
+        var t: [(String, [Anime])] = []
+        if !related.isEmpty { t.append(("Связанное", related)) }
+        if !similar.isEmpty { t.append(("Похожие", similar)) }
+        return t
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 14) {
+                    if tabs.count > 1 {
+                        Picker("", selection: $tab) {
+                            ForEach(Array(tabs.enumerated()), id: \.offset) { i, t in
+                                Text("\(t.0) · \(t.1.count)").tag(i)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                    let list = tabs.indices.contains(tab) ? tabs[tab].1 : []
+                    LazyVGrid(columns: columns, spacing: 18) {
+                        ForEach(list) { a in
+                            Button { Haptics.tap(); onPick(a) } label: { AnimeCard(anime: a) }
+                                .buttonStyle(.pressable)
+                        }
+                    }
+                }
+                .padding(14)
+            }
+            .background(AppBackground())
+            .navigationTitle(tabs.count == 1 ? tabs[0].0 : "Связанное и похожие")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } }
+            }
+        }
+        .onAppear { tab = min(start, max(tabs.count - 1, 0)) }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 }
 
