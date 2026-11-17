@@ -775,6 +775,14 @@ actor AnimelibAPI {
         }
     }
 
+    /// Сколько серий/глав у тайтла и когда вышла последняя (если сайт сообщает дату).
+    func updateInfo(slug: String?) async -> (count: Int?, date: String?) {
+        guard let slug, !slug.isEmpty else { return (nil, nil) }
+        let path = LibSite.current.apiPath + "/" + slug
+        guard let data = try? await rawData(path), let root = J.obj(data) else { return (nil, nil) }
+        return FavUpdate.parse(root)
+    }
+
     func episodes(animeID: Int) async throws -> [EpisodeShort] {
         let q = [URLQueryItem(name: "anime_id", value: String(animeID))]
         return try await get("/episodes", query: q, as: Envelope<[EpisodeShort]>.self).data
@@ -1214,34 +1222,351 @@ final class FavoritesStore: ObservableObject {
     }
 }
 
+// MARK: - Списки избранного: статусы, сортировка, «Продолжить»
+enum ListStatus: String, CaseIterable, Codable {
+    case active, planned, done, dropped
+
+    func title(book: Bool) -> String {
+        switch self {
+        case .active: return book ? "Читаю" : "Смотрю"
+        case .planned: return "В планах"
+        case .done: return book ? "Прочитано" : "Просмотрено"
+        case .dropped: return "Брошено"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .active: return "play.circle.fill"
+        case .planned: return "clock.fill"
+        case .done: return "checkmark.circle.fill"
+        case .dropped: return "xmark.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .active: return .green
+        case .planned: return .orange
+        case .done: return .blue
+        case .dropped: return .red
+        }
+    }
+}
+
+enum FavSort: String, CaseIterable {
+    case added, updated, opened, title, rating
+
+    var title: String {
+        switch self {
+        case .added: return "По добавлению"
+        case .updated: return "По обновлению (новые серии и главы)"
+        case .opened: return "Недавно открытые"
+        case .title: return "По названию"
+        case .rating: return "По рейтингу"
+        }
+    }
+}
+
+struct FavMeta: Codable {
+    var status: String?
+    var count: Int?
+    var release: Date?
+    var changed: Date?
+    var checked: Date?
+}
+
+enum FavUpdate {
+    /// Достаёт из ответа сайта число серий/глав и дату последнего выхода (поля ищем по смыслу имени).
+    static func parse(_ root: Any) -> (count: Int?, date: String?) {
+        var count: Int?
+        var date: String?
+        func walk(_ v: Any, _ depth: Int) {
+            guard depth < 3 else { return }
+            if let o = v as? [String: Any] {
+                for (k, x) in o {
+                    let lk = k.lowercased()
+                    if count == nil, ["episodes_count", "chapters_count", "items_count"].contains(lk), let n = J.int(x) {
+                        count = n
+                    }
+                    if date == nil, lk.contains("last"), lk.contains("episode") || lk.contains("chapter"),
+                       let str = x as? String, str.count >= 10, str.first?.isNumber == true {
+                        date = str
+                    }
+                    if x is [String: Any] || x is [Any] { walk(x, depth + 1) }
+                }
+            } else if let arr = v as? [Any] {
+                for x in arr.prefix(5) { walk(x, depth + 1) }
+            }
+        }
+        walk(root, 0)
+        return (count, date)
+    }
+}
+
+func parseLibDate(_ s: String) -> Date? {
+    let t = s.replacingOccurrences(of: "T", with: " ")
+    let long = t.count >= 19
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "UTC")
+    f.dateFormat = long ? "yyyy-MM-dd HH:mm:ss" : "yyyy-MM-dd"
+    return f.date(from: String(t.prefix(long ? 19 : 10)))
+}
+
+@MainActor
+final class FavMetaStore: ObservableObject {
+    static let shared = FavMetaStore()
+    @Published private(set) var items: [String: FavMeta] = [:]
+    private let key = "favmeta.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([String: FavMeta].self, from: d) { items = v }
+    }
+
+    static func key(_ a: Anime) -> String { "\(LibSite.current.key)-\(a.id)" }
+
+    func status(_ a: Anime) -> ListStatus? {
+        items[Self.key(a)]?.status.flatMap { ListStatus(rawValue: $0) }
+    }
+
+    func setStatus(_ a: Anime, _ s: ListStatus?) {
+        var m = items[Self.key(a)] ?? FavMeta()
+        m.status = s?.rawValue
+        items[Self.key(a)] = m
+        save()
+    }
+
+    func updateDate(_ a: Anime) -> Date? {
+        guard let m = items[Self.key(a)] else { return nil }
+        return m.release ?? m.changed
+    }
+
+    func needsCheck(_ a: Anime) -> Bool {
+        guard let c = items[Self.key(a)]?.checked else { return true }
+        return Date().timeIntervalSince(c) > 1800
+    }
+
+    func apply(_ a: Anime, count: Int?, date: String?) {
+        var m = items[Self.key(a)] ?? FavMeta()
+        if let old = m.count, let n = count, n > old { m.changed = Date() }
+        if let n = count { m.count = n }
+        if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
+        m.checked = Date()
+        items[Self.key(a)] = m
+        save()
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+struct FavCard: View {
+    let anime: Anime
+    let status: ListStatus?
+    let book: Bool
+    let onStatus: (ListStatus?) -> Void
+    let onContinue: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            TitleLink(anime: anime) { AnimeCard(anime: anime) }
+                .buttonStyle(.pressable)
+            GeometryReader { geo in
+                ZStack {
+                    Menu {
+                        ForEach(ListStatus.allCases, id: \.self) { st in
+                            Button { onStatus(st) } label: { Label(st.title(book: book), systemImage: st.icon) }
+                        }
+                        if status != nil {
+                            Button(role: .destructive) { onStatus(nil) } label: {
+                                Label("Без статуса", systemImage: "tag.slash")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: status?.icon ?? "tag")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(status?.color ?? Color.white)
+                            .frame(width: 28, height: 28)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .position(x: 22, y: 22)
+
+                    Button(action: onContinue) {
+                        Image(systemName: "play.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 30, height: 30)
+                            .background(Theme.accent, in: Circle())
+                            .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                    }
+                    .buttonStyle(.plain)
+                    .position(x: geo.size.width - 22, y: geo.size.width * 1.5 - 22)
+                }
+            }
+        }
+    }
+}
+
 struct FavoritesView: View {
     @ObservedObject private var favorites: FavoritesStore = FavoritesStore.current
+    @ObservedObject private var meta = FavMetaStore.shared
+    @ObservedObject private var history: HistoryStore = HistoryStore.current
+    @AppStorage("fav.sort") private var sortRaw = FavSort.added.rawValue
+    @State private var filter: ListStatus?
+    @State private var continueAnime: Anime?
+    @State private var pushContinue = false
+    @State private var refreshing = false
+    private let book = LibSite.current.isBook
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    private var sort: FavSort { FavSort(rawValue: sortRaw) ?? .added }
+
+    private func opened(_ a: Anime) -> Date {
+        history.items.first(where: { $0.anime.id == a.id })?.updated ?? Date.distantPast
+    }
+
+    private var visible: [Anime] {
+        var list = favorites.items
+        if let f = filter { list = list.filter { meta.status($0) == f } }
+        switch sort {
+        case .added:
+            break
+        case .updated:
+            list.sort { (meta.updateDate($0) ?? Date.distantPast) > (meta.updateDate($1) ?? Date.distantPast) }
+        case .opened:
+            list.sort { opened($0) > opened($1) }
+        case .title:
+            list.sort { $0.displayTitle.localizedCaseInsensitiveCompare($1.displayTitle) == .orderedAscending }
+        case .rating:
+            list.sort { (Double($0.rateAvg ?? "") ?? 0) > (Double($1.rateAvg ?? "") ?? 0) }
+        }
+        return list
+    }
+
+    private func chip(_ title: String, _ count: Int, _ on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text("\(title) \(count)")
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(on ? Theme.accent : Theme.chip, in: Capsule())
+                .foregroundStyle(on ? Color.white : Color.primary)
+        }
+        .buttonStyle(.pressable)
+    }
+
+    private var chips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                chip("Все", favorites.items.count, filter == nil) { filter = nil }
+                ForEach(ListStatus.allCases, id: \.self) { st in
+                    chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st) {
+                        filter = st
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+    }
+
+    private func refresh(force: Bool) async {
+        let list = Array(favorites.items.prefix(60)).filter { force || meta.needsCheck($0) }
+        guard !list.isEmpty else { return }
+        refreshing = true
+        var i = 0
+        while i < list.count {
+            let chunk = Array(list[i..<min(i + 4, list.count)])
+            await withTaskGroup(of: (Anime, Int?, String?).self) { group in
+                for a in chunk {
+                    group.addTask {
+                        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
+                        return (a, r.count, r.date)
+                    }
+                }
+                for await (a, c, d) in group { meta.apply(a, count: c, date: d) }
+            }
+            i += 4
+        }
+        refreshing = false
+    }
+
+    @ViewBuilder
+    private var continueDestination: some View {
+        if let a = continueAnime {
+            if book {
+                NovelDetailView(novel: Novel(a), autoContinue: true)
+            } else {
+                DetailView(anime: a, autoContinue: true)
+            }
+        }
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                if favorites.items.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "heart.slash").font(.largeTitle).foregroundStyle(.secondary)
-                        Text("Пока пусто.\nОткройте тайтл и нажмите сердечко.")
+                VStack(spacing: 12) {
+                    if !favorites.items.isEmpty { chips }
+                    if sort == .updated, !favorites.items.isEmpty,
+                       favorites.items.allSatisfy({ meta.updateDate($0) == nil }) {
+                        Text(refreshing ? "Проверяю обновления…"
+                             : "Сайт не сообщил даты выхода: порядок по обновлению появится, когда приложение заметит новые серии или главы.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .padding(.horizontal, 14)
+                    }
+                    if favorites.items.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "heart.slash").font(.largeTitle).foregroundStyle(.secondary)
+                            Text("Пока пусто.\nОткройте тайтл и нажмите сердечко.")
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.top, 100)
+                    } else if visible.isEmpty {
+                        Text("В этом списке пока пусто.\nНажми значок ярлыка на обложке, чтобы задать статус.")
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
+                            .padding(.top, 60)
                     }
-                    .padding(.top, 100)
-                }
-                LazyVGrid(columns: columns, spacing: 18) {
-                    ForEach(favorites.items) { anime in
-                        TitleLink(anime: anime) { AnimeCard(anime: anime) }
-                            .buttonStyle(.pressable)
+                    LazyVGrid(columns: columns, spacing: 18) {
+                        ForEach(visible) { anime in
+                            FavCard(anime: anime, status: meta.status(anime), book: book,
+                                    onStatus: { st in
+                                        meta.setStatus(anime, st)
+                                        Haptics.select()
+                                    },
+                                    onContinue: {
+                                        Haptics.tap()
+                                        continueAnime = anime
+                                        pushContinue = true
+                                    })
+                        }
                     }
+                    .padding(.horizontal, 14)
                 }
-                .padding(.horizontal, 14)
             }
+            .refreshable { await refresh(force: true) }
+            .task { await refresh(force: false) }
             .background(AppBackground())
             .navigationTitle("Избранное")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Picker("Сортировка", selection: $sortRaw) {
+                            ForEach(FavSort.allCases, id: \.rawValue) { o in
+                                Text(o.title).tag(o.rawValue)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+                }
+            }
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
+            .navigationDestination(isPresented: $pushContinue) { continueDestination }
         }
     }
 }
@@ -1250,7 +1575,7 @@ struct FavoritesView: View {
 enum BackupManager {
     private static let prefixes = ["favorites", "history", "progress", "read", "search.", "set.",
                                    "accent.", "reader.", "manga.", "novel.", "off.",
-                                   "activity", "bookmarks", "highlights"]
+                                   "activity", "bookmarks", "highlights", "favmeta", "fav."]
 
     private static func allowed(_ key: String) -> Bool {
         prefixes.contains { key.hasPrefix($0) }
@@ -2921,8 +3246,25 @@ struct DetailView: View {
     @ObservedObject private var progress = ProgressStore.shared
     @State private var expanded = false
     @ObservedObject private var favorites = FavoritesStore.shared
+    private let autoContinue: Bool
+    @State private var didAutoContinue = false
 
-    init(anime: Anime) { _vm = StateObject(wrappedValue: DetailViewModel(anime: anime)) }
+    init(anime: Anime, autoContinue: Bool = false) {
+        _vm = StateObject(wrappedValue: DetailViewModel(anime: anime))
+        self.autoContinue = autoContinue
+    }
+
+    /// Открывает серию, на которой остановились (или следующую, если она досмотрена).
+    private func openContinue() {
+        guard !vm.episodes.isEmpty else { return }
+        var idx = 0
+        if let h = HistoryStore.shared.items.first(where: { $0.anime.id == vm.anime.id }),
+           let i = vm.episodes.firstIndex(where: { $0.id == h.episodeID }) {
+            idx = i
+            if progress.get(h.episodeID)?.finished == true, i + 1 < vm.episodes.count { idx = i + 1 }
+        }
+        selected = vm.episodes[idx]
+    }
 
     private var backdrop: some View {
         ZStack {
@@ -3099,7 +3441,13 @@ struct DetailView: View {
                 }
             }
         }
-        .task { await vm.load() }
+        .task {
+            await vm.load()
+            if autoContinue, !didAutoContinue {
+                didAutoContinue = true
+                openContinue()
+            }
+        }
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
         .fullScreenCover(item: $selected) { ep in
@@ -6049,8 +6397,13 @@ struct NovelDetailView: View {
     @ObservedObject private var dl = DownloadManager.shared
     @State private var confirmRemove = false
     private var isManga: Bool { LibSite.current.isManga }
+    private let autoContinue: Bool
+    @State private var didAutoContinue = false
 
-    init(novel: Novel) { _vm = StateObject(wrappedValue: NovelDetailViewModel(anime: novel.anime)) }
+    init(novel: Novel, autoContinue: Bool = false) {
+        _vm = StateObject(wrappedValue: NovelDetailViewModel(anime: novel.anime))
+        self.autoContinue = autoContinue
+    }
 
     private var backdrop: some View {
         ZStack {
@@ -6359,7 +6712,13 @@ struct NovelDetailView: View {
                 }
             }
         }
-        .task { await vm.load() }
+        .task {
+            await vm.load()
+            if autoContinue, !didAutoContinue, !vm.chapters.isEmpty {
+                didAutoContinue = true
+                reader = ReaderStart(id: resumeIndex)
+            }
+        }
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
         .confirmationDialog("Удалить загруженные главы этого тайтла?", isPresented: $confirmRemove, titleVisibility: .visible) {
