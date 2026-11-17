@@ -8903,6 +8903,18 @@ struct MangaReaderSettings: View {
     }
 }
 
+extension View {
+    /// Стекло в духе iOS: размытие, лёгкая светлая подложка, блик по краю и мягкая тень.
+    func liquidGlass<S: Shape>(_ shape: S) -> some View {
+        self
+            .background(shape.fill(.ultraThinMaterial))
+            .background(shape.fill(Color.white.opacity(0.10)))
+            .overlay(shape.stroke(LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.06), .white.opacity(0.25)],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 0.9))
+            .shadow(color: .black.opacity(0.4), radius: 14, y: 6)
+    }
+}
+
 struct SolidSheetBackground: ViewModifier {
     let color: Color
     func body(content: Content) -> some View {
@@ -9294,8 +9306,7 @@ struct MangaReaderView: View {
             Button { dismiss() } label: {
                 Image(systemName: "xmark").font(.system(size: 17, weight: .semibold))
                     .frame(width: 46, height: 46)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay(Circle().stroke(.white.opacity(0.14), lineWidth: 0.5))
+                    .liquidGlass(Circle())
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(novel.displayTitle).font(.footnote.bold()).lineLimit(1)
@@ -9305,8 +9316,7 @@ struct MangaReaderView: View {
             }
             .padding(.horizontal, 16)
             .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
+            .liquidGlass(Capsule())
             HStack(spacing: 0) {
                 Button { showSettings = true } label: {
                     Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
@@ -9328,8 +9338,7 @@ struct MangaReaderView: View {
                 }
             }
             .padding(.horizontal, 4)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
+            .liquidGlass(Capsule())
         }
         .foregroundStyle(.white)
         .environment(\.colorScheme, .dark)
@@ -9399,8 +9408,7 @@ struct MangaReaderView: View {
         .padding(.horizontal, 6)
         .padding(.top, 12)
         .padding(.bottom, 4)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 0.5))
+        .liquidGlass(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
     }
