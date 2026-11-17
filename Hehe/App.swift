@@ -477,7 +477,7 @@ enum APIError: LocalizedError {
 
 struct CatalogFilter: Equatable {
     var query: String = ""
-    var sortBy: SortOption = .rating
+    var sortBy: SortOption = .views
     var genres: Set<Int> = []
     var tags: Set<Int> = []
     var types: Set<Int> = []
@@ -577,22 +577,47 @@ actor AnimelibAPI {
 
     /// «По рейтингу» без тайтлов с парой оценок: иначе наверх попадает всё, что оценили один-два человека на десятку.
     func catalogRated(filter: CatalogFilter, startPage: Int) async throws -> (items: [Anime], hasNext: Bool, next: Int) {
-        let minVotes = LibSite.current.key == "ranobe" ? 30 : 100
+        let minVotes = LibSite.current.isBook ? 20 : 100
         var page = startPage
         var out: [Anime] = []
+        var firstRaw: [Anime] = []
         var hasNext = true
-        var tried = 0
-        while tried < 8 && hasNext && out.count < 18 {
-            do {
-                let r = try await catalog(filter: filter, page: page)
-                hasNext = r.hasNext
-                out += r.items.filter { ($0.rateVotes ?? Int.max) >= minVotes }
-            } catch {
-                if tried == 0 { throw error }
-                break
+        var batches = 0
+        var lastError: Error?
+        while batches < 6 && hasNext && out.count < 18 {
+            let pages = Array(page..<(page + 4))
+            // Четыре страницы сразу: наверху рейтинга много тайтлов с парой оценок, их надо быстро пролистать.
+            let results: [(Int, [Anime]?, Bool, Error?)] = await withTaskGroup(of: (Int, [Anime]?, Bool, Error?).self) { group in
+                for pg in pages {
+                    group.addTask {
+                        do {
+                            let r = try await AnimelibAPI.shared.catalog(filter: filter, page: pg)
+                            return (pg, r.items, r.hasNext, nil)
+                        } catch {
+                            return (pg, nil, false, error)
+                        }
+                    }
+                }
+                var all: [(Int, [Anime]?, Bool, Error?)] = []
+                for await r in group { all.append(r) }
+                return all.sorted { $0.0 < $1.0 }
             }
-            page += 1
-            tried += 1
+            var stop = false
+            for (_, items, next, err) in results {
+                guard let items else { lastError = err; stop = true; break }
+                if batches == 0 { firstRaw += items }
+                out += items.filter { ($0.rateVotes ?? Int.max) >= minVotes }
+                hasNext = next
+                if !next { stop = true; break }
+            }
+            page += pages.count
+            batches += 1
+            if stop { break }
+        }
+        if out.isEmpty {
+            if firstRaw.isEmpty, let e = lastError { throw e }
+            // Фильтр по числу оценок ничего не нашёл: лучше показать список как есть, чем пустой экран.
+            out = firstRaw
         }
         return (out, hasNext, page)
     }
@@ -2554,7 +2579,7 @@ final class AppRouter: ObservableObject {
 
     func openCatalog(query: String = "", sort: CatalogFilter.SortOption? = nil) {
         pendingQuery = query
-        pendingSort = sort ?? .rating
+        pendingSort = sort ?? .views
         tab = 1
     }
 }
