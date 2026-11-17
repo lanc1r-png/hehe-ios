@@ -8754,108 +8754,152 @@ struct MangaReaderSettings: View {
     let detected: String
     @Environment(\.dismiss) private var dismiss
 
-    private let panel = Color(white: 0.13)
-    private let canvas = Color(white: 0.06)
+    private func sectionTitle(_ t: String) -> some View {
+        Text(t).font(.title3.weight(.bold)).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4)
+    }
 
-    private func box<C: View>(_ title: String, icon: String, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: icon)
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(Theme.accent)
-            content()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    private func card<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 0) { content() }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private func note(_ t: String) -> some View {
-        Text(t).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Text(t).font(.footnote).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 12)
     }
 
-    private func modePicker(_ sel: Binding<String>) -> some View {
-        Picker("", selection: sel) {
-            Text("Авто").tag("auto")
-            Text("Страницы").tag("pages")
-            Text("Лента").tag("scroll")
+    /// Плитки выбора в духе тем Apple Books: у выбранной толстая рамка.
+    private func choice(_ options: [(String, String)], _ sel: Binding<String>) -> some View {
+        HStack(spacing: 10) {
+            ForEach(options, id: \.0) { o in
+                let on = sel.wrappedValue == o.0
+                Button {
+                    Haptics.select()
+                    sel.wrappedValue = o.0
+                } label: {
+                    Text(o.1)
+                        .font(.system(size: 16, weight: on ? .semibold : .medium))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, minHeight: 62)
+                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(Color.primary, lineWidth: on ? 3 : 0))
+                }
+                .buttonStyle(.plain)
+            }
         }
-        .pickerStyle(.segmented)
+        .padding(.vertical, 14)
     }
 
     private func slider(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, _ fmt: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title).font(.footnote)
+                Text(title).font(.system(size: 16))
                 Spacer()
-                Text(fmt).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                Text(fmt).font(.system(size: 15).monospacedDigit()).foregroundStyle(.secondary)
             }
             Slider(value: v, in: range).tint(Theme.accent)
         }
+        .padding(.vertical, 10)
+    }
+
+    private func toggle(_ title: String, _ on: Binding<Bool>) -> some View {
+        Toggle(title, isOn: on).tint(Theme.accent)
+            .font(.system(size: 17))
+            .frame(minHeight: 54)
+    }
+
+    private func str(_ b: Binding<Bool>) -> Binding<String> {
+        Binding(get: { b.wrappedValue ? "own" : "all" }, set: { b.wrappedValue = ($0 == "own") })
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            ZStack {
                 Text("Настройки читалки").font(.headline)
-                Spacer()
-                Button("Готово") { dismiss() }.font(.body.weight(.semibold))
+                HStack {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .frame(width: 46, height: 46)
+                            .background(.regularMaterial, in: Circle())
+                            .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
             }
-            .padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 10)
+            .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 8)
 
             ScrollView {
-                VStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("", selection: $own) {
-                            Text("Для всех").tag(false)
-                            Text("Для этого тайтла").tag(true)
-                        }
-                        .pickerStyle(.segmented)
-                        note(own ? "Эти настройки действуют только в этом тайтле, остальные не меняются."
+                VStack(spacing: 20) {
+                    VStack(spacing: 0) {
+                        choice([("all", "Для всех"), ("own", "Для этого тайтла")], str($own))
+                            .padding(.vertical, 0)
+                        Text(own ? "Эти настройки действуют только в этом тайтле, остальные не меняются."
                                  : "Изменения касаются всех тайтлов, у которых нет своих настроек.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4).padding(.top, 8)
                     }
 
-                    box("Режим чтения", icon: "book") {
-                        modePicker($titleMode)
+                    sectionTitle("Режим чтения")
+                    card {
+                        choice([("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")], $titleMode)
+                        Divider()
                         note("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)». Режим всегда запоминается для тайтла.")
                     }
 
-                    box("Листание", icon: "hand.draw") {
-                        Picker("", selection: $anim) {
-                            Text("Сдвиг").tag("slide")
-                            Text("Плавно").tag("fade")
-                            Text("Как в книге").tag("book")
-                        }
-                        .pickerStyle(.segmented)
+                    sectionTitle("Листание")
+                    card {
+                        choice([("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")], $anim)
+                        Divider()
                         note("Работает в режиме «Страницы».")
                     }
 
-                    box("Автопрокрутка", icon: "arrow.down.to.line") {
+                    sectionTitle("Автопрокрутка")
+                    card {
                         slider("Скорость", $speed, 15...240, "\(Int(speed))")
-                        Toggle("Сама переходить к следующей главе", isOn: $autoNext).tint(Theme.accent)
+                        Divider()
+                        toggle("Сама переходить к следующей главе", $autoNext)
+                        Divider()
                         note("Кнопка ▶ внизу в режиме «Лента». Касание ставит прокрутку на паузу.")
                     }
 
-                    box("Экран", icon: "sun.max") {
+                    sectionTitle("Экран")
+                    card {
                         slider("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
+                        Divider()
                         slider("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
-                        Toggle("Чёрно-белый режим", isOn: $gray).tint(Theme.accent)
-                        Toggle("Фон под страницу", isOn: $autoBG).tint(Theme.accent)
+                        Divider()
+                        toggle("Чёрно-белый режим", $gray)
+                        Divider()
+                        toggle("Фон под страницу", $autoBG)
+                        Divider()
                         note("Фон под страницу делает поля вокруг белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
                     }
 
-                    box("По умолчанию", icon: "slider.horizontal.3") {
-                        modePicker($defaultMode)
+                    sectionTitle("По умолчанию")
+                    card {
+                        choice([("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")], $defaultMode)
+                        Divider()
                         note("Для остальных тайтлов, пока у них выбрано «Авто».")
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 24)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 28)
             }
         }
-        .background(canvas.ignoresSafeArea())
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
-        .modifier(SolidSheetBackground(color: canvas))
+        .presentationDragIndicator(.hidden)
     }
 }
 
