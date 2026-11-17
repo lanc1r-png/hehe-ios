@@ -1876,7 +1876,7 @@ struct SettingsView: View {
     @AppStorage("novel.anim") private var novelAnim = "book"
     @AppStorage("off.wifi") private var offWifi = false
     @AppStorage("off.prefetch") private var offPrefetch = false
-    @ObservedObject private var offline = OfflineStore.shared
+    @ObservedObject private var offline = OfflineStore.current
     @State private var confirmOffline = false
     @ObservedObject private var auth = AuthStore.shared
     @State private var custom: Color = Theme.accent
@@ -5953,12 +5953,14 @@ func fmtBytes(_ n: Int) -> String {
 @MainActor
 final class OfflineStore: ObservableObject {
     static let shared = OfflineStore()
+    static let manga = OfflineStore(folder: "OfflineManga")
+    static var current: OfflineStore { LibSite.current.isManga ? manga : shared }
     @Published private(set) var entries: [Int: OfflineEntry] = [:]
     nonisolated let root: URL
 
-    init() {
+    init(folder: String = "Offline") {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        var dir = base.appendingPathComponent("Offline", isDirectory: true)
+        var dir = base.appendingPathComponent(folder, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var rv = URLResourceValues()
         rv.isExcludedFromBackup = true
@@ -5970,6 +5972,9 @@ final class OfflineStore: ObservableObject {
 
     nonisolated func folder(_ novel: Int) -> URL { root.appendingPathComponent(String(novel), isDirectory: true) }
     nonisolated func chapterFile(_ novel: Int, _ chapter: Int) -> URL { folder(novel).appendingPathComponent("\(chapter).json") }
+    nonisolated func mangaPageFile(_ novel: Int, _ chapter: Int, _ index: Int) -> URL {
+        folder(novel).appendingPathComponent("\(chapter)_\(index).img")
+    }
     nonisolated func coverFile(_ novel: Int) -> URL { folder(novel).appendingPathComponent("cover.img") }
     nonisolated func imageFile(novel: Int, chapter: Int, url: URL) -> URL {
         var h: UInt64 = 5381
@@ -6084,6 +6089,7 @@ final class DownloadManager: ObservableObject {
         let novel: Anime
         let chapters: [NovelChapter]
         let chapter: NovelChapter
+        let store: OfflineStore
     }
 
     @Published private(set) var pending: Set<Int> = []
@@ -6107,9 +6113,9 @@ final class DownloadManager: ObservableObject {
     }
 
     func enqueue(novel: Anime, all: [NovelChapter], targets: [NovelChapter]) {
-        let store = OfflineStore.shared
+        let store = OfflineStore.current
         for c in targets where !store.isDownloaded(novel.id, c.id) && !pending.contains(c.id) {
-            jobs.append(Job(novel: novel, chapters: all, chapter: c))
+            jobs.append(Job(novel: novel, chapters: all, chapter: c, store: store))
             pending.insert(c.id)
             failed[c.id] = nil
             total += 1
@@ -6194,6 +6200,10 @@ final class DownloadManager: ObservableObject {
         }
         guard let raw, let root = J.obj(raw) as? [String: Any],
               let d = root["data"] as? [String: Any] else { throw lastError }
+        if job.store === OfflineStore.manga {
+            try await downloadManga(job, raw: raw, data: d)
+            return
+        }
         let att = (d["attachments"] as? [[String: Any]]) ?? []
         let blocks = ReaderParser.parse(d["content"], attachments: att)
         if blocks.isEmpty {
@@ -6204,7 +6214,7 @@ final class DownloadManager: ObservableObject {
         for b in blocks {
             if case .image(_, let u) = b, !urls.contains(u) { urls.append(u) }
         }
-        let store = OfflineStore.shared
+        let store = job.store
         let nid = job.novel.id
         try? FileManager.default.createDirectory(at: store.folder(nid), withIntermediateDirectories: true)
         let targets: [(URL, URL)] = urls.map { ($0, store.imageFile(novel: nid, chapter: c.id, url: $0)) }
@@ -6225,6 +6235,70 @@ final class DownloadManager: ObservableObject {
             _ = await DownloadManager.fetchImage(cover, to: store.coverFile(nid))
         }
         store.record(novel: job.novel, chapters: job.chapters, chapter: c, raw: raw, extraBytes: imageBytes)
+    }
+
+    /// Манга: все страницы главы кладём в файлы 〈глава〉_〈номер〉.img. Глава сохраняется, только если скачались все.
+    private func downloadManga(_ job: Job, raw: Data, data d: [String: Any]) async throws {
+        let c = job.chapter
+        let bases = await MangaImageServers.shared.bases()
+        let pages = MangaService.parse(d, bases: bases)
+        if pages.isEmpty {
+            throw NSError(domain: "offline", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "У главы нет страниц или она недоступна"])
+        }
+        let store = job.store
+        let nid = job.novel.id
+        try? FileManager.default.createDirectory(at: store.folder(nid), withIntermediateDirectories: true)
+        var bytes = 0
+        var failedPages = 0
+        var start = 0
+        while start < pages.count {
+            let chunk = Array(pages[start..<min(start + 4, pages.count)])
+            start += 4
+            let sizes = await withTaskGroup(of: Int.self) { group -> [Int] in
+                for pg in chunk {
+                    let f = store.mangaPageFile(nid, c.id, pg.id)
+                    let urls = pg.urls
+                    group.addTask { await DownloadManager.fetchMangaPage(urls, to: f) }
+                }
+                var out: [Int] = []
+                for await n in group { out.append(n) }
+                return out
+            }
+            for n in sizes { if n == 0 { failedPages += 1 } else { bytes += n } }
+            if Task.isCancelled { throw CancellationError() }
+        }
+        if failedPages > 0 {
+            throw NSError(domain: "offline", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Не скачалось страниц: \(failedPages). Попробуй ещё раз"])
+        }
+        if let cover = job.novel.imageURL, store.coverURL(nid) == nil {
+            _ = await DownloadManager.fetchImage(cover, to: store.coverFile(nid))
+        }
+        store.record(novel: job.novel, chapters: job.chapters, chapter: c, raw: raw, extraBytes: bytes)
+    }
+
+    nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL) async -> Int {
+        if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 { return size }
+        let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        for round in 0..<2 {
+            for u in urls {
+                var req = URLRequest(url: u)
+                req.timeoutInterval = 30
+                req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+                req.setValue(agent, forHTTPHeaderField: "User-Agent")
+                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                   let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
+                   !data.isEmpty,
+                   let src = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(src) > 0 {
+                    try? data.write(to: file, options: .atomic)
+                    return data.count
+                }
+            }
+            if round == 0 { try? await Task.sleep(nanoseconds: 700_000_000) }
+        }
+        return 0
     }
 
     nonisolated static func fetchImage(_ url: URL, to file: URL) async -> Int {
@@ -6249,7 +6323,7 @@ struct ChapterDownloadButton: View {
     let novel: Anime
     let chapters: [NovelChapter]
     let chapter: NovelChapter
-    @ObservedObject private var store = OfflineStore.shared
+    @ObservedObject private var store = OfflineStore.current
     @ObservedObject private var dl = DownloadManager.shared
 
     var body: some View {
@@ -6279,7 +6353,7 @@ struct ChapterDownloadButton: View {
 }
 
 struct OfflineLibraryView: View {
-    @ObservedObject private var store = OfflineStore.shared
+    @ObservedObject private var store = OfflineStore.current
     @State private var confirmAll = false
 
     var body: some View {
@@ -6358,9 +6432,9 @@ final class NovelDetailViewModel: ObservableObject {
             let list = try await c
             chapters = list
             offline = false
-            if !LibSite.current.isManga { OfflineStore.shared.refresh(novel: anime, chapters: list) }
+            OfflineStore.current.refresh(novel: anime, chapters: list)
         } catch {
-            let saved = OfflineStore.shared.savedChapters(anime.id)
+            let saved = OfflineStore.current.savedChapters(anime.id)
             if saved.isEmpty {
                 self.error = error.localizedDescription
             } else {
@@ -6395,7 +6469,7 @@ struct NovelDetailView: View {
     @State private var reader: ReaderStart?
     @State private var showComments = false
     @State private var showBookmark = false
-    @ObservedObject private var store = OfflineStore.shared
+    @ObservedObject private var store = OfflineStore.current
     @ObservedObject private var dl = DownloadManager.shared
     @State private var confirmRemove = false
     private var isManga: Bool { LibSite.current.isManga }
@@ -6522,14 +6596,12 @@ struct NovelDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.pressable)
-            if !isManga { ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c) }
+            ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c)
         }
         .padding(10)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
         .contextMenu {
-            if isManga {
-                Button { reader = ReaderStart(id: i) } label: { Label("Читать", systemImage: "book") }
-            } else if saved {
+            if saved {
                 Button(role: .destructive) { store.remove(novel: vm.anime.id, chapter: c.id) } label: {
                     Label("Удалить загрузку", systemImage: "trash")
                 }
@@ -6660,7 +6732,7 @@ struct NovelDetailView: View {
                 HStack {
                     Text("Главы").font(.title3.bold())
                     Spacer()
-                    if !vm.chapters.isEmpty && !isManga { downloadMenu }
+                    if !vm.chapters.isEmpty { downloadMenu }
                     if vm.chapters.count > 1 {
                         Button { withAnimation { reversed.toggle() } } label: {
                             Label(reversed ? "Сначала новые" : "Сначала старые", systemImage: "arrow.up.arrow.down")
@@ -6687,7 +6759,7 @@ struct NovelDetailView: View {
                                 .font(.footnote.bold())
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            if !isManga { volumeButton(g.indices) }
+                            volumeButton(g.indices)
                         }
                         .padding(.top, 8)
                         ForEach(reversed ? Array(g.indices.reversed()) : g.indices, id: \.self) { i in
@@ -6796,17 +6868,41 @@ actor MangaImageServers {
 }
 
 enum MangaService {
-    static func pages(slug: String, chapter c: NovelChapter) async throws -> [MangaPage] {
+    private static func num(_ v: Any?) -> CGFloat {
+        if let x = v as? Double { return CGFloat(x) }
+        return CGFloat(J.int(v) ?? 0)
+    }
+
+    /// Скачанная глава: страницы лежат файлами на телефоне, сеть не нужна.
+    static func localPages(novel: Int, chapter: Int) -> [MangaPage]? {
+        let store = OfflineStore.manga
+        guard store.isDownloaded(novel, chapter),
+              let data = try? Data(contentsOf: store.chapterFile(novel, chapter)),
+              let root = J.obj(data) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { return nil }
+        let raw = (d["pages"] as? [[String: Any]]) ?? []
+        var out: [MangaPage] = []
+        for p in raw {
+            guard J.str(p["url"]) ?? J.str(p["image"]) != nil else { continue }
+            let f = store.mangaPageFile(novel, chapter, out.count)
+            guard FileManager.default.fileExists(atPath: f.path) else { return nil }
+            out.append(MangaPage(id: out.count, urls: [f], width: num(p["width"]), height: num(p["height"])))
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    static func pages(slug: String, chapter c: NovelChapter, novelID: Int? = nil) async throws -> [MangaPage] {
+        if let n = novelID, let local = localPages(novel: n, chapter: c.id) { return local }
         let data = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
                                                         query: NovelService.chapterQuery(c))
         guard let root = J.obj(data) as? [String: Any],
               let d = root["data"] as? [String: Any] else { throw APIError.badURL }
-        let raw = (d["pages"] as? [[String: Any]]) ?? []
         let bases = await MangaImageServers.shared.bases()
-        func num(_ v: Any?) -> CGFloat {
-            if let x = v as? Double { return CGFloat(x) }
-            return CGFloat(J.int(v) ?? 0)
-        }
+        return parse(d, bases: bases)
+    }
+
+    static func parse(_ d: [String: Any], bases: [String]) -> [MangaPage] {
+        let raw = (d["pages"] as? [[String: Any]]) ?? []
         var out: [MangaPage] = []
         for p in raw {
             guard let path = J.str(p["url"]) ?? J.str(p["image"]) else { continue }
@@ -6851,6 +6947,15 @@ actor MangaImageStore {
             var note = ""
             for round in 0..<2 {
                 for u in urls {
+                    if u.isFileURL {
+                        if let data = try? Data(contentsOf: u),
+                           let img = ImageLoader.downsample(data, maxPixel: px) {
+                            ImageCache.store(img, key)
+                            return (img, "")
+                        }
+                        note = "файл страницы не читается"
+                        continue
+                    }
                     var req = URLRequest(url: u)
                     req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
                     req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
@@ -7684,7 +7789,7 @@ struct MangaReaderView: View {
         ReadStore.shared.mark(novel.readKey, ch.id)
         scheduleHistory(ch)
         do {
-            let result = try await MangaService.pages(slug: slug, chapter: ch)
+            let result = try await MangaService.pages(slug: slug, chapter: ch, novelID: novel.id)
             if Task.isCancelled { return }
             pages = result
             if result.isEmpty {
