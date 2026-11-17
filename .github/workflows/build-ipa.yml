@@ -35,6 +35,15 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PL"
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PL"
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PL"
+      - name: Expose app folder in Files (file sharing)
+        run: |
+          PL=build/Build/Products/Release-iphoneos/Hehe.app/Info.plist
+          for K in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            /usr/libexec/PlistBuddy -c "Delete :$K" "$PL" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$K bool true" "$PL"
+          done
+          /usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$PL"
+          /usr/libexec/PlistBuddy -c "Print :LSSupportsOpeningDocumentsInPlace" "$PL"
       - name: Package IPA
         run: |
           mkdir Payload
