@@ -8632,6 +8632,7 @@ struct BookPager: UIViewControllerRepresentable {
     let count: Int
     @Binding var current: Int
     var backColor: UIColor = .black
+    var themedBack = false
     let content: (Int) -> AnyView
 
     final class Host: UIHostingController<AnyView> {
@@ -8686,7 +8687,7 @@ struct BookPager: UIViewControllerRepresentable {
         let pvc = UIPageViewController(transitionStyle: .pageCurl, navigationOrientation: .horizontal)
         pvc.dataSource = context.coordinator
         pvc.delegate = context.coordinator
-        pvc.isDoubleSided = true
+        pvc.isDoubleSided = themedBack
         pvc.view.backgroundColor = backColor
         // Свои зоны касаний у нас есть, встроенные отключаем, чтобы страницы не листались дважды.
         for g in pvc.gestureRecognizers where g is UITapGestureRecognizer { g.isEnabled = false }
@@ -8700,6 +8701,8 @@ struct BookPager: UIViewControllerRepresentable {
     func updateUIViewController(_ pvc: UIPageViewController, context: Context) {
         let c = context.coordinator
         c.parent = self
+        pvc.view.backgroundColor = backColor
+        if pvc.isDoubleSided != themedBack { pvc.isDoubleSided = themedBack }
         if c.shown != current, let h = c.host(current) {
             let dir: UIPageViewController.NavigationDirection = current > c.shown ? .forward : .reverse
             c.shown = current
@@ -10274,7 +10277,8 @@ struct NovelReaderView: View {
                     let count = pages.count + 1
                     switch novelAnim {
                     case "book":
-                        BookPager(count: count, current: $pageIndex, backColor: UIColor(bg)) { i in AnyView(pageContent(i, margins: m)) }
+                        BookPager(count: count, current: $pageIndex, backColor: UIColor(bg),
+                                  themedBack: activeTheme == "dark" || activeTheme == "black") { i in AnyView(pageContent(i, margins: m)) }
                     case "fade":
                         ZStack {
                             pageContent(pageIndex, margins: m)
