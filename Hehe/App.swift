@@ -2160,7 +2160,7 @@ struct SettingsView: View {
     @AppStorage("manga.mode.default") private var mangaMode = "auto"
     @AppStorage("manga.tapzones") private var tapZones = true
     @AppStorage("manga.anim") private var mangaAnim = "slide"
-    @AppStorage("manga.autobg") private var mangaAutoBG = true
+    @AppStorage("manga.autobg") private var mangaAutoBG = false
     @AppStorage("novel.mode") private var novelMode = "pages"
     @AppStorage("novel.anim") private var novelAnim = "book"
     @AppStorage("off.wifi") private var offWifi = false
@@ -8309,7 +8309,7 @@ struct MangaPageView: View {
     let page: MangaPage
     var vertical = false
     var dim: CGFloat = 1
-    var autoBG = true
+    var autoBG = false
     let onTap: (CGFloat) -> Void
     @State private var image: UIImage?
     @State private var failed = false
@@ -8700,7 +8700,7 @@ struct BookPager: UIViewControllerRepresentable {
 struct MangaTitlePrefs: Codable, Equatable {
     var enabled = false
     var anim = "slide"
-    var autoBG = true
+    var autoBG = false
     var autoNext = true
     var speed = 60.0
     var dim = 0.0
@@ -8981,7 +8981,7 @@ struct MangaReaderView: View {
     @AppStorage("manga.auto.next") private var autoNext = true
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
     @AppStorage("manga.anim") private var anim = "slide"
-    @AppStorage("manga.autobg") private var gAutoBG = true
+    @AppStorage("manga.autobg") private var gAutoBG = false
     @AppStorage("manga.f.dim") private var gDim = 0.0
     @AppStorage("manga.f.warm") private var gWarm = 0.0
     @AppStorage("manga.f.gray") private var gGray = false
@@ -9557,18 +9557,19 @@ enum NovelPaginator {
     }
 
     static func paginate(blocks: [ReaderBlock], title: String, size: CGSize, fontSize: CGFloat,
-                         serif: Bool, lineGap: CGFloat, color: UIColor) -> [NovelPage] {
+                         serif: Bool, lineGap: CGFloat, color: UIColor,
+                         bodyAlign: NSTextAlignment = .natural, firstIndent: CGFloat = 0) -> [NovelPage] {
         var pages: [NovelPage] = []
         let text = NSMutableAttributedString()
 
         func style(spacing: CGFloat, before: CGFloat = 0, indent: CGFloat = 0,
-                   align: NSTextAlignment = .natural) -> NSParagraphStyle {
+                   align: NSTextAlignment = .natural, first: CGFloat = 0) -> NSParagraphStyle {
             let p = NSMutableParagraphStyle()
             p.lineSpacing = fontSize * lineGap
             p.paragraphSpacing = spacing
             p.paragraphSpacingBefore = before
             p.headIndent = indent
-            p.firstLineHeadIndent = indent
+            p.firstLineHeadIndent = indent + first
             p.alignment = align
             p.lineBreakMode = .byWordWrapping
             return p
@@ -9593,9 +9594,9 @@ enum NovelPaginator {
         for b in blocks {
             switch b {
             case .paragraph(_, let t):
-                add(t + "\n", body, style(spacing: fontSize * 0.6))
+                add(t + "\n", body, style(spacing: fontSize * 0.6, align: bodyAlign, first: firstIndent))
             case .rich(_, let a):
-                let st = style(spacing: fontSize * 0.6)
+                let st = style(spacing: fontSize * 0.6, align: bodyAlign, first: firstIndent)
                 for run in a.runs {
                     let piece = String(a[run.range].characters)
                     let intent = run.inlinePresentationIntent ?? []
@@ -9764,6 +9765,218 @@ struct NovelPageCard: View {
 }
 
 // MARK: - Ранобэ: читалка
+struct NovelReaderSettings: View {
+    @Binding var fontSize: Double
+    @Binding var lineGap: Double
+    @Binding var serif: Bool
+    @Binding var theme: String
+    @Binding var margin: Double
+    @Binding var justify: Bool
+    @Binding var indent: Bool
+    @Binding var dim: Double
+    @Binding var warm: Double
+    @Binding var mode: String
+    @Binding var anim: String
+    let previewBG: Color
+    let previewFG: Color
+    let canSearch: Bool
+    let downloaded: Bool
+    let onSearch: () -> Void
+    let onBookmarks: () -> Void
+    let onDownload: () -> Void
+
+    // Ползунки, влияющие на разбивку на страницы, применяются, когда палец отпущен.
+    @State private var lf: Double
+    @State private var lg: Double
+    @State private var mg: Double
+    @Environment(\.dismiss) private var dismiss
+
+    private let panel = Color(white: 0.13)
+    private let canvas = Color(white: 0.06)
+
+    init(fontSize: Binding<Double>, lineGap: Binding<Double>, serif: Binding<Bool>, theme: Binding<String>,
+         margin: Binding<Double>, justify: Binding<Bool>, indent: Binding<Bool>,
+         dim: Binding<Double>, warm: Binding<Double>, mode: Binding<String>, anim: Binding<String>,
+         previewBG: Color, previewFG: Color, canSearch: Bool, downloaded: Bool,
+         onSearch: @escaping () -> Void, onBookmarks: @escaping () -> Void, onDownload: @escaping () -> Void) {
+        _fontSize = fontSize; _lineGap = lineGap; _serif = serif; _theme = theme
+        _margin = margin; _justify = justify; _indent = indent
+        _dim = dim; _warm = warm; _mode = mode; _anim = anim
+        self.previewBG = previewBG; self.previewFG = previewFG
+        self.canSearch = canSearch; self.downloaded = downloaded
+        self.onSearch = onSearch; self.onBookmarks = onBookmarks; self.onDownload = onDownload
+        _lf = State(initialValue: fontSize.wrappedValue)
+        _lg = State(initialValue: lineGap.wrappedValue)
+        _mg = State(initialValue: margin.wrappedValue)
+    }
+
+    private func box<C: View>(_ title: String, icon: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Theme.accent)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func note(_ t: String) -> some View {
+        Text(t).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func slider(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, step: Double? = nil,
+                        _ fmt: String, commit: (() -> Void)? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.footnote)
+                Spacer()
+                Text(fmt).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if let step {
+                Slider(value: v, in: range, step: step) { if !$0 { commit?() } }.tint(Theme.accent)
+            } else {
+                Slider(value: v, in: range) { if !$0 { commit?() } }.tint(Theme.accent)
+            }
+        }
+    }
+
+    private func action(_ title: String, _ icon: String, enabled: Bool = true, tint: Color = Theme.accent,
+                        _ run: @escaping () -> Void) -> some View {
+        Button(action: run) {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title3)
+                Text(title).font(.caption2.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .foregroundStyle(enabled ? tint : Color.secondary)
+            .background(panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
+    private let themes: [(String, String)] = [("auto", "Авто"), ("dark", "Тёмная"), ("black", "Чёрная"),
+                                              ("sepia", "Сепия"), ("light", "Светлая")]
+
+    private func swatch(_ id: String, _ title: String) -> some View {
+        let on = theme == id
+        let (bg, fg): (Color, Color) = {
+            switch id {
+            case "light": return (.white, Color(white: 0.1))
+            case "sepia": return (Color(red: 0.96, green: 0.93, blue: 0.85), Color(red: 0.23, green: 0.18, blue: 0.18))
+            case "black": return (.black, Color(white: 0.85))
+            default: return (Color(white: 0.07), Color(white: 0.9))
+            }
+        }()
+        return Button { Haptics.select(); theme = id } label: {
+            VStack(spacing: 6) {
+                ZStack {
+                    if id == "auto" {
+                        LinearGradient(colors: [Color(white: 0.07), Color.white], startPoint: .leading, endPoint: .trailing)
+                    } else {
+                        bg
+                    }
+                    Text("Aa").font(.system(size: 17, weight: .semibold, design: .serif))
+                        .foregroundStyle(id == "auto" ? Color.gray : fg)
+                }
+                .frame(width: 54, height: 54)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(on ? Theme.accent : Color.white.opacity(0.15), lineWidth: on ? 2.5 : 1))
+                Text(title).font(.caption2).foregroundStyle(on ? Theme.accent : Color.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Настройки читалки").font(.headline)
+                Spacer()
+                Button("Готово") { dismiss() }.font(.body.weight(.semibold))
+            }
+            .padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 10)
+
+            ScrollView {
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        action("Поиск", "magnifyingglass", enabled: canSearch, onSearch)
+                        action("Закладки", "bookmark", onBookmarks)
+                        action(downloaded ? "Удалить" : "Скачать", downloaded ? "trash" : "arrow.down.circle",
+                               tint: downloaded ? .red : Theme.accent) { onDownload(); Haptics.tap() }
+                    }
+
+                    Text("Он стоял у окна и смотрел, как дождь медленно стирает очертания города.")
+                        .font(.system(size: lf, design: serif ? .serif : .default))
+                        .lineSpacing(lf * lg)
+                        .foregroundStyle(previewFG)
+                        .padding(.horizontal, 16).padding(.vertical, 14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(previewBG, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.12)))
+
+                    box("Текст", icon: "textformat.size") {
+                        slider("Размер шрифта", $lf, 12...34, step: 1, "\(Int(lf))") { fontSize = lf }
+                        slider("Межстрочный интервал", $lg, 0.15...0.9, "\(Int(lg * 100))%") { lineGap = lg }
+                        Picker("", selection: $serif) {
+                            Text("С засечками").tag(true)
+                            Text("Без засечек").tag(false)
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    box("Страница", icon: "doc.plaintext") {
+                        slider("Поля", $mg, 8...48, step: 2, "\(Int(mg))") { margin = mg }
+                        Toggle("Выравнивание по ширине", isOn: $justify).tint(Theme.accent)
+                        Toggle("Красная строка", isOn: $indent).tint(Theme.accent)
+                        note("Выравнивание и красная строка работают в режиме «Страницы».")
+                    }
+
+                    box("Тема", icon: "paintpalette") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 12) {
+                                ForEach(themes, id: \.0) { swatch($0.0, $0.1) }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+
+                    box("Экран", icon: "sun.max") {
+                        slider("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
+                        slider("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
+                    }
+
+                    box("Режим чтения", icon: "book") {
+                        Picker("", selection: $mode) {
+                            Text("Страницы").tag("pages")
+                            Text("Прокрутка").tag("scroll")
+                        }
+                        .pickerStyle(.segmented)
+                        if mode == "pages" {
+                            Picker("", selection: $anim) {
+                                Text("Сдвиг").tag("slide")
+                                Text("Плавно").tag("fade")
+                                Text("Как в книге").tag("book")
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 24)
+            }
+        }
+        .background(canvas.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .presentationDetents([.medium, .large])
+        .modifier(SolidSheetBackground(color: canvas))
+    }
+}
+
 struct NovelReaderView: View {
     let novel: Anime
     let chapters: [NovelChapter]
@@ -9776,6 +9989,12 @@ struct NovelReaderView: View {
     @AppStorage("reader.theme") private var theme = "dark"
     @AppStorage("reader.serif") private var serif = true
     @AppStorage("reader.lh") private var lineGap = 0.4
+    @AppStorage("reader.margin") private var margin = 24.0
+    @AppStorage("reader.justify") private var justify = false
+    @AppStorage("reader.indent") private var indentOn = false
+    @AppStorage("reader.dim") private var dimV = 0.0
+    @AppStorage("reader.warm") private var warmV = 0.0
+    @State private var showReaderSettings = false
     @AppStorage("novel.mode") private var mode = "pages"
     @State private var historyTask: Task<Void, Never>?
     @State private var showBookmarks = false
@@ -9816,6 +10035,7 @@ struct NovelReaderView: View {
         switch activeTheme {
         case "sepia": return Color(red: 0.96, green: 0.93, blue: 0.85)
         case "light": return .white
+        case "black": return .black
         default: return Color(white: 0.07)
         }
     }
@@ -9824,6 +10044,7 @@ struct NovelReaderView: View {
         switch activeTheme {
         case "sepia": return Color(red: 0.23, green: 0.18, blue: 0.18)
         case "light": return Color(white: 0.1)
+        case "black": return Color(white: 0.85)
         default: return Color(white: 0.9)
         }
     }
@@ -9849,6 +10070,7 @@ struct NovelReaderView: View {
         switch activeTheme {
         case "sepia": return UIColor(red: 0.23, green: 0.18, blue: 0.18, alpha: 1)
         case "light": return UIColor(white: 0.1, alpha: 1)
+        case "black": return UIColor(white: 0.85, alpha: 1)
         default: return UIColor(white: 0.9, alpha: 1)
         }
     }
@@ -9861,7 +10083,7 @@ struct NovelReaderView: View {
 
     private func pageMargins() -> UIEdgeInsets {
         let ins = windowInsets
-        return UIEdgeInsets(top: ins.top + 16, left: 24, bottom: ins.bottom + 36, right: 24)
+        return UIEdgeInsets(top: ins.top + 16, left: CGFloat(margin), bottom: ins.bottom + 36, right: CGFloat(margin))
     }
 
     private func textSize(_ full: CGSize, _ m: UIEdgeInsets) -> CGSize {
@@ -9975,9 +10197,11 @@ struct NovelReaderView: View {
         let list = blocks
         let title = chapters[index].title
         let fs = CGFloat(fontSize), sf = serif, lg = CGFloat(lineGap), col = fgUI
+        let al: NSTextAlignment = justify ? .justified : .natural
+        let ind: CGFloat = indentOn ? CGFloat(fontSize) * 1.4 : 0
         let result = await Task.detached(priority: .userInitiated) {
             NovelPaginator.paginate(blocks: list, title: title, size: size, fontSize: fs,
-                                    serif: sf, lineGap: lg, color: col)
+                                    serif: sf, lineGap: lg, color: col, bodyAlign: al, firstIndent: ind)
         }.value
         if Task.isCancelled { return }
         let old = pages.count
@@ -10066,7 +10290,7 @@ struct NovelReaderView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .id("\(index)-\(novelAnim)-\(activeTheme)-\(hlRev)")
-            .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(lineGap)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
+            .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(lineGap)-\(margin)-\(justify)-\(indentOn)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
                 await paginate(geo.size)
             }
         }
@@ -10138,7 +10362,7 @@ struct NovelReaderView: View {
                     }
                     .frame(maxWidth: 700, alignment: .leading)
                     .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, CGFloat(margin))
                     .padding(.top, 8)
                     .foregroundStyle(fg)
                     .contentShape(Rectangle())
@@ -10174,7 +10398,7 @@ struct NovelReaderView: View {
             .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(activeTheme == "dark" ? .dark : .light, for: .navigationBar)
+            .toolbarColorScheme(activeTheme == "dark" || activeTheme == "black" ? .dark : .light, for: .navigationBar)
             .toolbarBackground(bg, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
@@ -10187,53 +10411,43 @@ struct NovelReaderView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        if mode == "pages" {
-                            Button { showSearch = true } label: { Label("Поиск по главе", systemImage: "magnifyingglass") }
-                        }
-                        Button { showBookmarks = true } label: { Label("Закладки и заметки", systemImage: "bookmark") }
-                        Button { fontSize = min(fontSize + 2, 34) } label: { Label("Крупнее", systemImage: "textformat.size.larger") }
-                        Button { fontSize = max(fontSize - 2, 12) } label: { Label("Мельче", systemImage: "textformat.size.smaller") }
-                        Toggle("Шрифт с засечками", isOn: $serif)
-                        if chapters.indices.contains(index) {
-                            let cur = chapters[index]
-                            if store.isDownloaded(novel.id, cur.id) {
-                                Button(role: .destructive) { store.remove(novel: novel.id, chapter: cur.id) } label: {
-                                    Label("Удалить загрузку", systemImage: "trash")
-                                }
-                            } else {
-                                Button {
-                                    DownloadManager.shared.enqueue(novel: novel, all: chapters, targets: [cur])
-                                } label: {
-                                    Label("Скачать главу", systemImage: "arrow.down.circle")
-                                }
-                            }
-                        }
-                        Picker("Режим", selection: $mode) {
-                            Text("Страницы").tag("pages")
-                            Text("Прокрутка").tag("scroll")
-                        }
-                        Picker("Листание", selection: $novelAnim) {
-                            Text("Сдвиг").tag("slide")
-                            Text("Плавно").tag("fade")
-                            Text("Как в книге").tag("book")
-                        }
-                        Picker("Интервал", selection: $lineGap) {
-                            Text("Плотный").tag(0.25)
-                            Text("Обычный").tag(0.4)
-                            Text("Свободный").tag(0.6)
-                        }
-                        Picker("Тема", selection: $theme) {
-                            Text("Как в системе").tag("auto")
-                            Text("Тёмная").tag("dark")
-                            Text("Сепия").tag("sepia")
-                            Text("Светлая").tag("light")
-                        }
-                    } label: { Image(systemName: "textformat") }
+                    Button { showReaderSettings = true } label: { Image(systemName: "textformat.size") }
                 }
             }
         }
-        .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
+        .preferredColorScheme(activeTheme == "dark" || activeTheme == "black" ? .dark : .light)
+        .overlay {
+            ZStack {
+                if dimV > 0.001 { Color.black.opacity(dimV).ignoresSafeArea() }
+                if warmV > 0.001 { Color(red: 1, green: 0.6, blue: 0.2).opacity(warmV * 0.5).ignoresSafeArea() }
+            }
+            .allowsHitTesting(false)
+        }
+        .sheet(isPresented: $showReaderSettings) {
+            NovelReaderSettings(fontSize: $fontSize, lineGap: $lineGap, serif: $serif, theme: $theme,
+                                margin: $margin, justify: $justify, indent: $indentOn,
+                                dim: $dimV, warm: $warmV, mode: $mode, anim: $novelAnim,
+                                previewBG: bg, previewFG: fg,
+                                canSearch: mode == "pages",
+                                downloaded: chapters.indices.contains(index) && store.isDownloaded(novel.id, chapters[index].id),
+                                onSearch: {
+                                    showReaderSettings = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { showSearch = true }
+                                },
+                                onBookmarks: {
+                                    showReaderSettings = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { showBookmarks = true }
+                                },
+                                onDownload: {
+                                    guard chapters.indices.contains(index) else { return }
+                                    let cur = chapters[index]
+                                    if store.isDownloaded(novel.id, cur.id) {
+                                        store.remove(novel: novel.id, chapter: cur.id)
+                                    } else {
+                                        DownloadManager.shared.enqueue(novel: novel, all: chapters, targets: [cur])
+                                    }
+                                })
+        }
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: true,
                            onBookmark: { jumpTo(offset: $0.position, chapterID: $0.chapterID) },
