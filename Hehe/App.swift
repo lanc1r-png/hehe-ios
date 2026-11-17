@@ -582,6 +582,11 @@ actor AnimelibAPI {
             }
             throw APIError.badURL
         }
+        // Настоящий запрос сайта: тайтлы автора = каталог с target_id и target_model=people.
+        if let r = try? await run([.init(name: "target_id", value: String(id)),
+                                   .init(name: "target_model", value: "people")]) {
+            return r
+        }
         // Уже найденный параметр: имя и вид значения («id» или «slug»).
         if let known = authorParam[site.key] {
             let parts = known.split(separator: "|").map(String.init)
