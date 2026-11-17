@@ -652,25 +652,55 @@ actor AnimelibAPI {
                             + tryLog.joined(separator: "\n") + "\nПоля автора: " + keys)
     }
 
-    /// Собирает тайтлы из любого ответа: берём объекты внутри массивов, у которых есть id и slug_url.
+    /// Собирает тайтлы из любого ответа: объекты с id и slug_url (авторов, людей и команды пропускаем).
     private func titlesIn(_ root: Any) -> [Anime] {
         var out: [Anime] = []
         var seen = Set<Int>()
-        func walk(_ v: Any, inArray: Bool) {
+        let siteKey = LibSite.current.key
+        func walk(_ v: Any) {
             if let d = v as? [String: Any] {
-                if inArray, J.int(d["id"]) != nil, d["slug_url"] != nil,
+                let model = (d["model"] as? String)?.lowercased() ?? ""
+                let isTitleLike = J.int(d["id"]) != nil && d["slug_url"] != nil
+                    && !["people", "user", "team"].contains(model)
+                let sameSite = !["anime", "manga", "ranobe"].contains(model) || model == siteKey
+                if isTitleLike, sameSite,
                    let data = try? JSONSerialization.data(withJSONObject: d),
                    let a = try? decoder.decode(Anime.self, from: data) {
                     if seen.insert(a.id).inserted { out.append(a) }
                     return
                 }
-                for x in d.values { walk(x, inArray: false) }
+                for x in d.values { walk(x) }
             } else if let arr = v as? [Any] {
-                for x in arr { walk(x, inArray: true) }
+                for x in arr { walk(x) }
             }
         }
-        walk(root, inArray: false)
+        walk(root)
         return out
+    }
+
+    /// «Похожие» и «Связанное» для карточки тайтла (формат ответа разбираем мягко).
+    func similarTitles(slug: String) async -> (similar: [Anime], related: [Anime], note: String) {
+        let base = LibSite.current.apiPath + "/" + slug
+        var notes: [String] = []
+        var lists: [[Anime]] = []
+        for sub in ["similar", "relations"] {
+            do {
+                let data = try await rawData(base + "/" + sub)
+                if let root = J.obj(data) {
+                    lists.append(titlesIn(root).filter { $0.slugUrl != slug })
+                } else {
+                    lists.append([])
+                    notes.append("\(sub): не JSON")
+                }
+            } catch {
+                lists.append([])
+                notes.append("\(sub): \(error.localizedDescription)")
+            }
+        }
+        let sim = lists[0]
+        let simIDs = Set(sim.map { $0.id })
+        let rel = lists[1].filter { !simIDs.contains($0.id) }
+        return (sim, rel, notes.joined(separator: "; "))
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -1219,7 +1249,8 @@ struct FavoritesView: View {
 // MARK: - Резервная копия (прогресс, избранное, история, настройки)
 enum BackupManager {
     private static let prefixes = ["favorites", "history", "progress", "read", "search.", "set.",
-                                   "accent.", "reader.", "manga.", "novel.", "off."]
+                                   "accent.", "reader.", "manga.", "novel.", "off.",
+                                   "activity", "bookmarks", "highlights"]
 
     private static func allowed(_ key: String) -> Bool {
         prefixes.contains { key.hasPrefix($0) }
@@ -1743,6 +1774,16 @@ struct SettingsView: View {
                             FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
                         }
                         if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
+                    }
+
+                    card("Статистика") {
+                        NavigationLink {
+                            StatsView()
+                        } label: {
+                            Label("Моя активность", systemImage: "chart.bar.xaxis")
+                        }
+                        Text("Сколько просмотрено и прочитано, серия дней подряд.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
 
                     card("Резервная копия") {
@@ -2994,6 +3035,8 @@ struct DetailView: View {
                 }
                 .buttonStyle(.pressable)
 
+                SimilarSection(anime: vm.anime)
+
                 Text("Серии").font(.title3.bold())
                 if vm.isLoading { ProgressView() }
                 if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
@@ -3111,6 +3154,7 @@ final class ProgressStore: ObservableObject {
             objectWillChange.send()
         }
         items[String(id)] = new
+        if new.finished && !(old?.finished ?? false) { ActivityStore.shared.addEpisode() }
         save()
     }
 
@@ -3393,15 +3437,48 @@ struct WebPlayerView: UIViewRepresentable {
 
 struct FullscreenPlayer: UIViewControllerRepresentable {
     let player: AVPlayer?
+    var onPiPStart: () -> Void = {}
+    var onPiPStop: () -> Void = {}
+    var onRestore: () -> Void = {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
+        var parent: FullscreenPlayer
+        init(_ p: FullscreenPlayer) { parent = p }
+
+        func playerViewControllerShouldAutomaticallyDismissAtPictureInPictureStart(_ pvc: AVPlayerViewController) -> Bool {
+            parent.onPiPStart()
+            return true
+        }
+
+        func playerViewControllerWillStartPictureInPicture(_ pvc: AVPlayerViewController) {
+            parent.onPiPStart()
+        }
+
+        func playerViewControllerDidStopPictureInPicture(_ pvc: AVPlayerViewController) {
+            parent.onPiPStop()
+        }
+
+        func playerViewController(_ pvc: AVPlayerViewController,
+                                  restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+            parent.onRestore()
+            completionHandler(true)
+        }
+    }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let c = AVPlayerViewController()
         c.player = player
         c.allowsPictureInPicturePlayback = true
+        c.canStartPictureInPictureAutomaticallyFromInline = true
+        c.delegate = context.coordinator
         return c
     }
 
-    func updateUIViewController(_ c: AVPlayerViewController, context: Context) {}
+    func updateUIViewController(_ c: AVPlayerViewController, context: Context) {
+        context.coordinator.parent = self
+    }
 }
 
 @MainActor
@@ -3612,7 +3689,33 @@ final class PlayerViewModel: ObservableObject {
         Haptics.tap()
     }
 
+    var pipActive = false
+
+    func pipStarted() { pipActive = true }
+
+    func pipRestored() {
+        pipActive = false
+        showNative = true
+    }
+
+    /// Окошко «картинка в картинке» закрыли: останавливаем видео, если экран плеера не открыт.
+    func pipStopped() {
+        pipActive = false
+        guard !showNative else { return }
+        if let p = fsPlayer {
+            let t = p.currentTime().seconds
+            let d = p.currentItem?.duration.seconds ?? 0
+            if t.isFinite, d.isFinite, d > 0 { ProgressStore.shared.update(episodeID, position: t, duration: d) }
+            if p !== player { p.pause() }
+        }
+        fsPlayer = nil
+    }
+
     func closeNative() {
+        if pipActive {
+            showNative = false
+            return
+        }
         if let p = fsPlayer {
             let t = p.currentTime().seconds
             let d = p.currentItem?.duration.seconds ?? 0
@@ -3650,6 +3753,7 @@ final class PlayerViewModel: ObservableObject {
                 self?.lastPosition = pos
                 ProgressStore.shared.update(id, position: pos, duration: dur.isFinite ? dur : 0)
                 self?.markWatched(pos)
+                if let r = p?.rate, r > 0 { ActivityStore.shared.addWatch(5) }
             }
         }
         observedPlayer = p
@@ -3896,7 +4000,11 @@ struct PlayerScreen: View {
         .fullScreenCover(isPresented: $vm.showNative, onDismiss: { vm.closeNative() }) {
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
-                FullscreenPlayer(player: vm.fsPlayer).ignoresSafeArea()
+                FullscreenPlayer(player: vm.fsPlayer,
+                                 onPiPStart: { vm.pipStarted() },
+                                 onPiPStop: { vm.pipStopped() },
+                                 onRestore: { vm.pipRestored() })
+                    .ignoresSafeArea()
                 if #unavailable(iOS 26) {
                     Button { vm.closeNative() } label: {
                         Image(systemName: "xmark")
@@ -5387,7 +5495,10 @@ final class ReadStore: ObservableObject {
 
     func mark(_ novel: Int, _ chapter: Int) {
         var list = read[String(novel)] ?? []
-        if !list.contains(chapter) { list.append(chapter) }
+        if !list.contains(chapter) {
+            list.append(chapter)
+            ActivityStore.shared.addChapter(manga: novel < 0)
+        }
         read[String(novel)] = list
         last[String(novel)] = chapter
         if let d = try? JSONEncoder().encode(read) { UserDefaults.standard.set(d, forKey: "read.v1") }
@@ -6189,6 +6300,8 @@ struct NovelDetailView: View {
                 }
                 .buttonStyle(.pressable)
 
+                SimilarSection(anime: vm.anime)
+
                 HStack {
                     Text("Главы").font(.title3.bold())
                     Spacer()
@@ -6773,6 +6886,10 @@ struct MangaReaderView: View {
     @State private var current = 0
     @State private var scrollPage = 0
     @State private var historyTask: Task<Void, Never>?
+    @State private var showBookmarks = false
+    @State private var pendingPage: Int?
+    @State private var jumpTick = 0
+    @ObservedObject private var bms = BookmarkStore.shared
     @State private var showComments = false
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
@@ -6952,6 +7069,17 @@ struct MangaReaderView: View {
                 Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
                     .frame(width: 40, height: 40)
             }
+            Menu {
+                Button { toggleBookmark() } label: {
+                    Label(pageBookmark == nil ? "Закладка на эту страницу" : "Убрать закладку",
+                          systemImage: pageBookmark == nil ? "bookmark" : "bookmark.slash")
+                }
+                Button { showBookmarks = true } label: { Label("Все закладки", systemImage: "list.bullet") }
+            } label: {
+                Image(systemName: pageBookmark == nil ? "bookmark" : "bookmark.fill").frame(width: 40, height: 40)
+            } primaryAction: {
+                toggleBookmark()
+            }
             Button { showComments = true } label: {
                 Image(systemName: "bubble.left.and.bubble.right").frame(width: 40, height: 40)
             }
@@ -7002,7 +7130,7 @@ struct MangaReaderView: View {
                             if current > 0 { proxy.scrollTo(current, anchor: .top) }
                         }
                     }
-                    .id("v\(index)")
+                    .id("v\(index)-\(jumpTick)")
                     .ignoresSafeArea(edges: .bottom)
                 } else {
                     pagedView
@@ -7053,11 +7181,55 @@ struct MangaReaderView: View {
                                     page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count)
             }
         }
+        .sheet(isPresented: $showBookmarks) {
+            BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: false,
+                           onBookmark: { openBookmark($0) }, onHighlight: { _ in })
+        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             preloadTask?.cancel()
             historyTask?.cancel()
+        }
+    }
+
+    private var chapterLabel: String {
+        chapter.map { "Том \($0.volume) · \($0.title)" } ?? ""
+    }
+
+    private var pageBookmark: Bookmark? {
+        guard let c = chapter, !pages.isEmpty else { return nil }
+        let p = min(shown, pages.count - 1)
+        return bms.find(titleKey: novel.readKey, chapterID: c.id, from: p, to: p + 1)
+    }
+
+    private func toggleBookmark() {
+        guard let c = chapter, !pages.isEmpty else { return }
+        if let b = pageBookmark {
+            bms.remove(b.id)
+            Haptics.tap()
+            return
+        }
+        let p = min(shown, pages.count - 1)
+        bms.add(Bookmark(titleKey: novel.readKey, chapterID: c.id, chapterLabel: chapterLabel,
+                         position: p, isText: false, snippet: "", note: "", created: Date()))
+        Haptics.success()
+    }
+
+    private func openBookmark(_ b: Bookmark) {
+        guard let ci = chapters.firstIndex(where: { $0.id == b.chapterID }) else { return }
+        if ci == index {
+            let p = min(max(b.position, 0), max(pages.count - 1, 0))
+            if vertical {
+                current = p
+                scrollPage = p
+                jumpTick += 1
+            } else {
+                withAnimation { current = p }
+            }
+        } else {
+            pendingPage = b.position
+            index = ci
         }
     }
 
@@ -7088,7 +7260,12 @@ struct MangaReaderView: View {
             if result.isEmpty {
                 error = "У главы нет страниц или она недоступна."
             } else {
-                preload(from: 0)
+                if let pp = pendingPage {
+                    current = min(max(pp, 0), result.count - 1)
+                    scrollPage = current
+                    pendingPage = nil
+                }
+                preload(from: current)
             }
         } catch {
             if Task.isCancelled { return }
@@ -7166,11 +7343,15 @@ enum NovelPaginator {
         func add(_ s: String, _ f: UIFont, _ st: NSParagraphStyle) {
             text.append(NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: color, .paragraphStyle: st]))
         }
+        var globalBase = 0
         func flush() {
             guard text.length > 0 else { return }
             for r in split(text, size: size) {
-                pages.append(.text(pages.count, text.attributedSubstring(from: r)))
+                let sub = NSMutableAttributedString(attributedString: text.attributedSubstring(from: r))
+                sub.addAttribute(.heheBase, value: globalBase + r.location, range: NSRange(location: 0, length: sub.length))
+                pages.append(.text(pages.count, sub))
             }
+            globalBase += text.length
             text.deleteCharacters(in: NSRange(location: 0, length: text.length))
         }
 
@@ -7208,16 +7389,69 @@ enum NovelPaginator {
     }
 }
 
+extension NSAttributedString.Key {
+    /// Смещение первого символа страницы в тексте всей главы (нужно для выделений и закладок).
+    static let heheBase = NSAttributedString.Key("hehe.base")
+}
+
+/// Накладывает цветные выделения на текст страницы.
+func applyHighlights(_ t: NSAttributedString, _ list: [Highlight]) -> NSAttributedString {
+    guard !list.isEmpty, t.length > 0,
+          let base = t.attribute(.heheBase, at: 0, effectiveRange: nil) as? Int else { return t }
+    let m = NSMutableAttributedString(attributedString: t)
+    let page = NSRange(location: base, length: t.length)
+    for h in list {
+        let r = NSIntersectionRange(page, NSRange(location: h.start, length: h.length))
+        guard r.length > 0 else { continue }
+        let local = NSRange(location: r.location - base, length: r.length)
+        m.addAttribute(.backgroundColor, value: h.uiColor, range: local)
+        if !h.note.isEmpty {
+            m.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: local)
+        }
+    }
+    return m
+}
+
+extension NovelPage {
+    var plainText: String {
+        if case .text(_, let t) = self { return t.string }
+        return ""
+    }
+}
+
 final class PageTextUIView: UIView {
     var text = NSAttributedString() {
         didSet { setNeedsDisplay() }
     }
+    /// Долгое нажатие: диапазон абзаца внутри страницы и его текст.
+    var onLongPress: ((NSRange, String) -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isOpaque = false
         contentMode = .redraw
+        let g = UILongPressGestureRecognizer(target: self, action: #selector(handleLong(_:)))
+        g.minimumPressDuration = 0.5
+        addGestureRecognizer(g)
+    }
+
+    @objc private func handleLong(_ g: UILongPressGestureRecognizer) {
+        guard g.state == .began, let cb = onLongPress, text.length > 0 else { return }
+        let storage = NSTextStorage(attributedString: text)
+        let lm = NSLayoutManager()
+        storage.addLayoutManager(lm)
+        let tc = NSTextContainer(size: CGSize(width: bounds.width, height: 100_000))
+        tc.lineFragmentPadding = 0
+        lm.addTextContainer(tc)
+        lm.ensureLayout(for: tc)
+        let idx = lm.characterIndex(for: g.location(in: self), in: tc, fractionOfDistanceBetweenInsertionPoints: nil)
+        let ns = text.string as NSString
+        guard idx < ns.length else { return }
+        var r = ns.paragraphRange(for: NSRange(location: idx, length: 0))
+        while r.length > 0, ns.character(at: NSMaxRange(r) - 1) == 10 { r.length -= 1 }
+        guard r.length > 0 else { return }
+        cb(r, ns.substring(with: r))
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -7230,20 +7464,24 @@ final class PageTextUIView: UIView {
         tc.lineFragmentPadding = 0
         lm.addTextContainer(tc)
         let r = lm.glyphRange(for: tc)
+        lm.drawBackground(forGlyphRange: r, at: .zero)
         lm.drawGlyphs(forGlyphRange: r, at: .zero)
     }
 }
 
 struct PageText: UIViewRepresentable {
     let text: NSAttributedString
+    var onLongPress: ((NSRange, String) -> Void)? = nil
 
     func makeUIView(context: Context) -> PageTextUIView {
         let v = PageTextUIView()
         v.text = text
+        v.onLongPress = onLongPress
         return v
     }
 
     func updateUIView(_ v: PageTextUIView, context: Context) {
+        v.onLongPress = onLongPress
         if !v.text.isEqual(to: text) { v.text = text }
     }
 }
@@ -7257,6 +7495,8 @@ struct NovelPageCard: View {
     let fg: Color
     let margins: UIEdgeInsets
     let onTap: (CGFloat) -> Void
+    var highlights: [Highlight] = []
+    var onLongPress: ((NSRange, String) -> Void)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -7267,7 +7507,10 @@ struct NovelPageCard: View {
                 Group {
                     switch page {
                     case .text(_, let t):
-                        PageText(text: t)
+                        PageText(text: applyHighlights(t, highlights), onLongPress: { local, str in
+                            let base = (t.attribute(.heheBase, at: 0, effectiveRange: nil) as? Int) ?? 0
+                            onLongPress?(NSRange(location: base + local.location, length: local.length), str)
+                        })
                     case .image(_, let u):
                         FitImage(url: u)
                     }
@@ -7302,6 +7545,15 @@ struct NovelReaderView: View {
     @AppStorage("reader.lh") private var lineGap = 0.4
     @AppStorage("novel.mode") private var mode = "pages"
     @State private var historyTask: Task<Void, Never>?
+    @State private var showBookmarks = false
+    @State private var showSearch = false
+    @State private var pendingSel: ReaderSelection?
+    @State private var noteFor: NoteRequest?
+    @State private var lastLongPress = Date.distantPast
+    @State private var pendingOffset: Int?
+    @State private var hlRev = 0
+    @ObservedObject private var bms = BookmarkStore.shared
+    @ObservedObject private var hls = HighlightStore.shared
     @AppStorage("novel.anim") private var novelAnim = "book"
     @State private var pages: [NovelPage] = []
     @State private var pageIndex = 0
@@ -7390,9 +7642,93 @@ struct NovelReaderView: View {
     }
 
     private func handleTap(_ x: CGFloat) {
+        // после долгого нажатия палец отпускается: этот «тап» игнорируем
+        if Date().timeIntervalSince(lastLongPress) < 0.8 { return }
         if x < 0.3 { turn(-1) }
         else if x > 0.7 { turn(1) }
         else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
+    }
+
+    private var chapterID: Int { chapters.indices.contains(index) ? chapters[index].id : 0 }
+
+    private var chapterLabel: String {
+        chapters.indices.contains(index) ? "Том \(chapters[index].volume) · \(chapters[index].title)" : ""
+    }
+
+    /// Диапазон символов главы, который занимает страница.
+    private func pageRange(_ i: Int) -> (Int, Int)? {
+        guard i >= 0, i < pages.count, case .text(_, let t) = pages[i], t.length > 0,
+              let b = t.attribute(.heheBase, at: 0, effectiveRange: nil) as? Int else { return nil }
+        return (b, b + t.length)
+    }
+
+    private func pageFor(offset: Int) -> Int? {
+        for i in 0..<pages.count {
+            if let r = pageRange(i), offset >= r.0, offset < r.1 { return i }
+        }
+        return nil
+    }
+
+    private var currentBookmark: Bookmark? {
+        guard let r = pageRange(pageIndex) else { return nil }
+        return bms.find(titleKey: novel.readKey, chapterID: chapterID, from: r.0, to: r.1)
+    }
+
+    private func toggleBookmark() {
+        guard let r = pageRange(pageIndex), case .text(_, let t) = pages[pageIndex] else {
+            Haptics.tap()
+            return
+        }
+        if let b = currentBookmark {
+            bms.remove(b.id)
+            Haptics.tap()
+            return
+        }
+        let snip = String(t.string.trimmingCharacters(in: .whitespacesAndNewlines).prefix(110))
+        bms.add(Bookmark(titleKey: novel.readKey, chapterID: chapterID, chapterLabel: chapterLabel,
+                         position: r.0, isText: true, snippet: snip, note: "", created: Date()))
+        Haptics.success()
+    }
+
+    private func jumpTo(offset: Int, chapterID cid: Int) {
+        guard let ci = chapters.firstIndex(where: { $0.id == cid }) else { return }
+        if mode != "pages" { mode = "pages" }
+        if ci == index {
+            if let p = pageFor(offset: offset) { withAnimation { pageIndex = p } }
+        } else {
+            pendingOffset = offset
+            index = ci
+        }
+    }
+
+    private func handleLong(_ r: NSRange, _ text: String) {
+        lastLongPress = Date()
+        Haptics.bump()
+        pendingSel = ReaderSelection(range: r, text: text)
+    }
+
+    private func applyHighlight(_ sel: ReaderSelection, color: Int) {
+        hls.set(titleKey: novel.readKey, chapterID: chapterID, label: chapterLabel,
+                range: sel.range, snippet: sel.text, color: color, note: nil)
+        hlRev += 1
+        Haptics.success()
+    }
+
+    private func removeHighlight(_ sel: ReaderSelection) {
+        if let h = hls.exact(novel.readKey, chapterID, sel.range) {
+            hls.remove(h.id)
+            hlRev += 1
+        }
+    }
+
+    private func openNote(_ sel: ReaderSelection) {
+        let existing = hls.exact(novel.readKey, chapterID, sel.range)
+        let key = novel.readKey, cid = chapterID, label = chapterLabel
+        noteFor = NoteRequest(title: String(sel.text.prefix(140)), initial: existing?.note ?? "") { text in
+            hls.set(titleKey: key, chapterID: cid, label: label, range: sel.range, snippet: sel.text,
+                    color: existing?.color ?? 0, note: text)
+            hlRev += 1
+        }
     }
 
     private func paginate(_ full: CGSize) async {
@@ -7414,6 +7750,10 @@ struct NovelReaderView: View {
         let old = pages.count
         pages = result
         pageIndex = old > 0 ? min(Int(Double(pageIndex) / Double(old) * Double(result.count)), max(result.count - 1, 0)) : 0
+        if let off = pendingOffset {
+            if let p = pageFor(offset: off) { pageIndex = p }
+            pendingOffset = nil
+        }
         paginating = false
     }
 
@@ -7443,7 +7783,9 @@ struct NovelReaderView: View {
     private func pageContent(_ i: Int, margins m: UIEdgeInsets) -> some View {
         if i < pages.count {
             NovelPageCard(page: pages[i], number: i + 1, total: pages.count, bg: bg, fg: fg,
-                          margins: m, onTap: handleTap)
+                          margins: m, onTap: handleTap,
+                          highlights: hls.forChapter(novel.readKey, chapterID),
+                          onLongPress: { r, s in handleLong(r, s) })
         } else {
             endPage
         }
@@ -7490,7 +7832,7 @@ struct NovelReaderView: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .id("\(index)-\(novelAnim)-\(activeTheme)")
+            .id("\(index)-\(novelAnim)-\(activeTheme)-\(hlRev)")
             .task(id: "\(index)-\(loading)-\(blocks.count)-\(fontSize)-\(serif)-\(lineGap)-\(activeTheme)-\(Int(geo.size.width))x\(Int(geo.size.height))") {
                 await paginate(geo.size)
             }
@@ -7602,7 +7944,18 @@ struct NovelReaderView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
+                    if mode == "pages" {
+                        Button { toggleBookmark() } label: {
+                            Image(systemName: currentBookmark == nil ? "bookmark" : "bookmark.fill")
+                        }
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        if mode == "pages" {
+                            Button { showSearch = true } label: { Label("Поиск по главе", systemImage: "magnifyingglass") }
+                        }
+                        Button { showBookmarks = true } label: { Label("Закладки и заметки", systemImage: "bookmark") }
                         Button { fontSize = min(fontSize + 2, 34) } label: { Label("Крупнее", systemImage: "textformat.size.larger") }
                         Button { fontSize = max(fontSize - 2, 12) } label: { Label("Мельче", systemImage: "textformat.size.smaller") }
                         Toggle("Шрифт с засечками", isOn: $serif)
@@ -7645,6 +7998,33 @@ struct NovelReaderView: View {
             }
         }
         .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
+        .sheet(isPresented: $showBookmarks) {
+            BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: true,
+                           onBookmark: { jumpTo(offset: $0.position, chapterID: $0.chapterID) },
+                           onHighlight: { jumpTo(offset: $0.start, chapterID: $0.chapterID) })
+        }
+        .sheet(isPresented: $showSearch) {
+            ChapterSearchSheet(pages: pages) { p in withAnimation { pageIndex = p } }
+        }
+        .sheet(item: $noteFor) { r in
+            NoteSheet(title: r.title, initial: r.initial, onSave: r.save)
+        }
+        .confirmationDialog("Выделение", isPresented: Binding(get: { pendingSel != nil },
+                                                              set: { if !$0 { pendingSel = nil } }),
+                            titleVisibility: .visible, presenting: pendingSel) { sel in
+            Button("Выделить жёлтым") { applyHighlight(sel, color: 0) }
+            Button("Выделить зелёным") { applyHighlight(sel, color: 1) }
+            Button("Выделить синим") { applyHighlight(sel, color: 2) }
+            Button("Выделить розовым") { applyHighlight(sel, color: 3) }
+            Button("Заметка…") { openNote(sel) }
+            if hls.exact(novel.readKey, chapterID, sel.range) != nil {
+                Button("Убрать выделение", role: .destructive) { removeHighlight(sel) }
+            }
+            Button("Копировать текст") { UIPasteboard.general.string = sel.text }
+            Button("Отмена", role: .cancel) {}
+        } message: { sel in
+            Text(String(sel.text.prefix(120)))
+        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -7699,11 +8079,601 @@ struct NovelReaderView: View {
     }
 }
 
+// MARK: - Закладки, выделения и заметки
+struct ReaderSelection: Identifiable {
+    let id = UUID()
+    let range: NSRange
+    let text: String
+}
+
+struct NoteRequest: Identifiable {
+    let id = UUID()
+    let title: String
+    let initial: String
+    let save: (String) -> Void
+}
+
+struct Bookmark: Codable, Identifiable {
+    var id = UUID()
+    let titleKey: Int
+    let chapterID: Int
+    let chapterLabel: String
+    /// Манга: номер страницы (с нуля). Ранобэ: смещение в тексте главы.
+    let position: Int
+    let isText: Bool
+    let snippet: String
+    var note: String
+    let created: Date
+}
+
+@MainActor
+final class BookmarkStore: ObservableObject {
+    static let shared = BookmarkStore()
+    @Published private(set) var items: [Bookmark] = []
+    private let key = "bookmarks.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([Bookmark].self, from: d) { items = v }
+    }
+
+    func forTitle(_ k: Int) -> [Bookmark] {
+        items.filter { $0.titleKey == k }.sorted { $0.created > $1.created }
+    }
+
+    func find(titleKey: Int, chapterID: Int, from: Int, to: Int) -> Bookmark? {
+        items.first { $0.titleKey == titleKey && $0.chapterID == chapterID && $0.position >= from && $0.position < to }
+    }
+
+    func add(_ b: Bookmark) {
+        items.append(b)
+        save()
+    }
+
+    func remove(_ id: UUID) {
+        items.removeAll { $0.id == id }
+        save()
+    }
+
+    func setNote(_ id: UUID, _ note: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].note = note
+        save()
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+struct Highlight: Codable, Identifiable {
+    var id = UUID()
+    let titleKey: Int
+    let chapterID: Int
+    let chapterLabel: String
+    let start: Int
+    let length: Int
+    var color: Int
+    var note: String
+    let snippet: String
+    let created: Date
+
+    static let palette: [UIColor] = [
+        UIColor(red: 1.0, green: 0.84, blue: 0.2, alpha: 0.5),
+        UIColor(red: 0.35, green: 0.85, blue: 0.45, alpha: 0.45),
+        UIColor(red: 0.3, green: 0.65, blue: 1.0, alpha: 0.45),
+        UIColor(red: 1.0, green: 0.45, blue: 0.7, alpha: 0.45)
+    ]
+
+    var uiColor: UIColor { Highlight.palette[min(max(color, 0), Highlight.palette.count - 1)] }
+    var swiftUIColor: Color { Color(uiColor.withAlphaComponent(1)) }
+}
+
+@MainActor
+final class HighlightStore: ObservableObject {
+    static let shared = HighlightStore()
+    @Published private(set) var items: [Highlight] = []
+    private let key = "highlights.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([Highlight].self, from: d) { items = v }
+    }
+
+    func forChapter(_ k: Int, _ chapter: Int) -> [Highlight] {
+        items.filter { $0.titleKey == k && $0.chapterID == chapter }
+    }
+
+    func forTitle(_ k: Int) -> [Highlight] {
+        items.filter { $0.titleKey == k }.sorted { $0.created > $1.created }
+    }
+
+    func exact(_ k: Int, _ chapter: Int, _ r: NSRange) -> Highlight? {
+        items.first { $0.titleKey == k && $0.chapterID == chapter && $0.start == r.location && $0.length == r.length }
+    }
+
+    @discardableResult
+    func set(titleKey: Int, chapterID: Int, label: String, range: NSRange, snippet: String,
+             color: Int?, note: String?) -> Highlight {
+        if let i = items.firstIndex(where: {
+            $0.titleKey == titleKey && $0.chapterID == chapterID && $0.start == range.location && $0.length == range.length
+        }) {
+            if let c = color { items[i].color = c }
+            if let n = note { items[i].note = n }
+            save()
+            return items[i]
+        }
+        let h = Highlight(titleKey: titleKey, chapterID: chapterID, chapterLabel: label,
+                          start: range.location, length: range.length, color: color ?? 0,
+                          note: note ?? "", snippet: String(snippet.prefix(160)), created: Date())
+        items.append(h)
+        save()
+        return h
+    }
+
+    func remove(_ id: UUID) {
+        items.removeAll { $0.id == id }
+        save()
+    }
+
+    func setNote(_ id: UUID, _ note: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].note = note
+        save()
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+struct NoteSheet: View {
+    let title: String
+    let onSave: (String) -> Void
+    @State private var text: String
+    @Environment(\.dismiss) private var dismiss
+
+    init(title: String, initial: String, onSave: @escaping (String) -> Void) {
+        self.title = title
+        self.onSave = onSave
+        _text = State(initialValue: initial)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title).font(.footnote).foregroundStyle(.secondary).lineLimit(4)
+                TextEditor(text: $text)
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
+                    .frame(minHeight: 160)
+                Spacer()
+            }
+            .padding(14)
+            .background(AppBackground())
+            .navigationTitle("Заметка")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Отмена") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Сохранить") {
+                        onSave(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                        dismiss()
+                    }
+                    .bold()
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+/// Список закладок, выделений и заметок одного тайтла.
+struct BookmarksSheet: View {
+    let titleKey: Int
+    let titleName: String
+    let showHighlights: Bool
+    let onBookmark: (Bookmark) -> Void
+    let onHighlight: (Highlight) -> Void
+    @ObservedObject private var bms = BookmarkStore.shared
+    @ObservedObject private var hls = HighlightStore.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var noteFor: NoteRequest?
+
+    var body: some View {
+        let marks = bms.forTitle(titleKey)
+        let lights = hls.forTitle(titleKey)
+        NavigationStack {
+            List {
+                Section("Закладки") {
+                    if marks.isEmpty {
+                        Text("Пока нет закладок. Нажми значок закладки в читалке.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    ForEach(marks) { b in
+                        Button {
+                            dismiss()
+                            onBookmark(b)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(b.chapterLabel).font(.subheadline.weight(.semibold))
+                                Text(b.isText ? b.snippet : "Страница \(b.position + 1)")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                if !b.note.isEmpty {
+                                    Text(b.note).font(.caption).foregroundStyle(Theme.accent)
+                                }
+                            }
+                        }
+                        .swipeActions {
+                            Button(role: .destructive) { bms.remove(b.id) } label: { Label("Удалить", systemImage: "trash") }
+                            Button {
+                                noteFor = NoteRequest(title: b.chapterLabel, initial: b.note) { bms.setNote(b.id, $0) }
+                            } label: { Label("Заметка", systemImage: "note.text") }
+                            .tint(.orange)
+                        }
+                    }
+                }
+                if showHighlights {
+                    Section("Выделения и заметки") {
+                        if lights.isEmpty {
+                            Text("Удерживай палец на абзаце в читалке, чтобы выделить его или добавить заметку.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                        ForEach(lights) { h in
+                            Button {
+                                dismiss()
+                                onHighlight(h)
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    RoundedRectangle(cornerRadius: 2).fill(h.swiftUIColor).frame(width: 4)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(h.chapterLabel).font(.caption).foregroundStyle(.secondary)
+                                        Text(h.snippet).font(.subheadline).lineLimit(3)
+                                        if !h.note.isEmpty {
+                                            Text(h.note).font(.caption).foregroundStyle(Theme.accent)
+                                        }
+                                    }
+                                }
+                            }
+                            .swipeActions {
+                                Button(role: .destructive) { hls.remove(h.id) } label: { Label("Удалить", systemImage: "trash") }
+                                Button {
+                                    noteFor = NoteRequest(title: h.snippet, initial: h.note) { hls.setNote(h.id, $0) }
+                                } label: { Label("Заметка", systemImage: "note.text") }
+                                .tint(.orange)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(titleName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+            }
+            .sheet(item: $noteFor) { r in
+                NoteSheet(title: r.title, initial: r.initial, onSave: r.save)
+            }
+        }
+    }
+}
+
+/// Поиск по тексту открытой главы (ранобэ, постраничный режим).
+struct ChapterSearchSheet: View {
+    let pages: [NovelPage]
+    let onPick: (Int) -> Void
+    @State private var query = ""
+    @Environment(\.dismiss) private var dismiss
+
+    struct Hit: Identifiable {
+        let id: Int
+        let page: Int
+        let snippet: String
+    }
+
+    private func search(_ q: String) -> [Hit] {
+        let needle = q.trimmingCharacters(in: .whitespaces)
+        guard needle.count >= 2 else { return [] }
+        var out: [Hit] = []
+        for (i, p) in pages.enumerated() {
+            let s = p.plainText as NSString
+            guard s.length > 0 else { continue }
+            var from = 0
+            while from < s.length, out.count < 300 {
+                let r = s.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive],
+                                range: NSRange(location: from, length: s.length - from))
+                if r.location == NSNotFound { break }
+                let a = max(0, r.location - 30)
+                let b = min(s.length, NSMaxRange(r) + 50)
+                let snip = s.substring(with: NSRange(location: a, length: b - a))
+                    .replacingOccurrences(of: "\n", with: " ")
+                out.append(Hit(id: out.count, page: i,
+                               snippet: (a > 0 ? "…" : "") + snip + (b < s.length ? "…" : "")))
+                from = NSMaxRange(r)
+            }
+        }
+        return out
+    }
+
+    var body: some View {
+        let hits = search(query)
+        NavigationStack {
+            List {
+                if query.trimmingCharacters(in: .whitespaces).count < 2 {
+                    Text("Введи слово или фразу (от 2 букв).").foregroundStyle(.secondary)
+                } else if hits.isEmpty {
+                    Text("В этой главе ничего не найдено.").foregroundStyle(.secondary)
+                }
+                ForEach(hits) { h in
+                    Button {
+                        dismiss()
+                        onPick(h.page)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Страница \(h.page + 1)").font(.caption).foregroundStyle(Theme.accent)
+                            Text(h.snippet).font(.subheadline).lineLimit(3)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Поиск по главе")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Слово или фраза")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+            }
+        }
+    }
+}
+
+// MARK: - Похожие тайтлы
+@MainActor
+final class SimilarViewModel: ObservableObject {
+    @Published var similar: [Anime] = []
+    @Published var related: [Anime] = []
+    @Published var note = ""
+    @Published var loaded = false
+    private var loadedFor: Int?
+
+    func load(_ a: Anime) async {
+        guard loadedFor != a.id, let slug = a.slugUrl else { return }
+        loadedFor = a.id
+        let r = await AnimelibAPI.shared.similarTitles(slug: slug)
+        similar = r.similar
+        related = r.related
+        note = r.note
+        loaded = true
+        ImageLoader.prefetch((r.similar + r.related).compactMap { $0.imageURL })
+    }
+}
+
+struct SimilarSection: View {
+    let anime: Anime
+    @StateObject private var vm = SimilarViewModel()
+
+    private func row(_ title: String, _ list: [Anime]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.title3.bold())
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(Array(list.prefix(20))) { a in
+                        TitleLink(anime: a) { PosterCard(anime: a) }
+                            .buttonStyle(.pressable)
+                    }
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if !vm.related.isEmpty { row("Связанное", vm.related) }
+            if !vm.similar.isEmpty { row("Похожие", vm.similar) }
+            if vm.loaded, vm.related.isEmpty, vm.similar.isEmpty, !vm.note.isEmpty {
+                Text("Похожие: сайт не вернул список (\(vm.note))")
+                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
+        .task(id: anime.id) { await vm.load(anime) }
+    }
+}
+
+// MARK: - Статистика
+struct DayActivity: Codable {
+    var watch: Double = 0
+    var episodes = 0
+    var novels = 0
+    var manga = 0
+}
+
+@MainActor
+final class ActivityStore: ObservableObject {
+    static let shared = ActivityStore()
+    @Published private(set) var days: [String: DayActivity] = [:]
+    private let key = "activity.v1"
+    private var dirty = false
+    private var lastSave = Date.distantPast
+
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    static func dayKey(_ d: Date = Date()) -> String { fmt.string(from: d) }
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([String: DayActivity].self, from: d) { days = v }
+    }
+
+    private func mutate(_ f: (inout DayActivity) -> Void) {
+        let k = Self.dayKey()
+        var d = days[k] ?? DayActivity()
+        f(&d)
+        days[k] = d
+        dirty = true
+        if Date().timeIntervalSince(lastSave) > 30 { flush() }
+    }
+
+    func addWatch(_ seconds: Double) { mutate { $0.watch += seconds } }
+    func addEpisode() { mutate { $0.episodes += 1 } }
+    func addChapter(manga: Bool) {
+        mutate { if manga { $0.manga += 1 } else { $0.novels += 1 } }
+    }
+
+    func flush() {
+        guard dirty else { return }
+        dirty = false
+        lastSave = Date()
+        if let d = try? JSONEncoder().encode(days) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+struct StatsView: View {
+    @ObservedObject private var act = ActivityStore.shared
+    @ObservedObject private var prog = ProgressStore.shared
+    @ObservedObject private var reads = ReadStore.shared
+    @State private var chart = 0
+
+    private struct Bar: Identifiable {
+        let id: String
+        let label: String
+        let value: Double
+    }
+
+    private func lastDays(_ n: Int) -> [(String, Date)] {
+        let cal = Calendar.current
+        var out: [(String, Date)] = []
+        for i in (0..<n).reversed() {
+            if let d = cal.date(byAdding: .day, value: -i, to: Date()) { out.append((ActivityStore.dayKey(d), d)) }
+        }
+        return out
+    }
+
+    private func total(_ n: Int, _ f: (DayActivity) -> Double) -> Double {
+        var t = 0.0
+        for (k, _) in lastDays(n) { t += f(act.days[k] ?? DayActivity()) }
+        return t
+    }
+
+    private var streak: Int {
+        let cal = Calendar.current
+        func active(_ d: Date) -> Bool {
+            guard let a = act.days[ActivityStore.dayKey(d)] else { return false }
+            return a.watch > 0 || a.episodes > 0 || a.novels > 0 || a.manga > 0
+        }
+        var day = Date()
+        if !active(day) { day = cal.date(byAdding: .day, value: -1, to: day) ?? day }
+        var n = 0
+        while active(day), n < 3650 {
+            n += 1
+            guard let prev = cal.date(byAdding: .day, value: -1, to: day) else { break }
+            day = prev
+        }
+        return n
+    }
+
+    private var episodesFinished: Int { prog.items.values.filter { $0.finished }.count }
+    private var mangaChapters: Int {
+        reads.read.filter { (Int($0.key) ?? 0) < 0 }.values.reduce(0) { $0 + $1.count }
+    }
+    private var novelChapters: Int {
+        reads.read.filter { (Int($0.key) ?? 0) >= 0 }.values.reduce(0) { $0 + $1.count }
+    }
+    private var totalHours: Double { act.days.values.reduce(0.0) { $0 + $1.watch } / 3600 }
+
+    private func minutes(_ s: Double) -> String {
+        s >= 3600 ? String(format: "%.1f ч", s / 3600) : "\(Int(s / 60)) мин"
+    }
+
+    private func chaptersIn(_ n: Int) -> Int {
+        Int(total(n) { Double($0.novels + $0.manga) })
+    }
+
+    private var bars: [Bar] {
+        let f = DateFormatter()
+        f.dateFormat = "d"
+        var out: [Bar] = []
+        for (k, d) in lastDays(14) {
+            let a = act.days[k] ?? DayActivity()
+            let v = chart == 0 ? a.watch / 60 : Double(a.novels + a.manga)
+            out.append(Bar(id: k, label: f.string(from: d), value: v))
+        }
+        return out
+    }
+
+    private func tile(_ title: String, _ value: String, _ icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Image(systemName: icon).foregroundStyle(Theme.accent)
+            Text(value).font(.title2.bold())
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    var body: some View {
+        let list = bars
+        let maxV = max(list.map { $0.value }.max() ?? 1, 1)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    tile("Дней подряд", "\(streak)", "flame.fill")
+                    tile("Просмотр сегодня", minutes(total(1) { $0.watch }), "play.circle.fill")
+                    tile("Просмотр за неделю", minutes(total(7) { $0.watch }), "calendar")
+                    tile("Просмотр за месяц", minutes(total(30) { $0.watch }), "calendar.badge.clock")
+                    tile("Глав за неделю", "\(chaptersIn(7))", "book.fill")
+                    tile("Глав за месяц", "\(chaptersIn(30))", "books.vertical.fill")
+                    tile("Серий досмотрено", "\(episodesFinished)", "checkmark.circle.fill")
+                    tile("Всего часов", String(format: "%.1f", totalHours), "clock.fill")
+                    tile("Глав манги прочитано", "\(mangaChapters)", "photo.on.rectangle")
+                    tile("Глав ранобэ прочитано", "\(novelChapters)", "text.book.closed.fill")
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("", selection: $chart) {
+                        Text("Просмотр, мин").tag(0)
+                        Text("Чтение, глав").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    HStack(alignment: .bottom, spacing: 5) {
+                        ForEach(list) { b in
+                            VStack(spacing: 4) {
+                                Spacer(minLength: 0)
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(b.value > 0 ? Theme.accent : Theme.chip)
+                                    .frame(height: max(4, CGFloat(b.value / maxV) * 90))
+                                Text(b.label).font(.system(size: 9)).foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .frame(height: 118)
+                }
+                .padding(14)
+                .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+
+                Text("Статистика ведётся с момента обновления до этой версии. Время просмотра считается в родном плеере, веб-плеер Kodik в нём не учитывается.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(14)
+        }
+        .background(AppBackground())
+        .navigationTitle("Статистика")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 // MARK: - App
 @main
 struct HeheApp: App {
     init() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
     }
 
     var body: some Scene {

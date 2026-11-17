@@ -28,6 +28,13 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
+      - name: Enable background audio (needed for Picture in Picture)
+        run: |
+          PL=build/Build/Products/Release-iphoneos/Hehe.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PL"
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PL"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PL"
       - name: Package IPA
         run: |
           mkdir Payload
