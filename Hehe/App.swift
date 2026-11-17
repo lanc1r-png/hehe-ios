@@ -611,11 +611,47 @@ actor AnimelibAPI {
                 }
             }
         }
-        // Подсказка для разбора: как выглядит страница автора на сервере.
+        // Запасной путь: страница автора сама может отдавать список его работ.
         let key = (slug?.isEmpty == false) ? slug! : String(id)
+        if page == 1 {
+            let tries: [(String, [URLQueryItem])] = [
+                ("/people/\(key)", [.init(name: "fields[]", value: "titles")]),
+                ("/people/\(key)", []),
+                ("/people/\(key)/titles", []),
+                ("/people/\(key)/works", []),
+                ("/people/\(key)/\(site.apiPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")))", [])
+            ]
+            for (path, q) in tries {
+                guard let data = try? await rawData(path, query: q), let root = J.obj(data) else { continue }
+                let found = titlesIn(root)
+                if !found.isEmpty { return (found, false) }
+            }
+        }
+        // Подсказка для разбора: как выглядит страница автора на сервере.
         let sample = await rawText("/people/\(key)")
         throw APIError.http(404, "Фильтр по автору не сработал.\n" + log.prefix(12).joined(separator: "; ")
                             + "\n/people/\(key): " + String(sample.prefix(260)))
+    }
+
+    /// Собирает тайтлы из любого ответа: берём объекты внутри массивов, у которых есть id и slug_url.
+    private func titlesIn(_ root: Any) -> [Anime] {
+        var out: [Anime] = []
+        var seen = Set<Int>()
+        func walk(_ v: Any, inArray: Bool) {
+            if let d = v as? [String: Any] {
+                if inArray, J.int(d["id"]) != nil, d["slug_url"] != nil,
+                   let data = try? JSONSerialization.data(withJSONObject: d),
+                   let a = try? decoder.decode(Anime.self, from: data) {
+                    if seen.insert(a.id).inserted { out.append(a) }
+                    return
+                }
+                for x in d.values { walk(x, inArray: false) }
+            } else if let arr = v as? [Any] {
+                for x in arr { walk(x, inArray: true) }
+            }
+        }
+        walk(root, inArray: false)
+        return out
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -2049,6 +2085,7 @@ struct HomeView: View {
     @ObservedObject private var history: HistoryStore = HistoryStore.current
     @ObservedObject private var router = AppRouter.shared
     @State private var query = ""
+    @State private var confirmClear = false
     private let ranobe = LibSite.current.isBook
 
     private func poster(_ list: [Anime]) -> some View {
@@ -2094,20 +2131,40 @@ struct HomeView: View {
                         if !history.items.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
-                                              action: { history.clear() }, actionTitle: "Очистить")
+                                              action: { confirmClear = true }, actionTitle: "Очистить")
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 12) {
                                         ForEach(history.items) { h in
-                                            TitleLink(anime: h.anime) { ContinueCard(item: h) }
-                                                .buttonStyle(.pressable)
-                                                .contextMenu {
-                                                    Button(role: .destructive) { history.remove(h.anime.id) } label: {
-                                                        Label("Убрать", systemImage: "trash")
-                                                    }
+                                            ZStack(alignment: .topTrailing) {
+                                                TitleLink(anime: h.anime) { ContinueCard(item: h) }
+                                                    .buttonStyle(.pressable)
+                                                Button {
+                                                    Haptics.tap()
+                                                    withAnimation(.easeInOut(duration: 0.25)) { history.remove(h.anime.id) }
+                                                } label: {
+                                                    Image(systemName: "xmark.circle.fill")
+                                                        .font(.title3)
+                                                        .symbolRenderingMode(.palette)
+                                                        .foregroundStyle(.white, Color.black.opacity(0.55))
+                                                        .padding(6)
                                                 }
+                                                .buttonStyle(.plain)
+                                            }
+                                            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                                            .contextMenu {
+                                                Button(role: .destructive) { history.remove(h.anime.id) } label: {
+                                                    Label("Убрать из списка", systemImage: "trash")
+                                                }
+                                            }
                                         }
                                     }
                                     .padding(.horizontal, 14)
+                                }
+                                .confirmationDialog("Очистить список?", isPresented: $confirmClear, titleVisibility: .visible) {
+                                    Button("Очистить всё", role: .destructive) {
+                                        withAnimation { history.clear() }
+                                    }
+                                    Button("Отмена", role: .cancel) {}
                                 }
                             }
                         }
@@ -2215,7 +2272,8 @@ struct RootView: View {
         .preferredColorScheme(scheme)
         .onChange(of: router.tab) { _ in Haptics.select() }
         .onChange(of: scenePhase) { phase in
-            if phase == .background || phase == .inactive { BackupManager.writeAuto() }
+            if phase != .active { ProgressStore.shared.flush() }
+            if phase == .background { BackupManager.writeAuto() }
         }
         .task { BackupManager.writeAuto() }
         .overlay(alignment: .top) {
@@ -2666,8 +2724,7 @@ final class AuthorViewModel: ObservableObject {
             if fresh.isEmpty || !r.hasNext { finished = true }
             error = nil
         } catch {
-            finished = true
-            if items.isEmpty { self.error = error.localizedDescription }
+            if items.isEmpty { self.error = error.localizedDescription } else { finished = true }
         }
     }
 }
@@ -2699,8 +2756,12 @@ struct AuthorView: View {
                 .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
 
                 if let e = vm.error {
-                    Text(e).font(.footnote).foregroundStyle(.red)
-                    Button("Повторить") { Task { await vm.loadMore() } }
+                    Text(e).font(.footnote).foregroundStyle(.red).textSelection(.enabled)
+                    HStack(spacing: 16) {
+                        Button("Повторить") { Task { await vm.loadMore() } }
+                        Button("Скопировать текст ошибки") { UIPasteboard.general.string = e }
+                    }
+                    .font(.footnote)
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { a in
@@ -2993,7 +3054,19 @@ final class ProgressStore: ObservableObject {
         save()
     }
 
+    private var dirty = false
+    private var lastSave = Date.distantPast
+
     private func save() {
+        dirty = true
+        if Date().timeIntervalSince(lastSave) >= 20 { flush() }
+    }
+
+    /// Записывает накопленное на диск (вызывается при сворачивании и выходе из плеера).
+    func flush() {
+        guard dirty else { return }
+        dirty = false
+        lastSave = Date()
         if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
     }
 }
@@ -3296,6 +3369,8 @@ final class PlayerViewModel: ObservableObject {
     private var lastQualityTitle: String?
     var autoNative = true
     var onEnd: (() -> Void)?
+    var onWatched: (() -> Void)?
+    private var watchedFired = false
     private var endObserver: NSObjectProtocol?
     var episodeID = 0
     var lastPosition: Double = 0
@@ -3316,6 +3391,7 @@ final class PlayerViewModel: ObservableObject {
         showWeb = false; note = nil; debug = ""; sourceNote = ""
         playbackError = nil; lastWebStream = nil; statusObs = nil
         stopped = false
+        watchedFired = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
@@ -3481,6 +3557,7 @@ final class PlayerViewModel: ObservableObject {
             let t = p.currentTime().seconds
             let d = p.currentItem?.duration.seconds ?? 0
             if t.isFinite, d.isFinite, d > 0 { ProgressStore.shared.update(episodeID, position: t, duration: d) }
+            if t.isFinite { markWatched(t) }
             if p !== player { p.pause() }
         }
         fsPlayer = nil
@@ -3512,6 +3589,7 @@ final class PlayerViewModel: ObservableObject {
                 guard pos.isFinite, pos > 1 else { return }
                 self?.lastPosition = pos
                 ProgressStore.shared.update(id, position: pos, duration: dur.isFinite ? dur : 0)
+                self?.markWatched(pos)
             }
         }
         observedPlayer = p
@@ -3547,7 +3625,17 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
-    func stop() { savePosition(); stopped = true; detachObserver(); player?.pause(); player = nil }
+    /// Серия считается начатой после 20 секунд просмотра, а не после простого открытия.
+    func markWatched(_ pos: Double) {
+        guard !watchedFired, pos >= 20 else { return }
+        watchedFired = true
+        onWatched?()
+    }
+
+    func stop() {
+        savePosition(); stopped = true; detachObserver(); player?.pause(); player = nil
+        ProgressStore.shared.flush()
+    }
 }
 
 struct PlayerScreen: View {
@@ -3735,9 +3823,15 @@ struct PlayerScreen: View {
             }
         }
         .task(id: current.id) {
-            if let a = anime { HistoryStore.shared.record(anime: a, episode: current) }
+            let ep = current
+            vm.onWatched = { if let a = anime { HistoryStore.shared.record(anime: a, episode: ep) } }
             vm.onEnd = { go(nextEpisode) }
-            await vm.load(episodeID: current.id)
+            await vm.load(episodeID: ep.id)
+            // Веб-плеер не сообщает позицию: считаем просмотром 45 секунд на экране серии.
+            if vm.player == nil, vm.error == nil, vm.current != nil {
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+                if !Task.isCancelled, vm.player == nil { vm.onWatched?() }
+            }
         }
         .fullScreenCover(isPresented: $vm.showNative, onDismiss: { vm.closeNative() }) {
             ZStack(alignment: .topLeading) {
@@ -3879,6 +3973,8 @@ struct CommentItem: Identifiable {
     let created: String
     let replyCount: Int
     let replies: [CommentItem]
+    /// Номер страницы главы, к которой написан комментарий (если сайт его сообщает).
+    let page: Int?
 
     init?(_ d: [String: Any], extra: [CommentItem] = []) {
         guard let cid = J.int(d["id"]) else { return nil }
@@ -3893,6 +3989,7 @@ struct CommentItem: Identifiable {
         down = J.int(votes?["down"]) ?? J.int(d["dislikes_count"]) ?? 0
         date = J.date(J.str(d["created_at"]) ?? J.str(d["date"]))
         created = J.str(d["created_at"]) ?? J.str(d["date"]) ?? ""
+        page = J.int(d["post_page"]) ?? J.int(d["chapter_page"])
         let rawReplies = (d["replies"] as? [[String: Any]])
             ?? (d["children"] as? [[String: Any]])
             ?? (d["comments"] as? [[String: Any]]) ?? []
@@ -3956,6 +4053,8 @@ final class CommentsViewModel: ObservableObject {
     @Published var loadingReplies: Set<Int> = []
     @Published var repliesLoaded: [Int: [CommentItem]] = [:]
     @Published var replyTarget: CommentItem?
+    @Published var sampleKeys = ""
+    var postPage: Int?
 
     @Published var sort: CommentSort = .new
     let animeID: Int
@@ -4004,6 +4103,11 @@ final class CommentsViewModel: ObservableObject {
                 let data = try await AnimelibAPI.shared.rawData(path, query: query, token: AuthStore.shared.token)
                 guard let root = J.obj(data) else { continue }
                 let list = CommentParser.parse(root)
+                if sampleKeys.isEmpty {
+                    var raw: [[String: Any]] = []
+                    CommentParser.collect(root, into: &raw)
+                    if let f = raw.first { sampleKeys = f.keys.sorted().joined(separator: ", ") }
+                }
                 let meta = (root as? [String: Any])?["meta"] as? [String: Any]
                 if let used = query.first(where: { $0.name == "post_type" })?.value, types.count > 1 {
                     types = [used]
@@ -4044,6 +4148,11 @@ final class CommentsViewModel: ObservableObject {
         }
     }
 
+    func loadAll(max: Int = 10) async {
+        var n = 0
+        while !finished && n < max { await loadMore(); n += 1 }
+    }
+
     func reload() async {
         items = []
         repliesLoaded = [:]
@@ -4057,6 +4166,7 @@ final class CommentsViewModel: ObservableObject {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
         var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": type]
         if let p = parent { base["parent_comment"] = p }
+        if let pp = postPage { base["post_page"] = pp }
         var alt = base
         alt["is_spoiler"] = false
         alt["attachments"] = [Any]()
@@ -4247,10 +4357,11 @@ struct CommentSortMenu: View {
 
 struct CommentsList: View {
     @ObservedObject var vm: CommentsViewModel
+    var filter: ((CommentItem) -> Bool)? = nil
 
     var body: some View {
         LazyVStack(spacing: 10) {
-            ForEach(vm.sorted) { c in
+            ForEach(filter.map { vm.sorted.filter($0) } ?? vm.sorted) { c in
                 CommentRow(c: c, vm: vm)
                     .onAppear {
                         if c.id == vm.items.last?.id { Task { await vm.loadMore() } }
@@ -6380,34 +6491,90 @@ struct MangaPageView: View {
 struct ChapterCommentsView: View {
     let novel: Anime
     let chapter: NovelChapter
+    let pageCount: Int
+    @State private var page: Int
+    @State private var wholeChapter = false
     @StateObject private var vm: CommentsViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var showCompose = false
 
-    init(novel: Anime, chapter: NovelChapter) {
+    init(novel: Anime, chapter: NovelChapter, page: Int = 1, pageCount: Int = 0) {
         self.novel = novel
         self.chapter = chapter
+        self.pageCount = pageCount
+        _page = State(initialValue: max(page, 1))
         _vm = StateObject(wrappedValue: CommentsViewModel(animeID: chapter.id, slug: novel.slugUrl ?? String(novel.id),
                                                           postType: "chapter"))
     }
 
+    private var hasPages: Bool { vm.items.contains { $0.page != nil } }
+    private var perPage: Bool { !wholeChapter && hasPages }
+    private var onPage: [CommentItem] { vm.items.filter { $0.page == page } }
+
+    private func syncPostPage() { vm.postPage = perPage ? page : nil }
+
+    private var pageBar: some View {
+        VStack(spacing: 8) {
+            Picker("", selection: $wholeChapter) {
+                Text("Эта страница").tag(false)
+                Text("Вся глава").tag(true)
+            }
+            .pickerStyle(.segmented)
+            if !wholeChapter && hasPages {
+                HStack {
+                    Button { page = max(1, page - 1) } label: { Image(systemName: "chevron.left") }
+                        .disabled(page <= 1)
+                    Spacer()
+                    Text("Страница \(page)" + (pageCount > 0 ? " из \(pageCount)" : "") + " · комментариев: \(onPage.count)")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button { page = pageCount > 0 ? min(pageCount, page + 1) : page + 1 } label: { Image(systemName: "chevron.right") }
+                        .disabled(pageCount > 0 && page >= pageCount)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
     var body: some View {
         NavigationStack {
-            ScrollView { CommentsList(vm: vm).padding(14) }
-                .background(AppBackground())
-                .navigationTitle("Глава \(chapter.number)")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        HStack(spacing: 12) {
-                            CommentSortMenu(vm: vm)
-                            Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+            VStack(spacing: 0) {
+                pageBar
+                ScrollView {
+                    VStack(spacing: 10) {
+                        if perPage {
+                            CommentsList(vm: vm, filter: { $0.page == page })
+                            if onPage.isEmpty && !vm.isLoading {
+                                Text("К этой странице комментариев нет").foregroundStyle(.secondary).padding(.top, 30)
+                            }
+                        } else {
+                            CommentsList(vm: vm)
+                            if !vm.items.isEmpty && !hasPages && !vm.isLoading {
+                                Text("Сайт не передаёт номера страниц у комментариев, поэтому показана вся глава. Поля комментария: \(vm.sampleKeys)")
+                                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
                         }
                     }
+                    .padding(14)
                 }
-                .commentSheets(vm, showCompose: $showCompose)
-                .task { await vm.loadMore() }
+            }
+            .background(AppBackground())
+            .navigationTitle("Глава \(chapter.number)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 12) {
+                        CommentSortMenu(vm: vm)
+                        Button { syncPostPage(); showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                    }
+                }
+            }
+            .commentSheets(vm, showCompose: $showCompose)
+            .task { await vm.loadAll(); syncPostPage() }
+            .onChange(of: page) { _ in syncPostPage() }
+            .onChange(of: wholeChapter) { _ in syncPostPage() }
         }
     }
 }
@@ -6545,6 +6712,7 @@ struct MangaReaderView: View {
     @State private var chromeHidden = false
     @State private var current = 0
     @State private var scrollPage = 0
+    @State private var historyTask: Task<Void, Never>?
     @State private var showComments = false
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
@@ -6820,12 +6988,26 @@ struct MangaReaderView: View {
                                 detected: autoVertical ? "лента" : "страницы")
         }
         .sheet(isPresented: $showComments) {
-            if let c = chapter { ChapterCommentsView(novel: novel, chapter: c) }
+            if let c = chapter {
+                ChapterCommentsView(novel: novel, chapter: c,
+                                    page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count)
+            }
         }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             preloadTask?.cancel()
+            historyTask?.cancel()
+        }
+    }
+
+    private func scheduleHistory(_ ch: NovelChapter) {
+        historyTask?.cancel()
+        let n = novel
+        historyTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            HistoryStore.current.recordChapter(anime: n, chapterID: ch.id, title: ch.title)
         }
     }
 
@@ -6838,7 +7020,7 @@ struct MangaReaderView: View {
         current = 0
         scrollPage = 0
         ReadStore.shared.mark(novel.readKey, ch.id)
-        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        scheduleHistory(ch)
         do {
             let result = try await MangaService.pages(slug: slug, chapter: ch)
             if Task.isCancelled { return }
@@ -7059,6 +7241,7 @@ struct NovelReaderView: View {
     @AppStorage("reader.serif") private var serif = true
     @AppStorage("reader.lh") private var lineGap = 0.4
     @AppStorage("novel.mode") private var mode = "pages"
+    @State private var historyTask: Task<Void, Never>?
     @AppStorage("novel.anim") private var novelAnim = "book"
     @State private var pages: [NovelPage] = []
     @State private var pageIndex = 0
@@ -7403,7 +7586,20 @@ struct NovelReaderView: View {
         }
         .preferredColorScheme(activeTheme == "dark" ? .dark : .light)
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
-        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+            historyTask?.cancel()
+        }
+    }
+
+    private func scheduleHistory(_ ch: NovelChapter) {
+        historyTask?.cancel()
+        let n = novel
+        historyTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            HistoryStore.current.recordChapter(anime: n, chapterID: ch.id, title: ch.title)
+        }
     }
 
     private func load() async {
@@ -7416,7 +7612,7 @@ struct NovelReaderView: View {
         pages = []
         pageIndex = 0
         ReadStore.shared.mark(novel.readKey, ch.id)
-        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
+        scheduleHistory(ch)
         if let local = store.blocks(novel: novel.id, chapter: ch.id) {
             blocks = local
             loading = false
