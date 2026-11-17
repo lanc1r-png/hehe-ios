@@ -1575,7 +1575,7 @@ struct FavoritesView: View {
 enum BackupManager {
     private static let prefixes = ["favorites", "history", "progress", "read", "search.", "set.",
                                    "accent.", "reader.", "manga.", "novel.", "off.",
-                                   "activity", "bookmarks", "highlights", "favmeta", "fav."]
+                                   "activity", "bookmarks", "highlights", "favmeta", "fav.", "friends"]
 
     private static func allowed(_ key: String) -> Bool {
         prefixes.contains { key.hasPrefix($0) }
@@ -5440,6 +5440,502 @@ struct BookmarkSheet: View {
     }
 }
 
+// MARK: - Друзья
+struct Friend: Identifiable, Hashable, Codable {
+    let id: Int
+    var username: String
+    var avatar: URL?
+    var cover: URL?
+    var online: Bool?
+    var lastSeen: Date?
+    var level: Int?
+    var streak: Int?
+    var premium = false
+
+    var statusText: String {
+        if online == true { return "в сети" }
+        if let d = lastSeen {
+            let f = RelativeDateTimeFormatter()
+            f.locale = Locale(identifier: "ru_RU")
+            f.unitsStyle = .short
+            return "был(а) " + f.localizedString(for: d, relativeTo: Date())
+        }
+        return ""
+    }
+
+    /// Дополняем пустые поля данными из другой записи.
+    mutating func merge(_ o: Friend) {
+        if avatar == nil { avatar = o.avatar }
+        if cover == nil { cover = o.cover }
+        if online == nil { online = o.online }
+        if lastSeen == nil { lastSeen = o.lastSeen }
+        if level == nil { level = o.level }
+        if streak == nil { streak = o.streak }
+        premium = premium || o.premium
+    }
+}
+
+enum FriendParser {
+    static func date(_ v: Any?) -> Date? {
+        guard let s = v as? String, !s.isEmpty else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        if let d = f.date(from: s) { return d }
+        return parseLibDate(s)
+    }
+
+    /// Запись о друге может быть самим пользователем или обёрткой с вложенным user.
+    static func friend(_ d: [String: Any]) -> Friend? {
+        var cands: [[String: Any]] = [d]
+        for v in d.values { if let sub = v as? [String: Any] { cands.append(sub) } }
+        for c in cands {
+            guard let id = J.int(c["id"]), let name = J.str(c["username"]) ?? J.str(c["name"]) else { continue }
+            var online = (c["is_online"] as? Bool) ?? (c["online"] as? Bool)
+            var seen: Date?
+            for k in ["last_online_at", "last_seen_at", "last_online", "last_activity_at", "last_seen"] {
+                if let dt = date(c[k]) { seen = dt; break }
+            }
+            if online == nil, let sn = seen { online = Date().timeIntervalSince(sn) < 300 }
+            let st = c["login_streak"] as? [String: Any]
+            return Friend(id: id, username: name, avatar: J.url(c["avatar"]),
+                          cover: AuthStore.coverURL(c), online: online, lastSeen: seen,
+                          level: J.int(c["level"]) ?? J.int((c["user_level"] as? [String: Any])?["level"]),
+                          streak: J.int(st?["login_streak"]) ?? J.int(c["login_streak"]),
+                          premium: ((c["premium"] as? [String: Any])?["enabled"] as? Bool) ?? false)
+        }
+        return nil
+    }
+
+    static func detail(id: Int, token: String?) async -> Friend? {
+        guard let data = try? await AnimelibAPI.shared.rawData("/user/\(id)", token: token),
+              let root = J.obj(data) as? [String: Any] else { return nil }
+        let d = (root["data"] as? [String: Any]) ?? root
+        return friend(d)
+    }
+
+    /// Достаёт id из числа или ссылки вида …/user/123 или …/user/123-name.
+    static func userID(from text: String) -> Int? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let n = Int(t) { return n }
+        guard let r = t.range(of: "/user/") else { return nil }
+        let digits = t[r.upperBound...].prefix { $0.isNumber }
+        return Int(digits)
+    }
+}
+
+@MainActor
+final class LocalFriends: ObservableObject {
+    static let shared = LocalFriends()
+    @Published private(set) var items: [Friend] = []
+    private let key = "friends.local.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([Friend].self, from: d) { items = v }
+    }
+
+    func contains(_ id: Int) -> Bool { items.contains { $0.id == id } }
+
+    func toggle(_ f: Friend) {
+        if let i = items.firstIndex(where: { $0.id == f.id }) { items.remove(at: i) } else { items.insert(f, at: 0) }
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+@MainActor
+final class FriendsViewModel: ObservableObject {
+    @Published var friends: [Friend] = []
+    @Published var isLoading = false
+    @Published var loaded = false
+    @Published var debug = ""
+
+    private func parseList(_ data: Data) -> [Friend]? {
+        guard let root = J.obj(data) else { return nil }
+        var arr: [[String: Any]]?
+        if let o = root as? [String: Any] {
+            arr = o["data"] as? [[String: Any]]
+            if arr == nil, let inner = o["data"] as? [String: Any] {
+                arr = (inner["items"] as? [[String: Any]]) ?? (inner["friends"] as? [[String: Any]])
+            }
+            if arr == nil { arr = o["friends"] as? [[String: Any]] }
+        } else if let a = root as? [[String: Any]] {
+            arr = a
+        }
+        return arr?.compactMap { FriendParser.friend($0) }
+    }
+
+    func load(userID: Int, token: String) async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false; loaded = true }
+        let uid = String(userID)
+        let candidates: [(String, [URLQueryItem])] = [
+            ("/user/\(uid)/friends", []),
+            ("/friends", [URLQueryItem(name: "user_id", value: uid)]),
+            ("/user/friends", []),
+            ("/friends", []),
+            ("/social/friends", [URLQueryItem(name: "user_id", value: uid)])
+        ]
+        var log: [String] = []
+        var result: [Friend]?
+        var usedPath: (String, [URLQueryItem])?
+        for (path, q) in candidates {
+            do {
+                let data = try await AnimelibAPI.shared.rawData(path, query: q, token: token)
+                if let list = parseList(data) {
+                    result = list
+                    usedPath = (path, q)
+                    break
+                }
+                log.append("\(path): ответ без списка")
+            } catch APIError.http(let code, _) {
+                log.append("\(path): HTTP \(code)")
+            } catch {
+                log.append("\(path): сбой")
+            }
+        }
+        var all = result ?? []
+        if let (path, q) = usedPath, !all.isEmpty {
+            var page = 2
+            while page <= 6 {
+                let qq = q + [URLQueryItem(name: "page", value: String(page))]
+                guard let data = try? await AnimelibAPI.shared.rawData(path, query: qq, token: token),
+                      let more = parseList(data) else { break }
+                let known = Set(all.map { $0.id })
+                let fresh = more.filter { !known.contains($0.id) }
+                if fresh.isEmpty { break }
+                all += fresh
+                page += 1
+            }
+        }
+        for l in LocalFriends.shared.items where !all.contains(where: { $0.id == l.id }) { all.append(l) }
+        friends = all
+        debug = result == nil ? log.joined(separator: "\n") : ""
+        await enrich(token: token)
+    }
+
+    /// Если список не сообщил, кто в сети, спрашиваем профили по одному.
+    private func enrich(token: String) async {
+        let need = friends.filter { $0.online == nil }.prefix(40).map { $0.id }
+        var i = 0
+        while i < need.count {
+            let chunk = Array(need[i..<min(i + 4, need.count)])
+            i += 4
+            await withTaskGroup(of: Friend?.self) { group in
+                for id in chunk { group.addTask { await FriendParser.detail(id: id, token: token) } }
+                for await d in group {
+                    guard let d, let idx = friends.firstIndex(where: { $0.id == d.id }) else { continue }
+                    friends[idx].merge(d)
+                }
+            }
+        }
+    }
+
+    var sorted: [Friend] {
+        friends.sorted { a, b in
+            if (a.online == true) != (b.online == true) { return a.online == true }
+            if let x = a.lastSeen, let y = b.lastSeen, x != y { return x > y }
+            return a.username.localizedCaseInsensitiveCompare(b.username) == .orderedAscending
+        }
+    }
+}
+
+struct StatusDot: View {
+    let online: Bool?
+    var size: CGFloat = 14
+
+    var body: some View {
+        if let o = online {
+            Circle().fill(o ? Color.green : Color.gray.opacity(0.7))
+                .frame(width: size, height: size)
+                .overlay(Circle().stroke(Theme.base, lineWidth: 2.5))
+        }
+    }
+}
+
+struct FriendsView: View {
+    let userID: Int
+    @StateObject private var vm = FriendsViewModel()
+    @ObservedObject private var auth = AuthStore.shared
+    @State private var search = ""
+    @State private var manual = ""
+    @State private var manualMsg = ""
+    @State private var opened: Friend?
+    @State private var pushOpened = false
+
+    private var shown: [Friend] {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        let list = vm.sorted
+        return q.isEmpty ? list : list.filter { $0.username.localizedCaseInsensitiveContains(q) }
+    }
+
+    private func row(_ f: Friend) -> some View {
+        NavigationLink(value: f) {
+            HStack(spacing: 12) {
+                AnimatedRemoteImage(url: f.avatar, maxPixel: 200)
+                    .frame(width: 52, height: 52)
+                    .clipShape(Circle())
+                    .overlay(alignment: .bottomTrailing) { StatusDot(online: f.online).offset(x: 2, y: 2) }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(f.username).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    if !f.statusText.isEmpty {
+                        Text(f.statusText)
+                            .font(.caption)
+                            .foregroundStyle(f.online == true ? Color.green : Color.secondary)
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
+        }
+        .buttonStyle(.pressable)
+    }
+
+    private func openManual() async {
+        guard let id = FriendParser.userID(from: manual) else {
+            manualMsg = "Не понял. Вставь ссылку вида …/user/123 или просто число."
+            return
+        }
+        manualMsg = "Ищу…"
+        if let f = await FriendParser.detail(id: id, token: auth.token) {
+            manualMsg = ""
+            opened = f
+            pushOpened = true
+        } else {
+            manualMsg = "Пользователь не найден или профиль закрыт."
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 10) {
+                let online = vm.friends.filter { $0.online == true }.count
+                if !vm.friends.isEmpty {
+                    HStack {
+                        Text("\(vm.friends.count) друзей").font(.footnote).foregroundStyle(.secondary)
+                        if online > 0 {
+                            Label("\(online) в сети", systemImage: "circle.fill")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Color.green)
+                                .labelStyle(.titleAndIcon)
+                        }
+                        Spacer()
+                    }
+                }
+                if vm.isLoading && vm.friends.isEmpty { ProgressView().padding(.top, 30) }
+                ForEach(shown) { row($0) }
+                if vm.loaded && vm.friends.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "person.2.slash").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("Список друзей не загрузился").font(.subheadline.weight(.semibold))
+                        Text("Можно открыть профиль друга по ссылке ниже и добавить его в свой список прямо в приложении.")
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        if !vm.debug.isEmpty {
+                            Text("Пришли этот текст разработчику:\n" + vm.debug)
+                                .font(.system(size: 9, design: .monospaced))
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 24)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Открыть профиль по ссылке или ID").font(.footnote.weight(.semibold))
+                    HStack {
+                        TextField("https://…/user/123", text: $manual)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .padding(10)
+                            .background(Theme.chip, in: RoundedRectangle(cornerRadius: 12))
+                        Button { Task { await openManual() } } label: {
+                            Image(systemName: "arrow.right.circle.fill").font(.title2).foregroundStyle(Theme.accent)
+                        }
+                    }
+                    if !manualMsg.isEmpty { Text(manualMsg).font(.caption).foregroundStyle(.secondary) }
+                }
+                .padding(14)
+                .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+                .padding(.top, 8)
+            }
+            .padding(14)
+        }
+        .background(AppBackground())
+        .navigationTitle("Друзья")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $search, prompt: "Поиск среди друзей")
+        .refreshable { if let t = auth.token { await vm.load(userID: userID, token: t) } }
+        .task {
+            if vm.friends.isEmpty, let t = auth.token { await vm.load(userID: userID, token: t) }
+        }
+        .navigationDestination(for: Friend.self) { FriendProfileView(friend: $0) }
+        .navigationDestination(isPresented: $pushOpened) {
+            if let f = opened { FriendProfileView(friend: f) }
+        }
+    }
+}
+
+struct FriendProfileView: View {
+    @State var friend: Friend
+    @StateObject private var vm = ProfileViewModel()
+    @ObservedObject private var auth = AuthStore.shared
+    @ObservedObject private var local = LocalFriends.shared
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+
+    private func folderIcon(_ name: String) -> String {
+        let n = name.lowercased()
+        if n.contains("любим") { return "heart.fill" }
+        if n.contains("смотрю") || n.contains("читаю") { return "play.circle.fill" }
+        if n.contains("план") { return "calendar" }
+        if n.contains("просмотр") || n.contains("прочитан") { return "checkmark.circle.fill" }
+        if n.contains("брош") { return "xmark.circle.fill" }
+        if n.contains("отлож") { return "pause.circle.fill" }
+        if n.contains("не нрав") { return "hand.thumbsdown.fill" }
+        return "bookmark.fill"
+    }
+
+    private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
+        Label(text, systemImage: icon)
+            .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .foregroundStyle(tint)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private var header: some View {
+        VStack(spacing: 0) {
+            Group {
+                if let c = friend.cover {
+                    AnimatedRemoteImage(url: c, maxPixel: 900)
+                } else {
+                    LinearGradient(colors: [Theme.accent.opacity(0.55), Theme.accent.opacity(0.15)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                }
+            }
+            .frame(height: 130)
+            .clipped()
+            .overlay(alignment: .bottom) {
+                LinearGradient(colors: [.clear, Theme.base.opacity(0.85)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 60)
+            }
+
+            AnimatedRemoteImage(url: friend.avatar, maxPixel: 360)
+                .frame(width: 88, height: 88)
+                .clipShape(RoundedRectangle(cornerRadius: 22))
+                .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.base, lineWidth: 4))
+                .overlay(alignment: .topTrailing) { StatusDot(online: friend.online, size: 18).offset(x: 6, y: -6) }
+                .padding(.top, -44)
+
+            VStack(spacing: 10) {
+                Text(friend.username).font(.title2.bold())
+                if !friend.statusText.isEmpty {
+                    Text(friend.statusText)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(friend.online == true ? Color.green : Color.secondary)
+                }
+                if friend.premium {
+                    Label("Premium", systemImage: "crown.fill").font(.caption.bold()).foregroundStyle(.yellow)
+                }
+                HStack(spacing: 8) {
+                    if let st = friend.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
+                    if let lv = friend.level { stat("star.fill", .yellow, "Уровень \(lv)") }
+                    if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
+                }
+                Button {
+                    Haptics.tap()
+                    local.toggle(friend)
+                } label: {
+                    Label(local.contains(friend.id) ? "В моём списке друзей" : "Добавить в свой список",
+                          systemImage: local.contains(friend.id) ? "checkmark.circle.fill" : "person.badge.plus")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(local.contains(friend.id) ? AnyShapeStyle(Theme.chip) : AnyShapeStyle(Theme.accent), in: Capsule())
+                        .foregroundStyle(local.contains(friend.id) ? Color.primary : Color.white)
+                }
+                .buttonStyle(.pressable)
+            }
+            .padding(.top, 10)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 16)
+        }
+        .frame(maxWidth: .infinity)
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.chip))
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                header
+
+                if !vm.folders.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 10)], spacing: 10) {
+                        ForEach(vm.folders) { f in
+                            Button { Task { await vm.select(f.id) } } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Image(systemName: folderIcon(f.name)).font(.subheadline)
+                                        Spacer()
+                                        Text(f.count.map(String.init) ?? "").font(.title3.bold())
+                                    }
+                                    Text(f.name).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(f.id == vm.selected ? Color.white : Color.primary)
+                                .background(
+                                    f.id == vm.selected
+                                        ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.6)],
+                                                                       startPoint: .topLeading, endPoint: .bottomTrailing))
+                                        : AnyShapeStyle(Material.ultraThinMaterial),
+                                    in: RoundedRectangle(cornerRadius: 16))
+                                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
+                            }
+                            .buttonStyle(.pressable)
+                        }
+                    }
+                }
+
+                if let e = vm.error {
+                    Text("Списки недоступны: \(e)").font(.footnote).foregroundStyle(.orange)
+                }
+                LazyVGrid(columns: columns, spacing: 18) {
+                    ForEach(vm.items) { anime in
+                        TitleLink(anime: anime) { AnimeCard(anime: anime) }
+                            .buttonStyle(.pressable)
+                            .onAppear {
+                                if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
+                            }
+                    }
+                }
+                if vm.isLoading { ProgressView() }
+                if vm.items.isEmpty && !vm.isLoading && vm.error == nil {
+                    Text("В этом списке пока ничего нет или он скрыт").foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(14)
+        }
+        .background(AppBackground())
+        .navigationTitle(friend.username)
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if let t = auth.token {
+                if let d = await FriendParser.detail(id: friend.id, token: t) { friend.merge(d) }
+                vm.configure(userID: friend.id, token: t)
+                await vm.loadFolders()
+            }
+        }
+    }
+}
+
 struct ProfileView: View {
     @ObservedObject private var auth = AuthStore.shared
     @StateObject private var vm = ProfileViewModel()
@@ -5513,6 +6009,16 @@ struct ProfileView: View {
                                     if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
                                     if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
                                 }
+                                NavigationLink {
+                                    FriendsView(userID: u.id)
+                                } label: {
+                                    Label("Друзья", systemImage: "person.2.fill")
+                                        .font(.footnote.weight(.semibold))
+                                        .padding(.horizontal, 16).padding(.vertical, 9)
+                                        .background(Theme.accent, in: Capsule())
+                                        .foregroundStyle(.white)
+                                }
+                                .buttonStyle(.pressable)
                                 Button("Выйти") { auth.signOut() }
                                     .font(.footnote)
                                     .foregroundStyle(.red)
