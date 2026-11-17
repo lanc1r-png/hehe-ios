@@ -2757,7 +2757,7 @@ struct RootView: View {
         .preferredColorScheme(scheme)
         .onChange(of: router.tab) { _ in Haptics.select() }
         .onChange(of: scenePhase) { phase in
-            if phase != .active { ProgressStore.shared.flush() }
+            if phase != .active { ProgressStore.shared.flush(); ActivityStore.shared.flush() }
             if phase == .background { BackupManager.writeAuto() }
             if phase == .active, let d = BackupManager.externalCopyDate() {
                 foundText = d.formatted(date: .abbreviated, time: .shortened)
