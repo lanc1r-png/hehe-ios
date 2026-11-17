@@ -259,9 +259,13 @@ struct Cover: Codable, Hashable {
 
 struct RatingBox: Decodable {
     let average: String?
-    enum K: String, CodingKey { case average }
+    let votes: Int?
+    enum K: String, CodingKey { case average, votes }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
+        if let v = try? c.decode(Int.self, forKey: .votes) { votes = v }
+        else if let sv = try? c.decode(String.self, forKey: .votes), let v = Int(sv) { votes = v }
+        else { votes = nil }
         if let s = try? c.decode(String.self, forKey: .average) { average = s }
         else if let x = try? c.decode(Double.self, forKey: .average) { average = String(format: "%.1f", x) }
         else { average = nil }
@@ -283,6 +287,7 @@ struct Anime: Codable, Identifiable, Hashable {
     let otherNames: [String]?
     let episodesCount: Int?
     let rateAvg: String?
+    let rateVotes: Int?
     let status: NamedItem?
     let type: NamedItem?
     let ageRestriction: NamedItem?
@@ -292,9 +297,16 @@ struct Anime: Codable, Identifiable, Hashable {
         if let r = rusName, !r.isEmpty { return r }
         return name ?? engName ?? "Без названия"
     }
+    /// Для карточек. У манги и ранобэ миниатюра слишком мелкая и выглядит пиксельной, берём средний размер.
     var imageURL: URL? {
-        let s = cover?.thumbnail ?? cover?.md ?? cover?.default
+        let s = LibSite.current.isBook
+            ? (cover?.md ?? cover?.default ?? cover?.thumbnail)
+            : (cover?.thumbnail ?? cover?.md ?? cover?.default)
         return s.flatMap(URL.init(string:))
+    }
+    /// Для крупной обложки на странице тайтла.
+    var largeImageURL: URL? {
+        (cover?.default ?? cover?.md ?? cover?.thumbnail).flatMap(URL.init(string:))
     }
 
     enum CodingKeys: String, CodingKey {
@@ -326,6 +338,8 @@ struct Anime: Codable, Identifiable, Hashable {
         type = try? c.decode(NamedItem.self, forKey: .type)
         ageRestriction = try? c.decode(NamedItem.self, forKey: .ageRestriction)
         releaseDateString = try? c.decode(String.self, forKey: .releaseDateString)
+        rateVotes = (try? decoder.container(keyedBy: RatingKeys.self))
+            .flatMap { try? $0.decode(RatingBox.self, forKey: .rating) }?.votes
         if let s = try? c.decode(String.self, forKey: .rateAvg) { rateAvg = s }
         else if let d = try? c.decode(Double.self, forKey: .rateAvg) { rateAvg = String(format: "%.1f", d) }
         else if let rc = try? decoder.container(keyedBy: RatingKeys.self),
@@ -558,6 +572,28 @@ actor AnimelibAPI {
             }
         }
         throw lastError
+    }
+
+    /// «По рейтингу» без тайтлов с парой оценок: иначе наверх попадает всё, что оценили один-два человека на десятку.
+    func catalogRated(filter: CatalogFilter, startPage: Int) async throws -> (items: [Anime], hasNext: Bool, next: Int) {
+        let minVotes = LibSite.current.key == "ranobe" ? 30 : 100
+        var page = startPage
+        var out: [Anime] = []
+        var hasNext = true
+        var tried = 0
+        while tried < 8 && hasNext && out.count < 18 {
+            do {
+                let r = try await catalog(filter: filter, page: page)
+                hasNext = r.hasNext
+                out += r.items.filter { ($0.rateVotes ?? Int.max) >= minVotes }
+            } catch {
+                if tried == 0 { throw error }
+                break
+            }
+            page += 1
+            tried += 1
+        }
+        return (out, hasNext, page)
     }
 
     private func fetchCatalog(filter: CatalogFilter, page: Int, withSite: Bool, sort: String, site: LibSite) async throws -> (items: [Anime], hasNext: Bool) {
@@ -2360,6 +2396,10 @@ final class HomeViewModel: ObservableObject {
     private func fetch(_ sort: CatalogFilter.SortOption, page: Int = 1) async -> (items: [Anime], hasNext: Bool)? {
         var f = CatalogFilter()
         f.sortBy = sort
+        if sort == .rating {
+            guard let r = try? await AnimelibAPI.shared.catalogRated(filter: f, startPage: page) else { return nil }
+            return (r.items, r.hasNext)
+        }
         return try? await AnimelibAPI.shared.catalog(filter: f, page: page)
     }
 
@@ -2849,14 +2889,20 @@ final class CatalogViewModel: ObservableObject {
         let gen = generation
         defer { if gen == generation { isLoading = false } }
         do {
-            let r = try await AnimelibAPI.shared.catalog(filter: filter, page: page)
+            let r: (items: [Anime], hasNext: Bool, next: Int)
+            if filter.sortBy == .rating {
+                r = try await AnimelibAPI.shared.catalogRated(filter: filter, startPage: page)
+            } else {
+                let x = try await AnimelibAPI.shared.catalog(filter: filter, page: page)
+                r = (x.items, x.hasNext, page + 1)
+            }
             guard gen == generation else { return }
             let known = Set(items.map(\.id))
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
             ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
             hasNext = r.hasNext
-            page += 1
+            page = r.next
         } catch {
             guard gen == generation else { return }
             self.error = error.localizedDescription
@@ -6525,12 +6571,13 @@ struct NovelChapter: Identifiable, Hashable {
     let volume: String
     let number: String
     let name: String
+    let date: Date?
 
-    init(id: Int, volume: String, number: String, name: String) {
-        self.id = id; self.volume = volume; self.number = number; self.name = name
+    init(id: Int, volume: String, number: String, name: String, date: Date? = nil) {
+        self.id = id; self.volume = volume; self.number = number; self.name = name; self.date = date
     }
 
-    var saved: SavedChapter { SavedChapter(id: id, volume: volume, number: number, name: name) }
+    var saved: SavedChapter { SavedChapter(id: id, volume: volume, number: number, name: name, date: date) }
 
     init?(_ d: [String: Any]) {
         guard let cid = J.int(d["id"]) else { return nil }
@@ -6538,6 +6585,13 @@ struct NovelChapter: Identifiable, Hashable {
         volume = J.s(d["volume"]) ?? "1"
         number = J.s(d["number"]) ?? "0"
         name = J.str(d["name"]) ?? ""
+        // Дата выхода: самая ранняя загрузка среди переводов этой главы.
+        var dates: [Date] = []
+        for b in (d["branches"] as? [[String: Any]]) ?? [] {
+            if let dt = FriendParser.date(b["created_at"]) { dates.append(dt) }
+        }
+        if dates.isEmpty, let dt = FriendParser.date(d["created_at"]) ?? FriendParser.date(d["date"]) { dates.append(dt) }
+        date = dates.min()
     }
 
     var title: String { name.isEmpty ? "Глава \(number)" : "Глава \(number) · \(name)" }
@@ -6704,6 +6758,33 @@ enum ReaderParser {
     }
 }
 
+enum ChapterAge {
+    private static let absFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "d MMM yyyy"
+        return f
+    }()
+
+    /// «сегодня», «вчера», «3 дн. назад», «2 нед. назад», «5 мес. назад», «год назад».
+    static func ago(_ d: Date) -> String {
+        let cal = Calendar.current
+        let days = max(0, cal.dateComponents([.day], from: cal.startOfDay(for: d), to: cal.startOfDay(for: Date())).day ?? 0)
+        switch days {
+        case 0: return "сегодня"
+        case 1: return "вчера"
+        case 2..<7: return "\(days) дн. назад"
+        case 7..<30: return "\(days / 7) нед. назад"
+        case 30..<365: return "\(max(1, days / 30)) мес. назад"
+        default:
+            let y = days / 365
+            return y == 1 ? "год назад" : "\(y) г. назад"
+        }
+    }
+
+    static func full(_ d: Date) -> String { absFmt.string(from: d) }
+}
+
 enum NovelService {
     static func chapters(slug: String) async throws -> [NovelChapter] {
         let data = try await AnimelibAPI.shared.rawData("/manga/\(slug)/chapters")
@@ -6836,6 +6917,7 @@ struct SavedChapter: Codable {
     let volume: String
     let number: String
     let name: String
+    var date: Date? = nil
 }
 
 struct OfflineEntry: Codable {
@@ -6913,7 +6995,7 @@ final class OfflineStore: ObservableObject {
         guard let e = entries[novel] else { return [] }
         return e.chapters
             .filter { e.files[$0.id] != nil }
-            .map { NovelChapter(id: $0.id, volume: $0.volume, number: $0.number, name: $0.name) }
+            .map { NovelChapter(id: $0.id, volume: $0.volume, number: $0.number, name: $0.name, date: $0.date) }
     }
 
     /// Обновляем сохранённый список глав, пока есть сеть (чтобы офлайн было что показать).
@@ -7551,6 +7633,9 @@ struct NovelDetailView: View {
                             .multilineTextAlignment(.leading)
                         if let f = dl.failed[c.id] {
                             Text(f).font(.caption2).foregroundStyle(Color.orange).lineLimit(1)
+                        } else if let dt = c.date {
+                            Text((isRead ? "Прочитано · " : "") + ChapterAge.ago(dt) + " · " + ChapterAge.full(dt))
+                                .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                         } else if isRead {
                             Text("Прочитано").font(.caption2).foregroundStyle(.secondary)
                         }
@@ -7582,7 +7667,7 @@ struct NovelDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top, spacing: 14) {
-                    RemoteImage(url: vm.anime.imageURL)
+                    RemoteImage(url: vm.anime.largeImageURL, maxPixel: 600)
                         .frame(width: 120, height: 180)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
                         .shadow(color: .black.opacity(0.5), radius: 10, y: 5)
@@ -7597,6 +7682,9 @@ struct NovelDetailView: View {
                             if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Pill(icon: "exclamationmark.shield", text: a) }
                             if let r = vm.anime.rateAvg { Pill(icon: "star.fill", text: r) }
                             if !vm.chapters.isEmpty { Pill(icon: "list.bullet", text: "\(vm.chapters.count) гл.") }
+                            if let last = vm.chapters.compactMap({ $0.date }).max() {
+                                Pill(icon: "clock", text: "Новая глава: " + ChapterAge.ago(last))
+                            }
                         }
                     }
                 }
