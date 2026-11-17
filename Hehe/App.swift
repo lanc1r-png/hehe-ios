@@ -5565,6 +5565,33 @@ final class FriendsViewModel: ObservableObject {
            let v = try? JSONDecoder().decode([Friend].self, from: d) { friends = v }
     }
 
+    private var syncReplaced = false
+    private static let endpointKey = "friends.endpoint"
+
+    func beginSync() { syncReplaced = false }
+
+    /// Друзья, пойманные из запросов сайта. Адрес запроса запоминаем, чтобы дальше брать список напрямую.
+    func absorb(_ list: [Friend], endpoint: String) {
+        if !syncReplaced { friends = []; syncReplaced = true }
+        for f in list {
+            if let i = friends.firstIndex(where: { $0.id == f.id }) { friends[i].merge(f) } else { friends.append(f) }
+        }
+        UserDefaults.standard.set(endpoint, forKey: Self.endpointKey)
+        debug = ""
+        loaded = true
+        if let d = try? JSONEncoder().encode(friends) { UserDefaults.standard.set(d, forKey: cacheKey) }
+    }
+
+    /// Превращает пойманный адрес вида https://api…/api/путь?параметры в путь и параметры для нашего клиента.
+    private static func savedEndpoint() -> (String, [URLQueryItem])? {
+        guard let e = UserDefaults.standard.string(forKey: endpointKey),
+              let c = URLComponents(string: e),
+              let r = c.path.range(of: "/api/") else { return nil }
+        let path = "/" + c.path[r.upperBound...]
+        let q = (c.queryItems ?? []).filter { $0.name != "page" }
+        return (path, q)
+    }
+
     /// Список с сайта плюс друзья, добавленные вручную, без повторов и в порядке «сначала в сети».
     static func merged(_ api: [Friend], _ local: [Friend]) -> [Friend] {
         var all = api
@@ -5576,7 +5603,7 @@ final class FriendsViewModel: ObservableObject {
         }
     }
 
-    private func parseList(_ data: Data) -> [Friend]? {
+    func parseList(_ data: Data) -> [Friend]? {
         guard let root = J.obj(data) else { return nil }
         var arr: [[String: Any]]?
         if let o = root as? [String: Any] {
@@ -5600,7 +5627,7 @@ final class FriendsViewModel: ObservableObject {
         let uid = String(userID)
         let u = URLQueryItem(name: "user_id", value: uid)
         let p1 = URLQueryItem(name: "page", value: "1")
-        let candidates: [(String, [URLQueryItem])] = [
+        var candidates: [(String, [URLQueryItem])] = [
             ("/user/friends", [p1]),
             ("/user/friends", [u]),
             ("/user/friends", [u, p1]),
@@ -5615,6 +5642,7 @@ final class FriendsViewModel: ObservableObject {
             ("/user/relations", [u]),
             ("/user/\(uid)/subscriptions", [])
         ]
+        if let saved = Self.savedEndpoint() { candidates.insert(saved, at: 0) }
         var log: [String] = []
         var result: [Friend]?
         var usedPath: (String, [URLQueryItem])?
@@ -5661,7 +5689,7 @@ final class FriendsViewModel: ObservableObject {
     }
 
     /// Если список не сообщил, кто в сети, спрашиваем профили по одному.
-    private func enrich(token: String) async {
+    func enrich(token: String) async {
         let need = friends.filter { $0.online == nil }.prefix(40).map { $0.id }
         var i = 0
         while i < need.count {
@@ -5672,6 +5700,143 @@ final class FriendsViewModel: ObservableObject {
                 for await d in group {
                     guard let d, let idx = friends.firstIndex(where: { $0.id == d.id }) else { continue }
                     friends[idx].merge(d)
+                }
+            }
+        }
+    }
+}
+
+struct FriendsSniffWebView: UIViewRepresentable {
+    let url: URL
+    let onData: (String, String) -> Void
+
+    static let script = """
+    (function(){
+      if (window.__hehe2) return; window.__hehe2 = true;
+      function take(u, t){
+        try {
+          if (!/friend/i.test(String(u))) return;
+          if (/request|invit|incoming|outgoing|sent/i.test(String(u))) return;
+          window.webkit.messageHandlers.hfriends.postMessage({u: String(u), t: String(t).slice(0, 3000000)});
+        } catch (e) {}
+      }
+      var of = window.fetch;
+      if (of) window.fetch = function(a, o){
+        var u = typeof a === 'string' ? a : (a && a.url);
+        var p = of.apply(this, arguments);
+        p.then(function(r){ try { r.clone().text().then(function(t){ take(u, t); }); } catch (e) {} }).catch(function(){});
+        return p;
+      };
+      var oo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(m, u){
+        var x = this; x.__u = u;
+        x.addEventListener('loadend', function(){
+          try {
+            var t = (x.responseType === '' || x.responseType === 'text') ? x.responseText : JSON.stringify(x.response);
+            take(x.__u, t);
+          } catch (e) {}
+        });
+        return oo.apply(this, arguments);
+      };
+      var tries = 0, clicked = false;
+      var iv = setInterval(function(){
+        tries++; if (tries > 30) { clearInterval(iv); return; }
+        if (!clicked) {
+          var el = document.querySelector('a[href*="friends"]');
+          if (!el) {
+            var all = document.querySelectorAll('a,button,li,[role=tab],span,div');
+            for (var i = 0; i < all.length; i++) {
+              var t = (all[i].children.length === 0 ? all[i].textContent : '').trim();
+              if (t === 'Список друзей' || t === 'Друзья') { el = all[i]; break; }
+            }
+          }
+          if (el) { el.click(); clicked = true; }
+        } else {
+          window.scrollTo(0, document.body.scrollHeight);
+          var se = document.scrollingElement; if (se) se.scrollTop = se.scrollHeight;
+        }
+      }, 1000);
+    })();
+    """
+
+    final class Coordinator: NSObject, WKScriptMessageHandler {
+        let onData: (String, String) -> Void
+        init(_ f: @escaping (String, String) -> Void) { onData = f }
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard let o = m.body as? [String: Any], let u = o["u"] as? String, let t = o["t"] as? String else { return }
+            DispatchQueue.main.async { self.onData(u, t) }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onData) }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let cfg = WKWebViewConfiguration()
+        cfg.userContentController.add(context.coordinator, name: "hfriends")
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Self.script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        let v = WKWebView(frame: .zero, configuration: cfg)
+        v.customUserAgent = Kodik.ua
+        v.load(URLRequest(url: url))
+        return v
+    }
+
+    func updateUIView(_ v: WKWebView, context: Context) {}
+
+    static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
+        v.configuration.userContentController.removeScriptMessageHandler(forName: "hfriends")
+    }
+}
+
+struct FriendsSyncView: View {
+    let userID: Int
+    @ObservedObject var vm: FriendsViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var found = 0
+    @State private var lastHit = Date()
+
+    private var start: URL {
+        let host: String
+        switch LibSite.current.key {
+        case "ranobe": host = "https://ranobelib.me"
+        case "manga": host = "https://mangalib.me"
+        default: host = "https://animelib.org"
+        }
+        return URL(string: "\(host)/ru/user/\(userID)") ?? URL(string: host)!
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    if found == 0 { ProgressView() } else { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(found == 0 ? "Ищу список друзей на сайте…" : "Найдено друзей: \(found)")
+                            .font(.subheadline.weight(.semibold))
+                        Text(found == 0 ? "Если сайт попросит войти, войди. Если список сам не открылся, нажми на нём «Друзья»." : "Окно закроется само.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(12)
+                .background(Theme.card)
+                FriendsSniffWebView(url: start) { u, t in
+                    guard let d = t.data(using: .utf8), let list = vm.parseList(d), !list.isEmpty else { return }
+                    vm.absorb(list, endpoint: u)
+                    found = vm.friends.count
+                    lastHit = Date()
+                }
+            }
+            .navigationTitle("Синхронизация")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Готово") { dismiss() } }
+            }
+            .task {
+                vm.beginSync()
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if found > 0 && Date().timeIntervalSince(lastHit) > 5 { dismiss(); break }
                 }
             }
         }
@@ -5699,6 +5864,7 @@ struct FriendsView: View {
     @State private var search = ""
     @State private var onlyOnline = false
     @State private var showAdd = false
+    @State private var showSync = false
     @State private var manual = ""
     @State private var manualMsg = ""
     @State private var opened: Friend?
@@ -5836,16 +6002,21 @@ struct FriendsView: View {
                 .frame(width: 76, height: 76)
                 .background(Theme.accent.opacity(0.15), in: Circle())
             Text("Здесь пока никого").font(.headline)
-            Text("Список друзей с сайта сейчас не отдаётся. Добавь друзей вручную по ссылке на профиль, и они появятся здесь.")
+            Text("Приложение может подтянуть список прямо с сайта, пока ты в нём вошёл. Или добавь друзей вручную по ссылке.")
                 .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button { showAdd = true } label: {
-                Label("Добавить по ссылке", systemImage: "person.badge.plus")
+            Button { showSync = true } label: {
+                Label("Синхронизировать с сайтом", systemImage: "arrow.triangle.2.circlepath")
                     .font(.footnote.weight(.semibold))
                     .padding(.horizontal, 16).padding(.vertical, 10)
                     .background(Theme.accent, in: Capsule())
                     .foregroundStyle(.white)
             }
             .buttonStyle(.pressable)
+            Button { showAdd = true } label: {
+                Label("Добавить по ссылке", systemImage: "person.badge.plus")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.accent)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(22)
@@ -5899,10 +6070,16 @@ struct FriendsView: View {
         .searchable(text: $search, prompt: "Поиск среди друзей")
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button { showAdd = true } label: { Image(systemName: "person.badge.plus") }
+                HStack(spacing: 14) {
+                    Button { showSync = true } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                    Button { showAdd = true } label: { Image(systemName: "person.badge.plus") }
+                }
             }
         }
         .sheet(isPresented: $showAdd) { addSheet }
+        .fullScreenCover(isPresented: $showSync, onDismiss: {
+            if let t = auth.token { Task { await vm.enrich(token: t) } }
+        }) { FriendsSyncView(userID: userID, vm: vm) }
         .refreshable { if let t = auth.token { await vm.load(userID: userID, token: t) } }
         .task {
             if !vm.loaded, let t = auth.token { await vm.load(userID: userID, token: t) }
