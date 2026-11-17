@@ -10388,7 +10388,9 @@ struct NovelReaderView: View {
                         .disabled(index >= chapters.count - 1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(Capsule().fill(bg).overlay(Capsule().stroke(fg.opacity(0.18))))
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(Capsule().stroke(fg.opacity(0.14), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
                 .foregroundStyle(fg)
                 .padding(.horizontal, 24).padding(.bottom, 4)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -10399,7 +10401,7 @@ struct NovelReaderView: View {
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(activeTheme == "dark" || activeTheme == "black" ? .dark : .light, for: .navigationBar)
-            .toolbarBackground(bg, for: .navigationBar)
+            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
