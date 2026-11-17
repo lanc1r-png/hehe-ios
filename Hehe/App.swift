@@ -9290,9 +9290,12 @@ struct MangaReaderView: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Button { dismiss() } label: {
-                Image(systemName: "xmark").font(.headline).frame(width: 40, height: 40)
+                Image(systemName: "xmark").font(.system(size: 17, weight: .semibold))
+                    .frame(width: 46, height: 46)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay(Circle().stroke(.white.opacity(0.14), lineWidth: 0.5))
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(novel.displayTitle).font(.footnote.bold()).lineLimit(1)
@@ -9300,31 +9303,39 @@ struct MangaReaderView: View {
                     Text("Том \(c.volume) · Глава \(c.number)").font(.caption2).opacity(0.7)
                 }
             }
-            Spacer()
-            Button { showSettings = true } label: {
-                Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
-                    .frame(width: 40, height: 40)
-            }
-            Menu {
-                Button { toggleBookmark() } label: {
-                    Label(pageBookmark == nil ? "Закладка на эту страницу" : "Убрать закладку",
-                          systemImage: pageBookmark == nil ? "bookmark" : "bookmark.slash")
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
+            HStack(spacing: 0) {
+                Button { showSettings = true } label: {
+                    Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
+                        .frame(width: 42, height: 46)
                 }
-                Button { showBookmarks = true } label: { Label("Все закладки", systemImage: "list.bullet") }
-            } label: {
-                Image(systemName: pageBookmark == nil ? "bookmark" : "bookmark.fill").frame(width: 40, height: 40)
-            } primaryAction: {
-                toggleBookmark()
+                Menu {
+                    Button { toggleBookmark() } label: {
+                        Label(pageBookmark == nil ? "Закладка на эту страницу" : "Убрать закладку",
+                              systemImage: pageBookmark == nil ? "bookmark" : "bookmark.slash")
+                    }
+                    Button { showBookmarks = true } label: { Label("Все закладки", systemImage: "list.bullet") }
+                } label: {
+                    Image(systemName: pageBookmark == nil ? "bookmark" : "bookmark.fill").frame(width: 42, height: 46)
+                } primaryAction: {
+                    toggleBookmark()
+                }
+                Button { showComments = true } label: {
+                    Image(systemName: "bubble.left.and.bubble.right").frame(width: 42, height: 46)
+                }
             }
-            Button { showComments = true } label: {
-                Image(systemName: "bubble.left.and.bubble.right").frame(width: 40, height: 40)
-            }
+            .padding(.horizontal, 4)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 10)
+        .environment(\.colorScheme, .dark)
+        .padding(.horizontal, 12)
         .padding(.top, 6)
-        .padding(.bottom, 10)
-        .background(LinearGradient(colors: [.black.opacity(0.85), .clear], startPoint: .top, endPoint: .bottom))
+        .padding(.bottom, 8)
     }
 
     private func seek(_ p: Int) {
@@ -9384,10 +9395,14 @@ struct MangaReaderView: View {
             }
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 10)
-        .padding(.top, 10)
-        .padding(.bottom, 6)
-        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+        .environment(\.colorScheme, .dark)
+        .padding(.horizontal, 6)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 0.5))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
     }
 
     var body: some View {
