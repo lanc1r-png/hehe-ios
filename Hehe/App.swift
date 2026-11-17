@@ -613,24 +613,38 @@ actor AnimelibAPI {
         }
         // Запасной путь: страница автора сама может отдавать список его работ.
         let key = (slug?.isEmpty == false) ? slug! : String(id)
+        var tryLog: [String] = []
         if page == 1 {
-            let tries: [(String, [URLQueryItem])] = [
-                ("/people/\(key)", [.init(name: "fields[]", value: "titles")]),
-                ("/people/\(key)", []),
-                ("/people/\(key)/titles", []),
-                ("/people/\(key)/works", []),
-                ("/people/\(key)/\(site.apiPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")))", [])
-            ]
+            let tail = site.apiPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            var tries: [(String, [URLQueryItem])] = [("/people/\(key)", [])]
+            for f in ["titles", "manga", "anime", "ranobe", "works", "books", "comics", "projects"] {
+                tries.append(("/people/\(key)", [.init(name: "fields[]", value: f)]))
+            }
+            for sub in ["titles", "works", tail, "books", "projects"] {
+                tries.append(("/people/\(key)/\(sub)", []))
+            }
             for (path, q) in tries {
-                guard let data = try? await rawData(path, query: q), let root = J.obj(data) else { continue }
-                let found = titlesIn(root)
-                if !found.isEmpty { return (found, false) }
+                let label = path + (q.isEmpty ? "" : "?" + q.map { $0.name + "=" + ($0.value ?? "") }.joined(separator: "&"))
+                do {
+                    let data = try await rawData(path, query: q)
+                    guard let root = J.obj(data) else { tryLog.append("\(label): не JSON"); continue }
+                    let found = titlesIn(root)
+                    if !found.isEmpty { return (found, false) }
+                    tryLog.append("\(label): ответ есть, тайтлов нет")
+                } catch APIError.http(let code, _) {
+                    tryLog.append("\(label): HTTP \(code)")
+                } catch {
+                    tryLog.append("\(label): сбой")
+                }
             }
         }
-        // Подсказка для разбора: как выглядит страница автора на сервере.
-        let sample = await rawText("/people/\(key)")
-        throw APIError.http(404, "Фильтр по автору не сработал.\n" + log.prefix(12).joined(separator: "; ")
-                            + "\n/people/\(key): " + String(sample.prefix(260)))
+        var keys = ""
+        if let data = try? await rawData("/people/\(key)"), let root = J.obj(data) as? [String: Any],
+           let d = root["data"] as? [String: Any] {
+            keys = d.keys.sorted().joined(separator: ", ")
+        }
+        throw APIError.http(404, "Фильтр по автору не сработал (параметры каталога не меняют выдачу).\n"
+                            + tryLog.joined(separator: "\n") + "\nПоля автора: " + keys)
     }
 
     /// Собирает тайтлы из любого ответа: берём объекты внутри массивов, у которых есть id и slug_url.
@@ -1285,6 +1299,23 @@ enum BackupManager {
         (try? FileManager.default.attributesOfItem(atPath: autoURL.path))?[.modificationDate] as? Date
     }
 
+    /// Читает файл копии; если он ещё не скачан из iCloud, просит систему загрузить его и ждёт.
+    nonisolated static func readFile(_ url: URL) -> Data? {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        for attempt in 0..<4 {
+            var result: Data?
+            var err: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &err) { u in
+                result = try? Data(contentsOf: u)
+            }
+            if let r = result, !r.isEmpty { return r }
+            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+            if attempt < 3 { Thread.sleep(forTimeInterval: 2) }
+        }
+        return nil
+    }
+
     /// Возвращает число восстановленных записей.
     static func restore(_ data: Data) -> Int? {
         guard let root = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
@@ -1349,7 +1380,7 @@ struct SiteWebView: UIViewRepresentable {
       if (window.__heheLog) return; window.__heheLog = true;
       function want(m, u){
         if (m !== 'GET') return true;
-        return /(view|read|watch|progress|history|continue|last|chapter|episode)/i.test(String(u));
+        return /cdnlibs\\.org|\\/api\\//i.test(String(u));
       }
       function send(m, u, b, s){
         try {
@@ -1412,15 +1443,18 @@ struct SiteWebView: UIViewRepresentable {
 }
 
 struct SiteLogView: View {
+    var path: String = ""
     @StateObject private var log = SiteLog()
     @State private var showLog = false
 
     private var start: URL {
+        let base: String
         switch LibSite.current.key {
-        case "ranobe": return URL(string: "https://ranobelib.me/ru/")!
-        case "manga": return URL(string: "https://mangalib.me/ru/")!
-        default: return URL(string: "https://animelib.org/ru/")!
+        case "ranobe": base = "https://ranobelib.me/ru/"
+        case "manga": base = "https://mangalib.me/ru/"
+        default: base = "https://animelib.org/ru/"
         }
+        return URL(string: base + path) ?? URL(string: base)!
     }
 
     var body: some View {
@@ -1488,6 +1522,7 @@ struct SettingsView: View {
     @State private var shareItem: ShareItem?
     @State private var showImporter = false
     @State private var showExporter = false
+    @State private var restored = false
     @State private var backupInfo = ""
 
     private let presets: [(String, String)] = [
@@ -1746,16 +1781,30 @@ struct SettingsView: View {
                         Button { showImporter = true } label: {
                             Label("Восстановить из копии", systemImage: "arrow.down.doc")
                         }
-                        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.propertyList, .data]) { result in
-                            guard case .success(let url) = result else { return }
-                            let access = url.startAccessingSecurityScopedResource()
-                            defer { if access { url.stopAccessingSecurityScopedResource() } }
-                            if let d = try? Data(contentsOf: url), let n = BackupManager.restore(d) {
-                                backupInfo = "Восстановлено записей: \(n). Закрой приложение полностью и открой заново."
-                                Haptics.success()
-                            } else {
-                                backupInfo = "Не удалось прочитать файл копии."
+                        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
+                            guard case .success(let url) = result else {
+                                if case .failure(let e) = result { backupInfo = "Файл не выбран: \(e.localizedDescription)" }
+                                return
                             }
+                            backupInfo = "Читаю файл…"
+                            Task {
+                                let d = await Task.detached { BackupManager.readFile(url) }.value
+                                guard let d else {
+                                    backupInfo = "Файл не скачался из iCloud. Открой «Файлы», нажми на него, чтобы он загрузился, и повтори."
+                                    return
+                                }
+                                if let n = BackupManager.restore(d) {
+                                    backupInfo = "Восстановлено записей: \(n). Нажми «Перезапустить», чтобы всё подхватилось."
+                                    restored = true
+                                    Haptics.success()
+                                } else {
+                                    backupInfo = "Это не файл копии Yume (или он повреждён)."
+                                }
+                            }
+                        }
+                        if restored {
+                            Button("Перезапустить приложение") { exit(0) }
+                                .foregroundStyle(Theme.accent)
                         }
                         if !backupInfo.isEmpty {
                             Text(backupInfo).font(.caption).foregroundStyle(.secondary)
@@ -2762,6 +2811,12 @@ struct AuthorView: View {
                         Button("Скопировать текст ошибки") { UIPasteboard.general.string = e }
                     }
                     .font(.footnote)
+                    NavigationLink {
+                        SiteLogView(path: "people/\(author.slug ?? String(author.id))")
+                    } label: {
+                        Label("Открыть страницу автора на сайте и записать запросы", systemImage: "waveform.path.ecg")
+                            .font(.footnote.weight(.semibold))
+                    }
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { a in
