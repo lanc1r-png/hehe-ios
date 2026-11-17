@@ -1876,6 +1876,8 @@ struct SettingsView: View {
     @AppStorage("novel.anim") private var novelAnim = "book"
     @AppStorage("off.wifi") private var offWifi = false
     @AppStorage("off.prefetch") private var offPrefetch = false
+    @AppStorage("off.limitGB") private var offLimit = 0
+    @AppStorage("off.overflow") private var offOverflow = "refuse"
     @ObservedObject private var offline = OfflineStore.current
     @State private var confirmOffline = false
     @ObservedObject private var auth = AuthStore.shared
@@ -2059,8 +2061,8 @@ struct SettingsView: View {
                     }
                     .tint(Theme.accent)
 
-                    card("Загрузки · ранобэ") {
-                        if platform == "ranobe" {
+                    card("Загрузки · ранобэ и манга") {
+                        if platform == "ranobe" || platform == "manga" {
                             NavigationLink {
                                 OfflineLibraryView()
                             } label: {
@@ -2074,7 +2076,20 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.pressable)
                         } else {
-                            Text(platform == "manga" ? "Для манги загрузки пока недоступны: главы читаются онлайн." : "Скачанные главы доступны на платформе «Ранобэ».")
+                            Text("Скачанные главы доступны на платформах «Ранобэ» и «Манга».")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Picker("Лимит места", selection: $offLimit) {
+                            Text("Без лимита").tag(0)
+                            ForEach([1, 2, 3, 5, 10, 20, 50], id: \.self) { Text("\($0) ГБ").tag($0) }
+                        }
+                        if offLimit > 0 {
+                            Picker("При превышении", selection: $offOverflow) {
+                                Text("Отказаться").tag("refuse")
+                                Text("Удалять прочитанное").tag("purge")
+                            }
+                            .pickerStyle(.segmented)
+                            Text("Занято: \(fmtBytes(OfflineStore.usedBytes)) из \(offLimit) ГБ (ранобэ и манга вместе). «Отказаться»: загрузка останавливается на лимите. «Удалять прочитанное»: сначала стираются самые давние прочитанные главы.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Toggle("Скачивать только по Wi‑Fi", isOn: $offWifi)
@@ -5988,6 +6003,15 @@ final class OfflineStore: ObservableObject {
         }
     }
 
+    static var usedBytes: Int { shared.totalBytes + manga.totalBytes }
+    static var limitBytes: Int { UserDefaults.standard.integer(forKey: "off.limitGB") * 1_000_000_000 }
+    static var purgeMode: Bool { UserDefaults.standard.string(forKey: "off.overflow") == "purge" }
+
+    var avgChapterBytes: Int? {
+        let n = entries.values.reduce(0) { $0 + $1.files.count }
+        return n > 0 ? totalBytes / n : nil
+    }
+
     var allEntries: [OfflineEntry] { entries.values.sorted { $0.updated > $1.updated } }
     var totalBytes: Int { entries.values.reduce(0) { $0 + $1.files.values.reduce(0, +) } }
     func isDownloaded(_ novel: Int, _ chapter: Int) -> Bool { entries[novel]?.files[chapter] != nil }
@@ -6098,6 +6122,7 @@ final class DownloadManager: ObservableObject {
     @Published private(set) var total = 0
     @Published private(set) var done = 0
     @Published private(set) var status = ""
+    @Published var notice: String?
 
     private var jobs: [Job] = []
     private var worker: Task<Void, Never>?
@@ -6112,7 +6137,27 @@ final class DownloadManager: ObservableObject {
         monitor.start(queue: DispatchQueue(label: "hehe.netmonitor"))
     }
 
+    /// Удаляет самые давние прочитанные главы, пока занято не больше target. Возвращает, получилось ли.
+    private func purgeRead(target: Int) -> Bool {
+        var list: [(OfflineStore, Int, Int, Date)] = []
+        for st in [OfflineStore.shared, OfflineStore.manga] {
+            for e in st.entries.values {
+                let key = st === OfflineStore.manga ? -e.novel.id : e.novel.id
+                for cid in e.files.keys where ReadStore.shared.isRead(key, cid) {
+                    list.append((st, e.novel.id, cid, e.updated))
+                }
+            }
+        }
+        list.sort { $0.3 < $1.3 }
+        for (st, nid, cid, _) in list {
+            if OfflineStore.usedBytes <= target { break }
+            st.remove(novel: nid, chapter: cid)
+        }
+        return OfflineStore.usedBytes <= target
+    }
+
     func enqueue(novel: Anime, all: [NovelChapter], targets: [NovelChapter]) {
+        notice = nil
         let store = OfflineStore.current
         for c in targets where !store.isDownloaded(novel.id, c.id) && !pending.contains(c.id) {
             jobs.append(Job(novel: novel, chapters: all, chapter: c, store: store))
@@ -6153,6 +6198,18 @@ final class DownloadManager: ObservableObject {
         }
         while !Task.isCancelled, !jobs.isEmpty {
             let job = jobs.removeFirst()
+            let limit = OfflineStore.limitBytes
+            if limit > 0 && OfflineStore.usedBytes >= limit {
+                var ok = false
+                if OfflineStore.purgeMode { ok = purgeRead(target: Int(Double(limit) * 0.9)) }
+                if !ok {
+                    notice = "Достигнут лимит места (\(fmtBytes(limit))). Скачивание остановлено."
+                    pending.remove(job.chapter.id)
+                    jobs.removeAll()
+                    pending = []
+                    break
+                }
+            }
             current = job.chapter.id
             if Settings.bool("off.wifi", false) {
                 while expensive && !Task.isCancelled {
@@ -6472,6 +6529,9 @@ struct NovelDetailView: View {
     @ObservedObject private var store = OfflineStore.current
     @ObservedObject private var dl = DownloadManager.shared
     @State private var confirmRemove = false
+    @State private var showEstimate = false
+    @State private var estimateMsg = ""
+    @State private var estimateIdx: [Int] = []
     private var isManga: Bool { LibSite.current.isManga }
     private let autoContinue: Bool
     @State private var didAutoContinue = false
@@ -6496,8 +6556,29 @@ struct NovelDetailView: View {
         return 0
     }
 
-    private func queue(_ idx: [Int]) {
+    private func doQueue(_ idx: [Int]) {
         dl.enqueue(novel: vm.anime, all: vm.chapters, targets: idx.map { vm.chapters[$0] })
+    }
+
+    private func queue(_ idx: [Int]) {
+        let todo = idx.filter { !store.isDownloaded(vm.anime.id, vm.chapters[$0].id) }
+        guard !todo.isEmpty else { return }
+        let avg = store.avgChapterBytes ?? (isManga ? 20_000_000 : 800_000)
+        let est = avg * todo.count
+        let used = OfflineStore.usedBytes
+        let limit = OfflineStore.limitBytes
+        let over = limit > 0 && used + est > limit
+        if over || todo.count >= 10 {
+            var m = "Примерно \(fmtBytes(est))"
+            m += store.avgChapterBytes == nil ? " (грубая оценка, пока нет скачанных глав). " : " (по среднему размеру ваших глав). "
+            m += "Сейчас занято \(fmtBytes(used))" + (limit > 0 ? " из \(fmtBytes(limit))." : ".")
+            if over { m += OfflineStore.purgeMode ? " Лимит превышен: удалю самые старые прочитанные главы." : " Лимит будет превышен, скачивание остановится на нём." }
+            estimateMsg = m
+            estimateIdx = todo
+            showEstimate = true
+        } else {
+            doQueue(todo)
+        }
     }
 
     private func nextIndices(_ n: Int) -> [Int] {
@@ -6742,6 +6823,9 @@ struct NovelDetailView: View {
                     }
                 }
                 if dl.total > 0 { downloadBanner }
+                if let n = dl.notice {
+                    Text(n).font(.footnote).foregroundStyle(Color.orange)
+                }
                 if vm.offline {
                     Text("Нет сети: показаны только скачанные главы.")
                         .font(.footnote).foregroundStyle(Color.orange)
@@ -6795,6 +6879,12 @@ struct NovelDetailView: View {
         }
         .sheet(isPresented: $showComments) { CommentsView(anime: vm.anime) }
         .sheet(isPresented: $showBookmark) { BookmarkSheet(anime: vm.anime) }
+        .confirmationDialog("Скачать \(estimateIdx.count) гл.?", isPresented: $showEstimate, titleVisibility: .visible) {
+            Button("Скачать") { doQueue(estimateIdx) }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text(estimateMsg)
+        }
         .confirmationDialog("Удалить загруженные главы этого тайтла?", isPresented: $confirmRemove, titleVisibility: .visible) {
             Button("Удалить", role: .destructive) {
                 store.remove(novel: vm.anime.id)
@@ -7324,6 +7414,7 @@ struct MangaReaderSettings: View {
     @Binding var anim: String
     let detected: String
     @AppStorage("manga.autobg") private var autoBG = true
+    @AppStorage("manga.auto.next") private var autoNext = true
     @Environment(\.dismiss) private var dismiss
 
     private func picker(_ sel: Binding<String>) -> some View {
@@ -7358,6 +7449,13 @@ struct MangaReaderSettings: View {
                     Text("«Сдвиг»: страница уезжает вбок. «Плавно»: одна страница мягко сменяет другую. «Как в книге»: тяни за край, и страница переворачивается. Работает в режиме «Страницы».")
                 }
                 Section {
+                    Toggle("Сама переходить к следующей главе", isOn: $autoNext).tint(Theme.accent)
+                } header: {
+                    Text("Автопрокрутка")
+                } footer: {
+                    Text("Кнопка ▶ и ползунок скорости внизу в режиме «Лента». Касание экрана ставит прокрутку на паузу, палец на ленте тоже. Если страницы не успели загрузиться, лента ждёт.")
+                }
+                Section {
                     Toggle("Фон под страницу", isOn: $autoBG).tint(Theme.accent)
                 } footer: {
                     Text("Читалка смотрит на края страницы и делает поля вокруг неё белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
@@ -7375,6 +7473,90 @@ struct MangaReaderSettings: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Находит UIScrollView, внутри которого лежит SwiftUI-лента.
+struct ScrollFinder: UIViewRepresentable {
+    let onFound: (UIScrollView) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        v.isUserInteractionEnabled = false
+        return v
+    }
+
+    func updateUIView(_ v: UIView, context: Context) {
+        DispatchQueue.main.async {
+            var p: UIView? = v
+            while let x = p {
+                if let sv = x as? UIScrollView { onFound(sv); return }
+                p = x.superview
+            }
+        }
+    }
+}
+
+/// Плавная прокрутка ленты по таймеру кадров. Стоит на паузе, пока палец на экране,
+/// и ждёт, если следующие страницы ещё не загрузились.
+final class AutoScroller {
+    weak var scrollView: UIScrollView? {
+        didSet {
+            if scrollView !== oldValue { atEnd = false; pos = scrollView?.contentOffset.y ?? 0 }
+        }
+    }
+    var speed: CGFloat = 60
+    var canAdvance: () -> Bool = { true }
+    var onEnd: () -> Void = {}
+    private var link: CADisplayLink?
+    private var last: CFTimeInterval = 0
+    private var blockedSince: CFTimeInterval = 0
+    private var atEnd = false
+    private var pos: CGFloat = 0
+
+    func start() {
+        guard link == nil else { return }
+        atEnd = false
+        last = 0
+        blockedSince = 0
+        pos = scrollView?.contentOffset.y ?? 0
+        let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc private func tick(_ l: CADisplayLink) {
+        let now = l.timestamp
+        let dt = last == 0 ? 0 : min(now - last, 0.1)
+        last = now
+        guard dt > 0, let sv = scrollView else { return }
+        if sv.isTracking || sv.isDragging || sv.isDecelerating {
+            pos = sv.contentOffset.y
+            return
+        }
+        if canAdvance() {
+            blockedSince = 0
+        } else {
+            if blockedSince == 0 { blockedSince = now }
+            if now - blockedSince < 4 { return }
+        }
+        let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
+        if sv.contentSize.height > sv.bounds.height, sv.contentOffset.y >= maxY - 1 {
+            if !atEnd {
+                atEnd = true
+                onEnd()
+            }
+            return
+        }
+        atEnd = false
+        if abs(sv.contentOffset.y - pos) > 3 { pos = sv.contentOffset.y }
+        pos = min(pos + speed * CGFloat(dt), max(maxY, 0))
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: pos), animated: false)
     }
 }
 
@@ -7399,6 +7581,10 @@ struct MangaReaderView: View {
     @State private var showSettings = false
     @State private var sliding = false
     @State private var sliderValue = 0.0
+    @State private var scroller = AutoScroller()
+    @State private var autoOn = false
+    @AppStorage("manga.auto.speed") private var autoSpeed = 60.0
+    @AppStorage("manga.auto.next") private var autoNext = true
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
     @AppStorage("manga.anim") private var anim = "slide"
     @Environment(\.dismiss) private var dismiss
@@ -7445,7 +7631,47 @@ struct MangaReaderView: View {
         withAnimation(.easeOut(duration: 0.2)) { current = n }
     }
 
+    private func pagesReady() -> Bool {
+        guard !pages.isEmpty else { return false }
+        let lo = min(max(scrollPage, 0), pages.count - 1)
+        let hi = min(lo + 2, pages.count - 1)
+        for k in lo...hi {
+            let p = pages[k]
+            if ImageCache.shared.object(forKey: ImageCache.key(p.url, p.maxPixel)) == nil { return false }
+        }
+        return true
+    }
+
+    private func setAuto(_ on: Bool) {
+        autoOn = on
+        if on {
+            scroller.speed = CGFloat(autoSpeed)
+            scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && pagesReady() }
+            scroller.onEnd = {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    guard autoOn else { return }
+                    if autoNext && index + 1 < chapters.count {
+                        go(1)
+                    } else {
+                        setAuto(false)
+                        chromeHidden = false
+                    }
+                }
+            }
+            withAnimation(.easeInOut(duration: 0.2)) { chromeHidden = true }
+            scroller.start()
+        } else {
+            scroller.stop()
+        }
+    }
+
     private func handleTap(_ x: CGFloat) {
+        if vertical && autoOn {
+            setAuto(false)
+            withAnimation(.easeInOut(duration: 0.2)) { chromeHidden = false }
+            return
+        }
         if vertical || !Settings.bool("manga.tapzones", true) {
             withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() }
             return
@@ -7467,7 +7693,7 @@ struct MangaReaderView: View {
             var i = 0
             while i < order.count {
                 if Task.isCancelled { return }
-                let n = i == 0 ? 1 : 2
+                let n = i == 0 ? 1 : 3
                 let chunk = Array(order[i..<min(i + n, order.count)])
                 i += n
                 await withTaskGroup(of: Void.self) { group in
@@ -7609,6 +7835,18 @@ struct MangaReaderView: View {
 
     private var bottomBar: some View {
         VStack(spacing: 4) {
+            if vertical {
+                HStack(spacing: 10) {
+                    Button { setAuto(!autoOn) } label: {
+                        Image(systemName: autoOn ? "pause.circle.fill" : "play.circle.fill").font(.title2)
+                    }
+                    Image(systemName: "tortoise.fill").font(.caption)
+                    Slider(value: $autoSpeed, in: 15...240, step: 5).tint(Theme.accent)
+                    Image(systemName: "hare.fill").font(.caption)
+                    Text("\(Int(autoSpeed))").font(.caption2.monospacedDigit()).frame(width: 28)
+                }
+                .padding(.horizontal, 16)
+            }
             if pages.count > 1 {
                 Slider(value: $sliderValue, in: 0...Double(pages.count - 1), step: 1) { editing in
                     sliding = editing
@@ -7660,6 +7898,7 @@ struct MangaReaderView: View {
                                 }
                                 endCard.frame(height: 360).id(pages.count)
                             }
+                            .background(ScrollFinder { scroller.scrollView = $0 })
                         }
                         .onAppear {
                             if current > 0 { proxy.scrollTo(current, anchor: .top) }
@@ -7702,7 +7941,9 @@ struct MangaReaderView: View {
         }
         .onChange(of: vertical) { v in
             if v { scrollPage = current } else { current = min(scrollPage, pages.count) }
+            if !v && autoOn { setAuto(false) }
         }
+        .onChange(of: autoSpeed) { v in scroller.speed = CGFloat(v) }
         .onChange(of: titleMode) { v in
             UserDefaults.standard.set(v, forKey: "manga.mode.\(novel.id)")
         }
@@ -7725,6 +7966,7 @@ struct MangaReaderView: View {
             UIApplication.shared.isIdleTimerDisabled = false
             preloadTask?.cancel()
             historyTask?.cancel()
+            scroller.stop()
         }
     }
 
