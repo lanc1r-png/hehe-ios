@@ -1871,6 +1871,7 @@ struct SettingsView: View {
     @AppStorage("manga.mode.default") private var mangaMode = "auto"
     @AppStorage("manga.tapzones") private var tapZones = true
     @AppStorage("manga.anim") private var mangaAnim = "slide"
+    @AppStorage("manga.autobg") private var mangaAutoBG = true
     @AppStorage("novel.mode") private var novelMode = "pages"
     @AppStorage("novel.anim") private var novelAnim = "book"
     @AppStorage("off.wifi") private var offWifi = false
@@ -2041,6 +2042,7 @@ struct SettingsView: View {
                             }
                             .pickerStyle(.segmented)
                             Toggle("Листать тапом по краям экрана", isOn: $tapZones)
+                            Toggle("Фон под страницу (белый или чёрный по краям)", isOn: $mangaAutoBG)
                             Text("Для каждого тайтла режим можно поменять прямо в читалке, он запомнится.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -6894,6 +6896,35 @@ struct MangaPageView: View {
     @State private var base: CGFloat = 1
     @State private var offset: CGSize = .zero
     @State private var lastOffset: CGSize = .zero
+    @AppStorage("manga.autobg") private var autoBG = true
+    @State private var bg: Color?
+
+    /// Белое или чёрное поле по краям самой страницы.
+    static func edgeColor(_ img: UIImage) -> Color? {
+        guard let cg = img.cgImage else { return nil }
+        let n = 24
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        var ok = false
+        px.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: n, height: n, bitsPerComponent: 8,
+                                      bytesPerRow: n * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            ctx.interpolationQuality = .medium
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: n, height: n))
+            ok = true
+        }
+        guard ok else { return nil }
+        var sum = 0.0
+        var cnt = 0.0
+        for y in 0..<n {
+            for x in 0..<n where x < 2 || y < 2 || x >= n - 2 || y >= n - 2 {
+                let i = (y * n + x) * 4
+                sum += 0.299 * Double(px[i]) + 0.587 * Double(px[i + 1]) + 0.114 * Double(px[i + 2])
+                cnt += 1
+            }
+        }
+        return sum / max(cnt, 1) / 255 > 0.5 ? Color.white : Color.black
+    }
 
     private func resetZoom() {
         scale = 1; base = 1; offset = .zero; lastOffset = .zero
@@ -6907,6 +6938,7 @@ struct MangaPageView: View {
                 GeometryReader { geo in content(geo.size) }
             }
         }
+        .background(autoBG ? (bg ?? Color.clear) : Color.clear)
         .task(id: "\(page.id)-\(attempt)") { await load() }
     }
 
@@ -7011,6 +7043,7 @@ struct MangaPageView: View {
 
     private func load() async {
         if let img = await MangaImageStore.shared.image(for: page) {
+            bg = MangaPageView.edgeColor(img)
             withAnimation(.easeOut(duration: 0.15)) { image = img }
             return
         }
@@ -7185,6 +7218,7 @@ struct MangaReaderSettings: View {
     @Binding var defaultMode: String
     @Binding var anim: String
     let detected: String
+    @AppStorage("manga.autobg") private var autoBG = true
     @Environment(\.dismiss) private var dismiss
 
     private func picker(_ sel: Binding<String>) -> some View {
@@ -7219,6 +7253,11 @@ struct MangaReaderSettings: View {
                     Text("«Сдвиг»: страница уезжает вбок. «Плавно»: одна страница мягко сменяет другую. «Как в книге»: тяни за край, и страница переворачивается. Работает в режиме «Страницы».")
                 }
                 Section {
+                    Toggle("Фон под страницу", isOn: $autoBG).tint(Theme.accent)
+                } footer: {
+                    Text("Читалка смотрит на края страницы и делает поля вокруг неё белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
+                }
+                Section {
                     picker($defaultMode)
                 } header: {
                     Text("По умолчанию для остальных")
@@ -7230,7 +7269,7 @@ struct MangaReaderSettings: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
     }
 }
 
@@ -7253,6 +7292,8 @@ struct MangaReaderView: View {
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
     @State private var showSettings = false
+    @State private var sliding = false
+    @State private var sliderValue = 0.0
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
     @AppStorage("manga.anim") private var anim = "slide"
     @Environment(\.dismiss) private var dismiss
@@ -7450,16 +7491,46 @@ struct MangaReaderView: View {
         .background(LinearGradient(colors: [.black.opacity(0.85), .clear], startPoint: .top, endPoint: .bottom))
     }
 
+    private func seek(_ p: Int) {
+        let n = min(max(p, 0), max(pages.count - 1, 0))
+        if vertical {
+            current = n
+            scrollPage = n
+            jumpTick += 1
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) { current = n }
+        }
+    }
+
     private var bottomBar: some View {
-        HStack {
-            Button { go(-1) } label: { Image(systemName: "backward.end").frame(width: 48, height: 40) }
-                .disabled(index == 0)
-            Spacer()
-            Text(pages.isEmpty ? "…" : "\(min(shown + 1, pages.count)) / \(pages.count)")
-                .font(.footnote.monospacedDigit())
-            Spacer()
-            Button { go(1) } label: { Image(systemName: "forward.end").frame(width: 48, height: 40) }
-                .disabled(index + 1 >= chapters.count)
+        VStack(spacing: 4) {
+            if pages.count > 1 {
+                Slider(value: $sliderValue, in: 0...Double(pages.count - 1), step: 1) { editing in
+                    sliding = editing
+                    if !editing { seek(Int(sliderValue)) }
+                }
+                .tint(Theme.accent)
+                .padding(.horizontal, 16)
+                .onChange(of: shown) { v in
+                    if !sliding { sliderValue = Double(min(v, pages.count - 1)) }
+                }
+                .onChange(of: pages.count) { _ in
+                    sliderValue = Double(min(shown, max(pages.count - 1, 0)))
+                }
+                .onChange(of: sliderValue) { v in
+                    if sliding { Haptics.select() }
+                }
+            }
+            HStack {
+                Button { go(-1) } label: { Image(systemName: "backward.end").frame(width: 48, height: 40) }
+                    .disabled(index == 0)
+                Spacer()
+                Text(pages.isEmpty ? "…" : "\(sliding ? Int(sliderValue) + 1 : min(shown + 1, pages.count)) / \(pages.count)")
+                    .font(.footnote.monospacedDigit())
+                Spacer()
+                Button { go(1) } label: { Image(systemName: "forward.end").frame(width: 48, height: 40) }
+                    .disabled(index + 1 >= chapters.count)
+            }
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 10)
