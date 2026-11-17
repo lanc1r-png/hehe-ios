@@ -1073,7 +1073,9 @@ actor ImageLoader {
               let ph = props[kCGImagePropertyPixelHeight] as? CGFloat, pw > 0, ph > 0 else {
             return downsample(data, maxPixel: 4096)
         }
-        let scale = min(1, width / pw)
+        // Обычные страницы держим крупнее, чтобы при зуме не мылились; длинные ленты — как было.
+        let target = ph / pw <= 2.2 ? width * 1.7 : width
+        let scale = min(1, target / pw)
         let side = min(max(pw, ph) * scale, maxSide)
         return downsample(data, maxPixel: max(side, 64))
     }
@@ -8656,7 +8658,13 @@ struct BookPager: UIViewControllerRepresentable {
         // Оборот листа: однотонный экран цвета темы, чтобы не светился белым.
         func back(_ i: Int) -> Host? {
             guard i >= 0, i < parent.count else { return nil }
-            let h = Host(rootView: AnyView(Color(parent.backColor)))
+            let page = parent.content(i)
+            let h = Host(rootView: AnyView(
+                ZStack {
+                    Color(parent.backColor)
+                    page.scaleEffect(x: -1, y: 1).opacity(0.16)
+                }.clipped()
+            ))
             h.index = i
             h.isBack = true
             h.view.backgroundColor = parent.backColor
@@ -10280,7 +10288,7 @@ struct NovelReaderView: View {
                     switch novelAnim {
                     case "book":
                         BookPager(count: count, current: $pageIndex, backColor: UIColor(bg),
-                                  themedBack: activeTheme == "dark" || activeTheme == "black") { i in AnyView(pageContent(i, margins: m)) }
+                                  themedBack: true) { i in AnyView(pageContent(i, margins: m)) }
                     case "fade":
                         ZStack {
                             pageContent(pageIndex, margins: m)
