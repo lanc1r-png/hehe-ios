@@ -7496,6 +7496,7 @@ enum MangaService {
     }
 
     /// Скачанная глава: страницы лежат файлами на телефоне, сеть не нужна.
+    @MainActor
     static func localPages(novel: Int, chapter: Int) -> [MangaPage]? {
         let store = OfflineStore.manga
         guard store.isDownloaded(novel, chapter),
@@ -7514,7 +7515,7 @@ enum MangaService {
     }
 
     static func pages(slug: String, chapter c: NovelChapter, novelID: Int? = nil) async throws -> [MangaPage] {
-        if let n = novelID, let local = localPages(novel: n, chapter: c.id) { return local }
+        if let n = novelID, let local = await localPages(novel: n, chapter: c.id) { return local }
         let data = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
                                                         query: NovelService.chapterQuery(c))
         guard let root = J.obj(data) as? [String: Any],
