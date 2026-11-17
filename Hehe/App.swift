@@ -8631,10 +8631,12 @@ struct ChapterCommentsView: View {
 struct BookPager: UIViewControllerRepresentable {
     let count: Int
     @Binding var current: Int
+    var backColor: UIColor = .black
     let content: (Int) -> AnyView
 
     final class Host: UIHostingController<AnyView> {
         var index = 0
+        var isBack = false
     }
 
     final class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
@@ -8650,19 +8652,29 @@ struct BookPager: UIViewControllerRepresentable {
             return h
         }
 
+        // Оборот листа: однотонный экран цвета темы, чтобы не светился белым.
+        func back(_ i: Int) -> Host? {
+            guard i >= 0, i < parent.count else { return nil }
+            let h = Host(rootView: AnyView(Color(parent.backColor)))
+            h.index = i
+            h.isBack = true
+            h.view.backgroundColor = parent.backColor
+            return h
+        }
+
         func pageViewController(_ pvc: UIPageViewController, viewControllerBefore vc: UIViewController) -> UIViewController? {
             guard let h = vc as? Host else { return nil }
-            return host(h.index - 1)
+            return h.isBack ? host(h.index) : back(h.index - 1)
         }
 
         func pageViewController(_ pvc: UIPageViewController, viewControllerAfter vc: UIViewController) -> UIViewController? {
             guard let h = vc as? Host else { return nil }
-            return host(h.index + 1)
+            return h.isBack ? host(h.index + 1) : back(h.index)
         }
 
         func pageViewController(_ pvc: UIPageViewController, didFinishAnimating finished: Bool,
                                 previousViewControllers: [UIViewController], transitionCompleted completed: Bool) {
-            guard completed, let h = pvc.viewControllers?.first as? Host else { return }
+            guard completed, let h = pvc.viewControllers?.first as? Host, !h.isBack else { return }
             shown = h.index
             if parent.current != h.index { parent.current = h.index }
         }
@@ -8674,8 +8686,8 @@ struct BookPager: UIViewControllerRepresentable {
         let pvc = UIPageViewController(transitionStyle: .pageCurl, navigationOrientation: .horizontal)
         pvc.dataSource = context.coordinator
         pvc.delegate = context.coordinator
-        pvc.isDoubleSided = false
-        pvc.view.backgroundColor = .black
+        pvc.isDoubleSided = true
+        pvc.view.backgroundColor = backColor
         // Свои зоны касаний у нас есть, встроенные отключаем, чтобы страницы не листались дважды.
         for g in pvc.gestureRecognizers where g is UITapGestureRecognizer { g.isEnabled = false }
         if let h = context.coordinator.host(current) {
@@ -10262,7 +10274,7 @@ struct NovelReaderView: View {
                     let count = pages.count + 1
                     switch novelAnim {
                     case "book":
-                        BookPager(count: count, current: $pageIndex) { i in AnyView(pageContent(i, margins: m)) }
+                        BookPager(count: count, current: $pageIndex, backColor: UIColor(bg)) { i in AnyView(pageContent(i, margins: m)) }
                     case "fade":
                         ZStack {
                             pageContent(pageIndex, margins: m)
