@@ -1687,7 +1687,25 @@ enum BackupManager {
             UserDefaults.standard.set(v, forKey: k)
             n += 1
         }
+        UserDefaults.standard.synchronize()
         return n
+    }
+
+    /// Что лежит в копии: для сообщения после восстановления.
+    static func summary(_ data: Data) -> String {
+        guard let root = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let defs = root["defaults"] as? [String: Any] else { return "" }
+        func count(_ keys: [String]) -> Int {
+            keys.reduce(0) { sum, k in
+                guard let d = defs[k] as? Data, let a = (try? JSONSerialization.jsonObject(with: d)) as? [Any] else { return sum }
+                return sum + a.count
+            }
+        }
+        let fav = count(["favorites.v1", "favorites.novels.v1", "favorites.manga.v1"])
+        let hist = count(["history.v1", "history.novels.v1", "history.manga.v1"])
+        var s = "В копии: избранное \(fav), история \(hist)"
+        if let d = root["date"] as? Date { s += ", сохранена \(d.formatted(date: .abbreviated, time: .shortened))" }
+        return s + "."
     }
 }
 
@@ -1887,6 +1905,7 @@ struct SettingsView: View {
     @State private var showImporter = false
     @State private var showExporter = false
     @State private var restored = false
+    @State private var showRestartAlert = false
     @State private var backupInfo = ""
 
     private let presets: [(String, String)] = [
@@ -2181,9 +2200,11 @@ struct SettingsView: View {
                                     backupInfo = "Файл не скачался из iCloud. Открой «Файлы», нажми на него, чтобы он загрузился, и повтори."
                                     return
                                 }
+                                let sum = BackupManager.summary(d)
                                 if let n = BackupManager.restore(d) {
-                                    backupInfo = "Восстановлено записей: \(n). Нажми «Перезапустить», чтобы всё подхватилось."
+                                    backupInfo = "Восстановлено записей: \(n). \(sum)"
                                     restored = true
+                                    showRestartAlert = true
                                     Haptics.success()
                                 } else {
                                     backupInfo = "Это не файл копии Yume (или он повреждён)."
@@ -2191,7 +2212,7 @@ struct SettingsView: View {
                             }
                         }
                         if restored {
-                            Button("Перезапустить приложение") { exit(0) }
+                            Button("Закрыть приложение, чтобы применить") { exit(0) }
                                 .foregroundStyle(Theme.accent)
                         }
                         if !backupInfo.isEmpty {
@@ -2228,6 +2249,11 @@ struct SettingsView: View {
             }
             .background(AppBackground())
             .navigationTitle("Настройки")
+            .alert("Данные восстановлены", isPresented: $showRestartAlert) {
+                Button("Закрыть приложение") { UserDefaults.standard.synchronize(); exit(0) }
+            } message: {
+                Text("Чтобы всё подхватилось, приложение закроется. Открой Yume снова.")
+            }
             .navigationBarTitleDisplayMode(.inline)
         }
     }
