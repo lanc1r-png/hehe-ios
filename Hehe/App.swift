@@ -5,6 +5,7 @@ import Foundation
 import WebKit
 import Security
 import Network
+import Combine
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -1343,6 +1344,7 @@ struct FavMeta: Codable {
     var release: Date?
     var changed: Date?
     var checked: Date?
+    var seen: Int?
 }
 
 enum FavUpdate {
@@ -1419,6 +1421,31 @@ final class FavMetaStore: ObservableObject {
         return m.release ?? m.changed
     }
 
+    /// Сколько серий или глав вышло с тех пор, как ты в последний раз заглядывал в тайтл.
+    func newCount(_ a: Anime) -> Int {
+        guard let m = items[Self.key(a)], let c = m.count, let s = m.seen else { return 0 }
+        return max(0, c - s)
+    }
+
+    func totalNew(_ list: [Anime]) -> Int { list.filter { newCount($0) > 0 }.count }
+
+    func markSeen(_ a: Anime) {
+        let k = Self.key(a)
+        guard var m = items[k], let c = m.count, m.seen != c else { return }
+        m.seen = c
+        items[k] = m
+        save()
+    }
+
+    func markAllSeen(_ list: [Anime]) {
+        for a in list {
+            let k = Self.key(a)
+            if var m = items[k], let c = m.count { m.seen = c; items[k] = m }
+        }
+        UserDefaults.standard.set(Date(), forKey: "new.lastVisit")
+        save()
+    }
+
     func needsCheck(_ a: Anime) -> Bool {
         guard let c = items[Self.key(a)]?.checked else { return true }
         return Date().timeIntervalSince(c) > 1800
@@ -1426,6 +1453,7 @@ final class FavMetaStore: ObservableObject {
 
     func apply(_ a: Anime, count: Int?, date: String?) {
         var m = items[Self.key(a)] ?? FavMeta()
+        if m.seen == nil, let n = count { m.seen = m.count ?? n }
         if let old = m.count, let n = count, n > old { m.changed = Date() }
         if let n = count { m.count = n }
         if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
@@ -1436,6 +1464,167 @@ final class FavMetaStore: ObservableObject {
 
     private func save() {
         if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+/// Плановая проверка обновлений избранного: при запуске и возвращении в приложение, не чаще раза в час.
+@MainActor
+enum FavUpdater {
+    static func refresh(_ list: [Anime], force: Bool) async {
+        let meta = FavMetaStore.shared
+        let site = LibSite.current.key
+        let todo = Array(list.prefix(80)).filter { force || meta.needsCheck($0) }
+        var i = 0
+        while i < todo.count {
+            let chunk = Array(todo[i..<min(i + 4, todo.count)])
+            await withTaskGroup(of: (Anime, Int?, String?).self) { group in
+                for a in chunk {
+                    group.addTask {
+                        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
+                        return (a, r.count, r.date)
+                    }
+                }
+                for await (a, c, d) in group where LibSite.current.key == site { meta.apply(a, count: c, date: d) }
+            }
+            i += 4
+        }
+    }
+
+    static func refreshIfDue() async {
+        let last = UserDefaults.standard.object(forKey: "new.lastRun") as? Date ?? .distantPast
+        guard Date().timeIntervalSince(last) > 3600 else { return }
+        UserDefaults.standard.set(Date(), forKey: "new.lastRun")
+        await refresh(FavoritesStore.current.items, force: false)
+    }
+}
+
+struct NewInFavoritesView: View {
+    @ObservedObject private var favorites: FavoritesStore = FavoritesStore.current
+    @ObservedObject private var meta = FavMetaStore.shared
+    @State private var refreshing = false
+    private let unit = LibSite.current.isBook ? "гл." : "сер."
+
+    private var fresh: [Anime] {
+        favorites.items.filter { meta.newCount($0) > 0 }
+            .sorted { (meta.updateDate($0) ?? .distantPast) > (meta.updateDate($1) ?? .distantPast) }
+    }
+
+    private var recent: [Anime] {
+        favorites.items.filter { a in
+            meta.newCount(a) == 0 && (meta.updateDate(a).map { Date().timeIntervalSince($0) < 14 * 86400 } ?? false)
+        }
+        .sorted { (meta.updateDate($0) ?? .distantPast) > (meta.updateDate($1) ?? .distantPast) }
+    }
+
+    private func row(_ a: Anime) -> some View {
+        let n = meta.newCount(a)
+        return TitleLink(anime: a) {
+            HStack(spacing: 12) {
+                RemoteImage(url: a.imageURL, maxPixel: 200)
+                    .frame(width: 56, height: 84)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(a.displayTitle)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    HStack(spacing: 8) {
+                        if n > 0 {
+                            Text("+\(n) \(unit)")
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(Theme.accent, in: Capsule())
+                                .foregroundStyle(.white)
+                        }
+                        if let d = meta.updateDate(a) {
+                            Text(ChapterAge.ago(d)).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }
+            .foregroundStyle(.primary)
+            .padding(10)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Theme.chip))
+        }
+        .buttonStyle(.pressable)
+        .simultaneousGesture(TapGesture().onEnded { meta.markSeen(a) })
+    }
+
+    private func header(_ t: String) -> some View {
+        Text(t.uppercased())
+            .font(.caption.weight(.bold)).tracking(1.1)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 10) {
+                let f = fresh
+                HStack(spacing: 12) {
+                    Image(systemName: f.isEmpty ? "checkmark.seal.fill" : "bell.badge.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white)
+                        .frame(width: 44, height: 44)
+                        .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(f.isEmpty ? "Всё прочитано" : "Новое в \(f.count) тайтлах").font(.headline)
+                        if let d = UserDefaults.standard.object(forKey: "new.lastVisit") as? Date {
+                            Text("Отмечено: " + ChapterAge.ago(d)).font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text(refreshing ? "Проверяю…" : "Избранное проверяется само").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(14)
+                .background(Theme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 20))
+
+                if !f.isEmpty {
+                    Button {
+                        Haptics.success()
+                        withAnimation { meta.markAllSeen(favorites.items) }
+                    } label: {
+                        Label("Отметить всё просмотренным", systemImage: "checkmark.circle")
+                            .font(.footnote.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Theme.chip, in: Capsule())
+                    }
+                    .buttonStyle(.pressable)
+                    header("Новое")
+                    ForEach(f) { row($0) }
+                }
+                let r = recent
+                if !r.isEmpty {
+                    header("Недавно обновлялись")
+                    ForEach(r) { row($0) }
+                }
+                if f.isEmpty && r.isEmpty {
+                    Text("Пока ничего нового. Потяни вниз, чтобы проверить сейчас.")
+                        .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        .padding(.top, 30)
+                }
+            }
+            .padding(14)
+        }
+        .background(AppBackground())
+        .navigationTitle("Новое")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable {
+            refreshing = true
+            await FavUpdater.refresh(favorites.items, force: true)
+            refreshing = false
+        }
+        .task {
+            refreshing = true
+            await FavUpdater.refresh(favorites.items, force: false)
+            refreshing = false
+        }
     }
 }
 
@@ -1495,6 +1684,7 @@ struct FavoritesView: View {
     @State private var continueAnime: Anime?
     @State private var pushContinue = false
     @State private var refreshing = false
+    @State private var showNew = false
     private let book = LibSite.current.isBook
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
@@ -1549,23 +1739,8 @@ struct FavoritesView: View {
     }
 
     private func refresh(force: Bool) async {
-        let list = Array(favorites.items.prefix(60)).filter { force || meta.needsCheck($0) }
-        guard !list.isEmpty else { return }
         refreshing = true
-        var i = 0
-        while i < list.count {
-            let chunk = Array(list[i..<min(i + 4, list.count)])
-            await withTaskGroup(of: (Anime, Int?, String?).self) { group in
-                for a in chunk {
-                    group.addTask {
-                        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
-                        return (a, r.count, r.date)
-                    }
-                }
-                for await (a, c, d) in group { meta.apply(a, count: c, date: d) }
-            }
-            i += 4
-        }
+        await FavUpdater.refresh(favorites.items, force: force)
         refreshing = false
     }
 
@@ -1628,6 +1803,11 @@ struct FavoritesView: View {
             .background(AppBackground())
             .navigationTitle("Избранное")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showNew = true } label: {
+                        Image(systemName: meta.totalNew(favorites.items) > 0 ? "bell.badge.fill" : "bell")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Picker("Сортировка", selection: $sortRaw) {
@@ -1643,6 +1823,7 @@ struct FavoritesView: View {
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .navigationDestination(isPresented: $pushContinue) { continueDestination }
+            .navigationDestination(isPresented: $showNew) { NewInFavoritesView() }
         }
     }
 }
@@ -2408,6 +2589,7 @@ final class HistoryStore: ObservableObject {
     }
 
     func recordChapter(anime: Anime, chapterID: Int, title: String) {
+        FavMetaStore.shared.markSeen(anime)
         items.removeAll { $0.anime.id == anime.id }
         items.insert(HistoryItem(anime: anime, episodeID: chapterID, episodeTitle: title, updated: Date()), at: 0)
         if items.count > 30 { items = Array(items.prefix(30)) }
@@ -2415,6 +2597,7 @@ final class HistoryStore: ObservableObject {
     }
 
     func record(anime: Anime, episode: EpisodeShort) {
+        FavMetaStore.shared.markSeen(anime)
         items.removeAll { $0.anime.id == anime.id }
         items.insert(HistoryItem(anime: anime, episodeID: episode.id,
                                  episodeTitle: episode.title, updated: Date()), at: 0)
@@ -2811,6 +2994,7 @@ struct RootView: View {
     @AppStorage("set.theme") private var appTheme = "system"
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var router = AppRouter.shared
+    @State private var newBadge = 0
     @State private var showFound = false
     @State private var showDone = false
     @State private var foundText = ""
@@ -2841,6 +3025,7 @@ struct RootView: View {
                 .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
                 .tag(1)
             FavoritesView()
+                .badge(newBadge)
                 .tabItem { Label("Избранное", systemImage: "heart") }
                 .tag(2)
             ProfileView()
@@ -2858,12 +3043,20 @@ struct RootView: View {
         .onChange(of: scenePhase) { phase in
             if phase != .active { ProgressStore.shared.flush(); ActivityStore.shared.flush() }
             if phase == .background { BackupManager.writeAuto() }
+            if phase == .active { Task { await FavUpdater.refreshIfDue() } }
             if phase == .active, let d = BackupManager.externalCopyDate() {
                 foundText = d.formatted(date: .abbreviated, time: .shortened)
                 showFound = true
             }
         }
-        .task { BackupManager.writeAuto() }
+        .task {
+            BackupManager.writeAuto()
+            newBadge = FavMetaStore.shared.totalNew(FavoritesStore.current.items)
+            await FavUpdater.refreshIfDue()
+        }
+        .onReceive(FavMetaStore.shared.$items.debounce(for: .seconds(1), scheduler: RunLoop.main)) { _ in
+            newBadge = FavMetaStore.shared.totalNew(FavoritesStore.current.items)
+        }
         .alert("Найдена копия в папке приложения", isPresented: $showFound) {
             Button("Загрузить") { applyFound() }
             Button("Не нужно", role: .cancel) { BackupManager.acceptExternal() }
@@ -7144,7 +7337,7 @@ final class DownloadManager: ObservableObject {
     }
 
     @Published private(set) var pending: Set<Int> = []
-    @Published private(set) var current: Int?
+    @Published private(set) var active: Set<Int> = []
     @Published private(set) var failed: [Int: String] = [:]
     @Published private(set) var total = 0
     @Published private(set) var done = 0
@@ -7186,11 +7379,20 @@ final class DownloadManager: ObservableObject {
     func enqueue(novel: Anime, all: [NovelChapter], targets: [NovelChapter]) {
         notice = nil
         let store = OfflineStore.current
-        for c in targets where !store.isDownloaded(novel.id, c.id) && !pending.contains(c.id) {
+        // Всё накапливаем и публикуем один раз: иначе экран перерисовывается на каждую главу из сотни.
+        var newPending = pending
+        var newFailed = failed
+        var added = 0
+        for c in targets where !store.isDownloaded(novel.id, c.id) && !newPending.contains(c.id) {
             jobs.append(Job(novel: novel, chapters: all, chapter: c, store: store))
-            pending.insert(c.id)
-            failed[c.id] = nil
-            total += 1
+            newPending.insert(c.id)
+            newFailed[c.id] = nil
+            added += 1
+        }
+        if added > 0 {
+            pending = newPending
+            failed = newFailed
+            total += added
         }
         startIfNeeded()
     }
@@ -7207,7 +7409,7 @@ final class DownloadManager: ObservableObject {
         pending = []
         worker?.cancel()
         worker = nil
-        current = nil
+        active = []
         total = 0; done = 0; status = ""
     }
 
@@ -7223,6 +7425,23 @@ final class DownloadManager: ObservableObject {
             box.id = .invalid
             if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
         }
+        // Несколько глав качаются одновременно: на мобильной сети две, на Wi‑Fi три.
+        let lanes = expensive ? 2 : 3
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<lanes { group.addTask { await self.lane() } }
+        }
+        if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
+        if Task.isCancelled { return }
+        if done > 0 { Haptics.success() }
+        active = []
+        status = ""
+        total = 0
+        done = 0
+        worker = nil
+    }
+
+    /// Одна «полоса» загрузки: берёт следующую главу из очереди, пока очередь не опустеет.
+    private func lane() async {
         while !Task.isCancelled, !jobs.isEmpty {
             let job = jobs.removeFirst()
             let limit = OfflineStore.limitBytes
@@ -7231,41 +7450,59 @@ final class DownloadManager: ObservableObject {
                 if OfflineStore.purgeMode { ok = purgeRead(target: Int(Double(limit) * 0.9)) }
                 if !ok {
                     notice = "Достигнут лимит места (\(fmtBytes(limit))). Скачивание остановлено."
-                    pending.remove(job.chapter.id)
                     jobs.removeAll()
                     pending = []
-                    break
+                    return
                 }
             }
-            current = job.chapter.id
             if Settings.bool("off.wifi", false) {
                 while expensive && !Task.isCancelled {
                     status = "Ждём Wi‑Fi…"
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                 }
             }
-            if Task.isCancelled { break }
+            if Task.isCancelled { return }
+            active.insert(job.chapter.id)
             status = job.chapter.title
             do {
                 try await download(job)
             } catch {
-                if Task.isCancelled { break }
+                if Task.isCancelled { return }
                 failed[job.chapter.id] = error.localizedDescription
             }
-            if Task.isCancelled { break }
+            active.remove(job.chapter.id)
+            if Task.isCancelled { return }
             done += 1
             pending.remove(job.chapter.id)
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            try? await Task.sleep(nanoseconds: 60_000_000)
         }
-        if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
-        if Task.isCancelled { return }
-        if done > 0 { Haptics.success() }
-        current = nil
-        status = ""
-        total = 0
-        done = 0
-        worker = nil
     }
+
+    /// Качает элементы с «скользящим окном»: как только одна загрузка закончилась, стартует следующая.
+    nonisolated static func pool<T>(_ items: [T], width: Int, _ work: @escaping (T) async -> Int) async -> [Int] {
+        await withTaskGroup(of: Int.self) { group -> [Int] in
+            var out: [Int] = []
+            var it = items.makeIterator()
+            for _ in 0..<min(width, items.count) {
+                if let x = it.next() { group.addTask { await work(x) } }
+            }
+            while let n = await group.next() {
+                out.append(n)
+                if Task.isCancelled { group.cancelAll(); continue }
+                if let x = it.next() { group.addTask { await work(x) } }
+            }
+            return out
+        }
+    }
+
+    nonisolated static let session: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.httpMaximumConnectionsPerHost = 12
+        c.timeoutIntervalForRequest = 30
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.urlCache = nil
+        return URLSession(configuration: c)
+    }()
 
     private func download(_ job: Job) async throws {
         guard let slug = job.novel.slugUrl else { throw APIError.badURL }
@@ -7302,19 +7539,10 @@ final class DownloadManager: ObservableObject {
         let nid = job.novel.id
         try? FileManager.default.createDirectory(at: store.folder(nid), withIntermediateDirectories: true)
         let targets: [(URL, URL)] = urls.map { ($0, store.imageFile(novel: nid, chapter: c.id, url: $0)) }
-        var imageBytes = 0
-        var start = 0
-        while start < targets.count {
-            let chunk = Array(targets[start..<min(start + 4, targets.count)])
-            start += 4
-            imageBytes += await withTaskGroup(of: Int.self) { group -> Int in
-                for (u, f) in chunk { group.addTask { await DownloadManager.fetchImage(u, to: f) } }
-                var sum = 0
-                for await n in group { sum += n }
-                return sum
-            }
-            if Task.isCancelled { throw CancellationError() }
-        }
+        let imageBytes = await DownloadManager.pool(targets, width: 6) { t in
+            await DownloadManager.fetchImage(t.0, to: t.1)
+        }.reduce(0, +)
+        if Task.isCancelled { throw CancellationError() }
         if let cover = job.novel.imageURL, store.coverURL(nid) == nil {
             _ = await DownloadManager.fetchImage(cover, to: store.coverFile(nid))
         }
@@ -7335,23 +7563,12 @@ final class DownloadManager: ObservableObject {
         try? FileManager.default.createDirectory(at: store.folder(nid), withIntermediateDirectories: true)
         var bytes = 0
         var failedPages = 0
-        var start = 0
-        while start < pages.count {
-            let chunk = Array(pages[start..<min(start + 4, pages.count)])
-            start += 4
-            let sizes = await withTaskGroup(of: Int.self) { group -> [Int] in
-                for pg in chunk {
-                    let f = store.mangaPageFile(nid, c.id, pg.id)
-                    let urls = pg.urls
-                    group.addTask { await DownloadManager.fetchMangaPage(urls, to: f) }
-                }
-                var out: [Int] = []
-                for await n in group { out.append(n) }
-                return out
-            }
-            for n in sizes { if n == 0 { failedPages += 1 } else { bytes += n } }
-            if Task.isCancelled { throw CancellationError() }
+        let targets: [([URL], URL)] = pages.map { ($0.urls, store.mangaPageFile(nid, c.id, $0.id)) }
+        let sizes = await DownloadManager.pool(targets, width: 8) { t in
+            await DownloadManager.fetchMangaPage(t.0, to: t.1)
         }
+        if Task.isCancelled { throw CancellationError() }
+        for n in sizes { if n == 0 { failedPages += 1 } else { bytes += n } }
         if failedPages > 0 {
             throw NSError(domain: "offline", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Не скачалось страниц: \(failedPages). Попробуй ещё раз"])
@@ -7372,7 +7589,7 @@ final class DownloadManager: ObservableObject {
                 req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
                 req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 req.setValue(agent, forHTTPHeaderField: "User-Agent")
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                if let (data, resp) = try? await DownloadManager.session.data(for: req),
                    let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
                    !data.isEmpty,
                    let src = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(src) > 0 {
@@ -7391,7 +7608,7 @@ final class DownloadManager: ObservableObject {
             var req = URLRequest(url: url)
             req.timeoutInterval = 30
             req.setValue("https://ranobelib.me/", forHTTPHeaderField: "Referer")
-            if let (data, resp) = try? await URLSession.shared.data(for: req),
+            if let (data, resp) = try? await DownloadManager.session.data(for: req),
                (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
                !data.isEmpty, UIImage(data: data) != nil {
                 try? data.write(to: file, options: .atomic)
@@ -7421,7 +7638,7 @@ struct ChapterDownloadButton: View {
                 if saved {
                     Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.green)
                 } else if queued {
-                    if dl.current == chapter.id { ProgressView() }
+                    if dl.active.contains(chapter.id) { ProgressView() }
                     else { Image(systemName: "clock").foregroundStyle(.secondary) }
                 } else if dl.failed[chapter.id] != nil {
                     Image(systemName: "exclamationmark.circle").foregroundStyle(Color.orange)
@@ -8067,6 +8284,7 @@ struct MangaPageView: View {
     let page: MangaPage
     var vertical = false
     var dim: CGFloat = 1
+    var autoBG = true
     let onTap: (CGFloat) -> Void
     @State private var image: UIImage?
     @State private var failed = false
@@ -8076,7 +8294,6 @@ struct MangaPageView: View {
     @State private var base: CGFloat = 1
     @State private var offset: CGSize = .zero
     @State private var lastOffset: CGSize = .zero
-    @AppStorage("manga.autobg") private var autoBG = true
     @State private var bg: Color?
 
     /// Белое или чёрное поле по краям самой страницы.
@@ -8393,16 +8610,59 @@ struct BookPager: UIViewControllerRepresentable {
     }
 }
 
+/// Свои настройки читалки для одного тайтла (как в Mihon). Пока «enabled» выключено, работают общие.
+struct MangaTitlePrefs: Codable, Equatable {
+    var enabled = false
+    var anim = "slide"
+    var autoBG = true
+    var autoNext = true
+    var speed = 60.0
+    var dim = 0.0
+    var warm = 0.0
+    var gray = false
+}
+
+struct GrayIf: ViewModifier {
+    let on: Bool
+    func body(content: Content) -> some View {
+        if on { content.saturation(0) } else { content }
+    }
+}
+
 struct MangaReaderSettings: View {
     @Binding var titleMode: String
     @Binding var defaultMode: String
+    @Binding var own: Bool
     @Binding var anim: String
+    @Binding var autoBG: Bool
+    @Binding var autoNext: Bool
+    @Binding var speed: Double
+    @Binding var dim: Double
+    @Binding var warm: Double
+    @Binding var gray: Bool
     let detected: String
-    @AppStorage("manga.autobg") private var autoBG = true
-    @AppStorage("manga.auto.next") private var autoNext = true
     @Environment(\.dismiss) private var dismiss
 
-    private func picker(_ sel: Binding<String>) -> some View {
+    private let panel = Color(white: 0.13)
+    private let canvas = Color(white: 0.06)
+
+    private func box<C: View>(_ title: String, icon: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Theme.accent)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func note(_ t: String) -> some View {
+        Text(t).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func modePicker(_ sel: Binding<String>) -> some View {
         Picker("", selection: sel) {
             Text("Авто").tag("auto")
             Text("Страницы").tag("pages")
@@ -8411,53 +8671,91 @@ struct MangaReaderSettings: View {
         .pickerStyle(.segmented)
     }
 
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    picker($titleMode)
-                } header: {
-                    Text("Для этого тайтла")
-                } footer: {
-                    Text("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы и веб-комиксов: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)».")
-                }
-                Section {
-                    Picker("", selection: $anim) {
-                        Text("Сдвиг").tag("slide")
-                        Text("Плавно").tag("fade")
-                        Text("Как в книге").tag("book")
-                    }
-                    .pickerStyle(.segmented)
-                } header: {
-                    Text("Листание страниц")
-                } footer: {
-                    Text("«Сдвиг»: страница уезжает вбок. «Плавно»: одна страница мягко сменяет другую. «Как в книге»: тяни за край, и страница переворачивается. Работает в режиме «Страницы».")
-                }
-                Section {
-                    Toggle("Сама переходить к следующей главе", isOn: $autoNext).tint(Theme.accent)
-                } header: {
-                    Text("Автопрокрутка")
-                } footer: {
-                    Text("Кнопка ▶ и ползунок скорости внизу в режиме «Лента». Касание экрана ставит прокрутку на паузу, палец на ленте тоже. Если страницы не успели загрузиться, лента ждёт.")
-                }
-                Section {
-                    Toggle("Фон под страницу", isOn: $autoBG).tint(Theme.accent)
-                } footer: {
-                    Text("Читалка смотрит на края страницы и делает поля вокруг неё белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
-                }
-                Section {
-                    picker($defaultMode)
-                } header: {
-                    Text("По умолчанию для остальных")
-                } footer: {
-                    Text("Работает, пока для тайтла выбрано «Авто» и у него нет своей настройки.")
-                }
+    private func slider(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, _ fmt: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.footnote)
+                Spacer()
+                Text(fmt).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
             }
-            .navigationTitle("Режим чтения")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
+            Slider(value: v, in: range).tint(Theme.accent)
         }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Настройки читалки").font(.headline)
+                Spacer()
+                Button("Готово") { dismiss() }.font(.body.weight(.semibold))
+            }
+            .padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 10)
+
+            ScrollView {
+                VStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("", selection: $own) {
+                            Text("Для всех").tag(false)
+                            Text("Для этого тайтла").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        note(own ? "Эти настройки действуют только в этом тайтле, остальные не меняются."
+                                 : "Изменения касаются всех тайтлов, у которых нет своих настроек.")
+                    }
+
+                    box("Режим чтения", icon: "book") {
+                        modePicker($titleMode)
+                        note("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)». Режим всегда запоминается для тайтла.")
+                    }
+
+                    box("Листание", icon: "hand.draw") {
+                        Picker("", selection: $anim) {
+                            Text("Сдвиг").tag("slide")
+                            Text("Плавно").tag("fade")
+                            Text("Как в книге").tag("book")
+                        }
+                        .pickerStyle(.segmented)
+                        note("Работает в режиме «Страницы».")
+                    }
+
+                    box("Автопрокрутка", icon: "arrow.down.to.line") {
+                        slider("Скорость", $speed, 15...240, "\(Int(speed))")
+                        Toggle("Сама переходить к следующей главе", isOn: $autoNext).tint(Theme.accent)
+                        note("Кнопка ▶ внизу в режиме «Лента». Касание ставит прокрутку на паузу.")
+                    }
+
+                    box("Экран", icon: "sun.max") {
+                        slider("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
+                        slider("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
+                        Toggle("Чёрно-белый режим", isOn: $gray).tint(Theme.accent)
+                        Toggle("Фон под страницу", isOn: $autoBG).tint(Theme.accent)
+                        note("Фон под страницу делает поля вокруг белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
+                    }
+
+                    box("По умолчанию", icon: "slider.horizontal.3") {
+                        modePicker($defaultMode)
+                        note("Для остальных тайтлов, пока у них выбрано «Авто».")
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 24)
+            }
+        }
+        .background(canvas.ignoresSafeArea())
+        .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
+        .modifier(SolidSheetBackground(color: canvas))
+    }
+}
+
+struct SolidSheetBackground: ViewModifier {
+    let color: Color
+    func body(content: Content) -> some View {
+        if #available(iOS 16.4, *) {
+            content.presentationBackground(color)
+        } else {
+            content
+        }
     }
 }
 
@@ -8585,6 +8883,7 @@ struct MangaReaderView: View {
     @State private var showComments = false
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
+    @State private var prefs: MangaTitlePrefs
     @State private var showSettings = false
     @State private var sliding = false
     @State private var sliderValue = 0.0
@@ -8596,13 +8895,46 @@ struct MangaReaderView: View {
     @AppStorage("manga.auto.next") private var autoNext = true
     @AppStorage("manga.mode.default") private var defaultMode = "auto"
     @AppStorage("manga.anim") private var anim = "slide"
+    @AppStorage("manga.autobg") private var gAutoBG = true
+    @AppStorage("manga.f.dim") private var gDim = 0.0
+    @AppStorage("manga.f.warm") private var gWarm = 0.0
+    @AppStorage("manga.f.gray") private var gGray = false
     @Environment(\.dismiss) private var dismiss
 
     init(novel: Anime, chapters: [NovelChapter], start: Int) {
         self.novel = novel
         self.chapters = chapters
         _titleMode = State(initialValue: UserDefaults.standard.string(forKey: "manga.mode.\(novel.id)") ?? "auto")
+        let saved = UserDefaults.standard.data(forKey: "manga.tprefs.\(novel.id)")
+            .flatMap { try? JSONDecoder().decode(MangaTitlePrefs.self, from: $0) }
+        _prefs = State(initialValue: saved ?? MangaTitlePrefs())
         _index = State(initialValue: min(max(start, 0), max(chapters.count - 1, 0)))
+    }
+
+    private var own: Bool { prefs.enabled }
+    private var effAnim: String { own ? prefs.anim : anim }
+    private var effAutoBG: Bool { own ? prefs.autoBG : gAutoBG }
+    private var effAutoNext: Bool { own ? prefs.autoNext : autoNext }
+    private var effSpeed: Double { own ? prefs.speed : autoSpeed }
+    private var effDim: Double { own ? prefs.dim : gDim }
+    private var effWarm: Double { own ? prefs.warm : gWarm }
+    private var effGray: Bool { own ? prefs.gray : gGray }
+
+    /// Значение читается и пишется либо в свои настройки тайтла, либо в общие.
+    private func bind<T>(_ path: WritableKeyPath<MangaTitlePrefs, T>, _ global: Binding<T>) -> Binding<T> {
+        Binding(get: { own ? prefs[keyPath: path] : global.wrappedValue },
+                set: { v in if own { prefs[keyPath: path] = v } else { global.wrappedValue = v } })
+    }
+
+    private var ownBinding: Binding<Bool> {
+        Binding(get: { prefs.enabled },
+                set: { on in
+                    if on && !prefs.enabled {
+                        prefs.anim = anim; prefs.autoBG = gAutoBG; prefs.autoNext = autoNext
+                        prefs.speed = autoSpeed; prefs.dim = gDim; prefs.warm = gWarm; prefs.gray = gGray
+                    }
+                    prefs.enabled = on
+                })
     }
 
     private var chapter: NovelChapter? { chapters.indices.contains(index) ? chapters[index] : nil }
@@ -8654,14 +8986,14 @@ struct MangaReaderView: View {
     private func setAuto(_ on: Bool) {
         autoOn = on
         if on {
-            scroller.speed = CGFloat(autoSpeed)
+            scroller.speed = CGFloat(effSpeed)
             scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && pagesReady() }
             scroller.onEnd = {
                 guard reachedEnd else { return false }
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     guard autoOn else { return }
-                    if autoNext && index + 1 < chapters.count {
+                    if effAutoNext && index + 1 < chapters.count {
                         go(1)
                     } else {
                         setAuto(false)
@@ -8725,7 +9057,7 @@ struct MangaReaderView: View {
 
     @ViewBuilder
     private var pagedView: some View {
-        switch anim {
+        switch effAnim {
         case "book":
             GeometryReader { geo in
                 let ref = pages[min(current, pages.count - 1)]
@@ -8740,7 +9072,7 @@ struct MangaReaderView: View {
                         .onTapGesture { handleTap(0.5) }
                     BookPager(count: pages.count + 1, current: $current) { i in
                         i < pages.count
-                            ? AnyView(MangaPageView(page: pages[i], dim: 0.9, onTap: handleTap))
+                            ? AnyView(MangaPageView(page: pages[i], dim: 0.9, autoBG: effAutoBG, onTap: handleTap))
                             : AnyView(endCard)
                     }
                     .frame(width: fitW, height: fitH)
@@ -8750,7 +9082,7 @@ struct MangaReaderView: View {
         case "fade":
             ZStack {
                 if current < pages.count {
-                    MangaPageView(page: pages[current], onTap: handleTap)
+                    MangaPageView(page: pages[current], autoBG: effAutoBG, onTap: handleTap)
                         .id(current)
                         .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 1.04)),
                                                 removal: .opacity))
@@ -8769,7 +9101,7 @@ struct MangaReaderView: View {
         default:
             TabView(selection: $current) {
                 ForEach(pages) { p in
-                    MangaPageView(page: p, onTap: handleTap).tag(p.id)
+                    MangaPageView(page: p, autoBG: effAutoBG, onTap: handleTap).tag(p.id)
                 }
                 endCard.tag(pages.count)
             }
@@ -8859,9 +9191,9 @@ struct MangaReaderView: View {
                         Image(systemName: autoOn ? "pause.circle.fill" : "play.circle.fill").font(.title2)
                     }
                     Image(systemName: "tortoise.fill").font(.caption)
-                    Slider(value: $autoSpeed, in: 15...240, step: 5).tint(Theme.accent)
+                    Slider(value: bind(\.speed, $autoSpeed), in: 15...240, step: 5).tint(Theme.accent)
                     Image(systemName: "hare.fill").font(.caption)
-                    Text("\(Int(autoSpeed))").font(.caption2.monospacedDigit()).frame(width: 28)
+                    Text("\(Int(effSpeed))").font(.caption2.monospacedDigit()).frame(width: 28)
                 }
                 .padding(.horizontal, 16)
                 if !autoNote.isEmpty {
@@ -8907,13 +9239,14 @@ struct MangaReaderView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
+            Group {
             if !pages.isEmpty {
                 if vertical {
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(spacing: 0) {
                                 ForEach(pages) { p in
-                                    MangaPageView(page: p, vertical: true, onTap: handleTap)
+                                    MangaPageView(page: p, vertical: true, autoBG: effAutoBG, onTap: handleTap)
                                         .id(p.id)
                                         .onAppear { scrollPage = p.id }
                                 }
@@ -8930,9 +9263,17 @@ struct MangaReaderView: View {
                     .ignoresSafeArea(edges: .bottom)
                 } else {
                     pagedView
-                        .id("p\(index)-\(anim)")
+                        .id("p\(index)-\(effAnim)")
                         .ignoresSafeArea()
                 }
+            }
+            }
+            .modifier(GrayIf(on: effGray))
+            if effDim > 0.001 {
+                Color.black.opacity(effDim).ignoresSafeArea().allowsHitTesting(false)
+            }
+            if effWarm > 0.001 {
+                Color(red: 1, green: 0.6, blue: 0.2).opacity(effWarm * 0.5).ignoresSafeArea().allowsHitTesting(false)
             }
             if loading {
                 ProgressView().tint(.white)
@@ -8965,12 +9306,18 @@ struct MangaReaderView: View {
             if v { scrollPage = current } else { current = min(scrollPage, pages.count) }
             if !v && autoOn { setAuto(false) }
         }
-        .onChange(of: autoSpeed) { v in scroller.speed = CGFloat(v) }
+        .onChange(of: effSpeed) { v in scroller.speed = CGFloat(v) }
+        .onChange(of: prefs) { v in
+            if let d = try? JSONEncoder().encode(v) { UserDefaults.standard.set(d, forKey: "manga.tprefs.\(novel.id)") }
+        }
         .onChange(of: titleMode) { v in
             UserDefaults.standard.set(v, forKey: "manga.mode.\(novel.id)")
         }
         .sheet(isPresented: $showSettings) {
-            MangaReaderSettings(titleMode: $titleMode, defaultMode: $defaultMode, anim: $anim,
+            MangaReaderSettings(titleMode: $titleMode, defaultMode: $defaultMode, own: ownBinding,
+                                anim: bind(\.anim, $anim), autoBG: bind(\.autoBG, $gAutoBG),
+                                autoNext: bind(\.autoNext, $autoNext), speed: bind(\.speed, $autoSpeed),
+                                dim: bind(\.dim, $gDim), warm: bind(\.warm, $gWarm), gray: bind(\.gray, $gGray),
                                 detected: autoVertical ? "лента" : "страницы")
         }
         .sheet(isPresented: $showComments) {
