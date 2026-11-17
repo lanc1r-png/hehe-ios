@@ -8407,41 +8407,8 @@ struct MangaPageView: View {
                 }
                 .simultaneousGesture(SpatialTapGesture().onEnded { v in onTap(v.location.x / max(size.width, 1)) })
             } else {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .colorMultiply(Color(white: dim))
+                ZoomableImageView(image: image, dim: dim, onTap: onTap)
                     .frame(width: size.width, height: size.height)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        TapGesture(count: 2).onEnded {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                if scale > 1 { resetZoom() } else { scale = 2.4; base = 2.4 }
-                            }
-                        }
-                        .exclusively(before: SpatialTapGesture().onEnded { v in
-                            onTap(v.location.x / max(size.width, 1))
-                        })
-                    )
-                    .simultaneousGesture(
-                        MagnificationGesture()
-                            .onChanged { scale = min(max(base * $0, 1), 4) }
-                            .onEnded { _ in
-                                base = scale
-                                if scale <= 1.02 { withAnimation { resetZoom() } }
-                            }
-                    )
-                    .gesture(
-                        DragGesture()
-                            .onChanged { v in
-                                offset = CGSize(width: lastOffset.width + v.translation.width,
-                                                height: lastOffset.height + v.translation.height)
-                            }
-                            .onEnded { _ in lastOffset = offset },
-                        including: scale > 1 ? .all : .none
-                    )
             }
         } else if failed {
             Button { failed = false; attempt += 1 } label: {
@@ -8472,6 +8439,100 @@ struct MangaPageView: View {
         if Task.isCancelled { return }
         note = await MangaImageStore.shared.lastNote
         failed = true
+    }
+}
+
+/// Страница манги с настоящим зумом: щипок приближает к точке между пальцами, палец двигает приближенную страницу
+/// по всем краям, двойное касание приближает к месту касания и возвращает обратно.
+final class FitScrollView: UIScrollView {
+    let imageView = UIImageView()
+    private var lastSize: CGSize = .zero
+    private weak var lastImage: UIImage?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let img = imageView.image, bounds.width > 1, bounds.height > 1,
+              img.size.width > 0, img.size.height > 0 else { return }
+        let relayout = bounds.size != lastSize || lastImage !== img
+        if relayout {
+            lastSize = bounds.size
+            lastImage = img
+            zoomScale = 1
+            let r = min(bounds.width / img.size.width, bounds.height / img.size.height)
+            let fit = CGSize(width: img.size.width * r, height: img.size.height * r)
+            imageView.frame = CGRect(origin: .zero, size: fit)
+            contentSize = fit
+        }
+        let ix = max((bounds.width - contentSize.width) / 2, 0)
+        let iy = max((bounds.height - contentSize.height) / 2, 0)
+        let inset = UIEdgeInsets(top: iy, left: ix, bottom: iy, right: ix)
+        if contentInset != inset { contentInset = inset }
+        if relayout { contentOffset = CGPoint(x: -ix, y: -iy) }
+    }
+}
+
+struct ZoomableImageView: UIViewRepresentable {
+    let image: UIImage
+    var dim: CGFloat = 1
+    let onTap: (CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        var onTap: ((CGFloat) -> Void)?
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { (scrollView as? FitScrollView)?.imageView }
+        func scrollViewDidZoom(_ scrollView: UIScrollView) { scrollView.setNeedsLayout() }
+
+        @objc func single(_ g: UITapGestureRecognizer) {
+            guard let s = g.view as? UIScrollView else { return }
+            let x = g.location(in: s).x - s.contentOffset.x
+            onTap?(x / max(s.bounds.width, 1))
+        }
+
+        @objc func double(_ g: UITapGestureRecognizer) {
+            guard let s = g.view as? FitScrollView else { return }
+            if s.zoomScale > s.minimumZoomScale + 0.05 {
+                s.setZoomScale(s.minimumZoomScale, animated: true)
+            } else {
+                let target: CGFloat = 2.6
+                let p = g.location(in: s.imageView)
+                let w = s.bounds.width / target
+                let h = s.bounds.height / target
+                s.zoom(to: CGRect(x: p.x - w / 2, y: p.y - h / 2, width: w, height: h), animated: true)
+            }
+        }
+    }
+
+    func makeUIView(context: Context) -> FitScrollView {
+        let s = FitScrollView()
+        s.delegate = context.coordinator
+        s.minimumZoomScale = 1
+        s.maximumZoomScale = 5
+        s.bouncesZoom = true
+        s.showsVerticalScrollIndicator = false
+        s.showsHorizontalScrollIndicator = false
+        s.contentInsetAdjustmentBehavior = .never
+        s.decelerationRate = .fast
+        s.backgroundColor = .clear
+        s.imageView.contentMode = .scaleToFill
+        s.addSubview(s.imageView)
+        let dbl = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.double(_:)))
+        dbl.numberOfTapsRequired = 2
+        let one = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.single(_:)))
+        one.require(toFail: dbl)
+        s.addGestureRecognizer(dbl)
+        s.addGestureRecognizer(one)
+        return s
+    }
+
+    func updateUIView(_ s: FitScrollView, context: Context) {
+        context.coordinator.onTap = onTap
+        if s.imageView.image !== image {
+            s.imageView.image = image
+            s.setNeedsLayout()
+        }
+        s.imageView.alpha = dim
     }
 }
 
