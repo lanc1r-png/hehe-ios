@@ -8914,7 +8914,7 @@ struct NovelPageCard: View {
                 Text("\(number) / \(total)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(fg.opacity(0.45))
-                    .position(x: geo.size.width / 2, y: geo.size.height - margins.bottom / 2 - 2)
+                    .position(x: geo.size.width / 2, y: geo.size.height - max(margins.bottom / 2 - 12, 20))
             }
             .contentShape(Rectangle())
             .gesture(SpatialTapGesture().onEnded { v in onTap(v.location.x / max(geo.size.width, 1)) })
@@ -9324,7 +9324,8 @@ struct NovelReaderView: View {
                         .disabled(index >= chapters.count - 1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(.ultraThinMaterial, in: Capsule())
+                .background(Capsule().fill(bg).overlay(Capsule().stroke(fg.opacity(0.18))))
+                .foregroundStyle(fg)
                 .padding(.horizontal, 24).padding(.bottom, 4)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
@@ -9334,6 +9335,8 @@ struct NovelReaderView: View {
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(activeTheme == "dark" ? .dark : .light, for: .navigationBar)
+            .toolbarBackground(bg, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
