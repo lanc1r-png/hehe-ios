@@ -15,6 +15,32 @@ enum Theme {
     /// Акцентный цвет берётся из настроек и меняется на лету.
     private static var cachedHex = ""
     private static var cachedColor = Color(hex: defaultAccentHex)
+    private static var cachedSecondary = Color(hex: defaultAccentHex)
+    private static var dirty = true
+    private static let observer: NSObjectProtocol = NotificationCenter.default.addObserver(
+        forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in Theme.dirty = true }
+
+    /// Второй цвет фона: тот же акцент, сдвинутый по оттенку. Меняется вместе с акцентом.
+    private static func shifted(_ hex: String) -> Color {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(Color(hex: hex)).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        let nh = (h + 0.07).truncatingRemainder(dividingBy: 1)
+        return Color(hue: Double(nh), saturation: Double(s), brightness: Double(b))
+    }
+
+    private static func refresh() {
+        _ = observer
+        guard dirty else { return }
+        dirty = false
+        let hex = UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex
+        if hex != cachedHex {
+            cachedHex = hex
+            cachedColor = Color(hex: hex)
+            cachedSecondary = shifted(hex)
+        }
+    }
+
+    static var accent2: Color { refresh(); return cachedSecondary }
 
     /// Цвета, которые сами подстраиваются под светлую и тёмную тему.
     static let card = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
@@ -23,14 +49,7 @@ enum Theme {
         ? UIColor(white: 1, alpha: 0.10) : UIColor(white: 0, alpha: 0.08) })
     static let base = Color(uiColor: .systemBackground)
 
-    static var accent: Color {
-        let hex = UserDefaults.standard.string(forKey: "accent.hex") ?? defaultAccentHex
-        if hex != cachedHex {
-            cachedHex = hex
-            cachedColor = Color(hex: hex)
-        }
-        return cachedColor
-    }
+    static var accent: Color { refresh(); return cachedColor }
 }
 
 /// Сайт сети Lib, с которым сейчас работает приложение (аниме или ранобэ).
@@ -100,7 +119,7 @@ struct AppBackground: View {
             Theme.base
             RadialGradient(colors: [Theme.accent.opacity(dark ? 0.35 : 0.22), .clear],
                            center: .topLeading, startRadius: 20, endRadius: 460)
-            RadialGradient(colors: [Color.pink.opacity(dark ? 0.18 : 0.10), .clear],
+            RadialGradient(colors: [Theme.accent2.opacity(dark ? 0.24 : 0.14), .clear],
                            center: .bottomTrailing, startRadius: 20, endRadius: 460)
         }
         .ignoresSafeArea()
@@ -1318,13 +1337,20 @@ enum FavUpdate {
     }
 }
 
-func parseLibDate(_ s: String) -> Date? {
-    let t = s.replacingOccurrences(of: "T", with: " ")
-    let long = t.count >= 19
+private func makeLibFmt(_ pattern: String) -> DateFormatter {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
     f.timeZone = TimeZone(identifier: "UTC")
-    f.dateFormat = long ? "yyyy-MM-dd HH:mm:ss" : "yyyy-MM-dd"
+    f.dateFormat = pattern
+    return f
+}
+private let libLongFmt = makeLibFmt("yyyy-MM-dd HH:mm:ss")
+private let libShortFmt = makeLibFmt("yyyy-MM-dd")
+
+func parseLibDate(_ s: String) -> Date? {
+    let t = s.replacingOccurrences(of: "T", with: " ")
+    let long = t.count >= 19
+    let f = long ? libLongFmt : libShortFmt
     return f.date(from: String(t.prefix(long ? 19 : 10)))
 }
 
@@ -2509,13 +2535,14 @@ struct PosterCard: View {
             RemoteImage(url: anime.imageURL)
                 .frame(width: width, height: width * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
-                .shadow(color: .black.opacity(0.4), radius: 6, y: 3)
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.chip, lineWidth: 1))
                 .overlay(alignment: .topLeading) {
                     if let t = anime.type?.title, !t.isEmpty {
                         Text(t)
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .foregroundStyle(.white)
+                            .background(Color.black.opacity(0.55), in: Capsule())
                             .padding(6)
                     }
                 }
@@ -2524,7 +2551,8 @@ struct PosterCard: View {
                         Label(r, systemImage: "star.fill")
                             .font(.caption2.bold())
                             .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .foregroundStyle(.white)
+                            .background(Color.black.opacity(0.55), in: Capsule())
                             .padding(6)
                     }
                 }
@@ -3201,14 +3229,15 @@ struct AnimeCard: View {
             RemoteImage(url: anime.imageURL)
                 .aspectRatio(2/3, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
-                .shadow(color: .black.opacity(0.4), radius: 6, y: 3)
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.chip, lineWidth: 1))
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
                         Label(r, systemImage: "star.fill")
                             .font(.caption2.bold())
                             .padding(.horizontal, 7)
                             .padding(.vertical, 4)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .foregroundStyle(.white)
+                            .background(Color.black.opacity(0.55), in: Capsule())
                             .padding(6)
                     }
                 }
@@ -4494,18 +4523,26 @@ enum J {
         return URL(string: t)
     }
 
+    private static let isoFrac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let outFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "d MMM yyyy"
+        return f
+    }()
+
     static func date(_ s: String?) -> String {
         guard let s = s else { return "" }
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let f2 = ISO8601DateFormatter()
-        f2.formatOptions = [.withInternetDateTime]
-        if let d = f1.date(from: s) ?? f2.date(from: s) {
-            let out = DateFormatter()
-            out.locale = Locale(identifier: "ru_RU")
-            out.dateFormat = "d MMM yyyy"
-            return out.string(from: d)
-        }
+        if let d = isoFrac.date(from: s) ?? isoPlain.date(from: s) { return outFmt.string(from: d) }
         return String(s.prefix(10))
     }
 }
@@ -5473,14 +5510,16 @@ struct Friend: Identifiable, Hashable, Codable {
 
     var statusText: String {
         if online == true { return "в сети" }
-        if let d = lastSeen {
-            let f = RelativeDateTimeFormatter()
-            f.locale = Locale(identifier: "ru_RU")
-            f.unitsStyle = .short
-            return "был(а) " + f.localizedString(for: d, relativeTo: Date())
-        }
+        if let d = lastSeen { return "был(а) " + Friend.relFmt.localizedString(for: d, relativeTo: Date()) }
         return ""
     }
+
+    private static let relFmt: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.unitsStyle = .short
+        return f
+    }()
 
     /// Дополняем пустые поля данными из другой записи.
     mutating func merge(_ o: Friend) {
@@ -5495,13 +5534,20 @@ struct Friend: Identifiable, Hashable, Codable {
 }
 
 enum FriendParser {
-    static func date(_ v: Any?) -> Date? {
-        guard let s = v as? String, !s.isEmpty else { return nil }
+    private static let isoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+
+    static func date(_ v: Any?) -> Date? {
+        guard let s = v as? String, !s.isEmpty else { return nil }
+        if let d = isoFrac.date(from: s) ?? isoPlain.date(from: s) { return d }
         return parseLibDate(s)
     }
 
@@ -9824,11 +9870,11 @@ struct TitleActionsRow: View {
                 }
             }
             chip("bubble.left.and.bubble.right.fill", "Комментарии", nil, onComments)
-            if !vm.related.isEmpty {
-                chip("link", "Связанное", vm.related.count) { startTab = 0; showSheet = true }
-            }
-            if !vm.similar.isEmpty {
-                chip("sparkles", "Похожие", vm.similar.count) { startTab = vm.related.isEmpty ? 0 : 1; showSheet = true }
+            if !vm.related.isEmpty || !vm.similar.isEmpty {
+                let both = !vm.related.isEmpty && !vm.similar.isEmpty
+                chip(both ? "square.stack.3d.up.fill" : (vm.related.isEmpty ? "sparkles" : "link"),
+                     both ? "Похожее" : (vm.related.isEmpty ? "Похожие" : "Связанное"),
+                     vm.related.count + vm.similar.count) { showSheet = true }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -9850,52 +9896,113 @@ struct TitleActionsRow: View {
     }
 }
 
+struct SimilarCell: View {
+    let anime: Anime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RemoteImage(url: anime.imageURL, maxPixel: 320)
+                .aspectRatio(2/3, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(alignment: .bottomLeading) {
+                    if let r = anime.rateAvg {
+                        Text("★ " + r)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(Color.black.opacity(0.55), in: Capsule())
+                            .padding(5)
+                    }
+                }
+            Text(anime.displayTitle)
+                .font(.caption.weight(.medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+        }
+    }
+}
+
 struct SimilarSheet: View {
     let related: [Anime]
     let similar: [Anime]
     let start: Int
     let onPick: (Anime) -> Void
     @State private var tab = 0
+    @State private var limit = 18
     @Environment(\.dismiss) private var dismiss
-    private let columns = [GridItem(.adaptive(minimum: 104), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 100), spacing: 12)]
 
-    private var tabs: [(String, [Anime])] {
-        var t: [(String, [Anime])] = []
-        if !related.isEmpty { t.append(("Связанное", related)) }
-        if !similar.isEmpty { t.append(("Похожие", similar)) }
+    private var tabs: [(title: String, icon: String, list: [Anime])] {
+        var t: [(title: String, icon: String, list: [Anime])] = []
+        if !related.isEmpty { t.append(("Связанное", "link", related)) }
+        if !similar.isEmpty { t.append(("Похожие", "sparkles", similar)) }
         return t
     }
 
+    private func tabButton(_ i: Int, _ t: (title: String, icon: String, list: [Anime])) -> some View {
+        let on = i == tab
+        return Button {
+            Haptics.select()
+            tab = i
+            limit = 18
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: t.icon)
+                Text(t.title)
+                Text("\(t.list.count)")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background((on ? Color.white : Theme.accent).opacity(0.25), in: Capsule())
+            }
+            .font(.subheadline.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .foregroundStyle(on ? Color.white : Color.primary)
+            .background(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip), in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
     var body: some View {
+        let all = tabs
+        let cur = all.indices.contains(tab) ? all[tab].list : []
+        let shown = Array(cur.prefix(limit))
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    if tabs.count > 1 {
-                        Picker("", selection: $tab) {
-                            ForEach(Array(tabs.enumerated()), id: \.offset) { i, t in
-                                Text("\(t.0) · \(t.1.count)").tag(i)
-                            }
+                    if all.count > 1 {
+                        HStack(spacing: 8) {
+                            ForEach(Array(all.enumerated()), id: \.offset) { i, t in tabButton(i, t) }
                         }
-                        .pickerStyle(.segmented)
                     }
-                    let list = tabs.indices.contains(tab) ? tabs[tab].1 : []
-                    LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(list) { a in
-                            Button { Haptics.tap(); onPick(a) } label: { AnimeCard(anime: a) }
-                                .buttonStyle(.pressable)
+                    LazyVGrid(columns: columns, spacing: 14) {
+                        ForEach(shown) { a in
+                            Button { Haptics.tap(); onPick(a) } label: { SimilarCell(anime: a) }
+                                .buttonStyle(.plain)
                         }
+                    }
+                    if cur.count > shown.count {
+                        Button {
+                            limit += 24
+                        } label: {
+                            Text("Показать ещё · \(cur.count - shown.count)")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 18).padding(.vertical, 10)
+                                .background(Theme.chip, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
                 .padding(14)
             }
             .background(AppBackground())
-            .navigationTitle(tabs.count == 1 ? tabs[0].0 : "Связанное и похожие")
+            .navigationTitle(all.count == 1 ? all[0].title : "Связанное и похожее")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } }
             }
         }
-        .onAppear { tab = min(start, max(tabs.count - 1, 0)) }
+        .onAppear { tab = min(start, max(all.count - 1, 0)) }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
     }
