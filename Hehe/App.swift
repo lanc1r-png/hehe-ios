@@ -8665,11 +8665,13 @@ struct BookPager: UIViewControllerRepresentable {
 
         func pageViewController(_ pvc: UIPageViewController, viewControllerBefore vc: UIViewController) -> UIViewController? {
             guard let h = vc as? Host else { return nil }
+            if !parent.themedBack { return host(h.index - 1) }
             return h.isBack ? host(h.index) : back(h.index - 1)
         }
 
         func pageViewController(_ pvc: UIPageViewController, viewControllerAfter vc: UIViewController) -> UIViewController? {
             guard let h = vc as? Host else { return nil }
+            if !parent.themedBack { return host(h.index + 1) }
             return h.isBack ? host(h.index + 1) : back(h.index)
         }
 
