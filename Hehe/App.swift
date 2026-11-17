@@ -1660,21 +1660,57 @@ enum BackupManager {
         (try? FileManager.default.attributesOfItem(atPath: autoURL.path))?[.modificationDate] as? Date
     }
 
-    /// Читает файл копии; если он ещё не скачан из iCloud, просит систему загрузить его и ждёт.
-    nonisolated static func readFile(_ url: URL) -> Data? {
+    /// Читает файл копии; если он ещё не скачан из iCloud, просит систему загрузить его и ждёт до минуты.
+    nonisolated static func readFile(_ url: URL) -> Data? { readFileDetailed(url).0 }
+
+    nonisolated static func readFileDetailed(_ url: URL) -> (Data?, String) {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
-        for attempt in 0..<4 {
+        let deadline = Date().addingTimeInterval(60)
+        var reason = ""
+        while true {
             var result: Data?
             var err: NSError?
+            var inner: Error?
             NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &err) { u in
-                result = try? Data(contentsOf: u)
+                do { result = try Data(contentsOf: u) } catch { inner = error }
             }
-            if let r = result, !r.isEmpty { return r }
+            if let r = result, !r.isEmpty { return (r, "") }
+            reason = (err as Error? ?? inner)?.localizedDescription ?? "файл пустой"
+            if Date() > deadline { return (nil, reason) }
             try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-            if attempt < 3 { Thread.sleep(forTimeInterval: 2) }
+            Thread.sleep(forTimeInterval: 2)
         }
-        return nil
+    }
+
+    /// Ищет в выбранной папке файл Yume-backup (в том числе ещё не скачанный из iCloud) и читает самый свежий.
+    nonisolated static func readFromFolder(_ folder: URL) -> (Data?, String) {
+        let access = folder.startAccessingSecurityScopedResource()
+        defer { if access { folder.stopAccessingSecurityScopedResource() } }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        var real = Set<String>()
+        for n in names {
+            var t = n
+            if t.hasPrefix(".") { t.removeFirst() }
+            if t.hasSuffix(".icloud") { t.removeLast(7) }
+            if t.lowercased().contains("yume-backup") { real.insert(t) }
+        }
+        guard !real.isEmpty else {
+            return (nil, "В папке нет файла Yume-backup. Там лежит: " + (names.isEmpty ? "ничего" : names.prefix(6).joined(separator: ", ")))
+        }
+        var best: (Data, Date)?
+        var reason = ""
+        for name in real.sorted() {
+            let u = folder.appendingPathComponent(name)
+            let (d, r) = readFileDetailed(u)
+            guard let d else { reason = r; continue }
+            guard let root = (try? PropertyListSerialization.propertyList(from: d, format: nil)) as? [String: Any],
+                  (root["app"] as? String) == "Yume" else { reason = "файл не от Yume"; continue }
+            let date = (root["date"] as? Date) ?? Date.distantPast
+            if best == nil || date > best!.1 { best = (d, date) }
+        }
+        if let b = best { return (b.0, "") }
+        return (nil, reason)
     }
 
     /// Возвращает число восстановленных записей.
@@ -1906,7 +1942,24 @@ struct SettingsView: View {
     @State private var showExporter = false
     @State private var restored = false
     @State private var showRestartAlert = false
+    @State private var showFolderImporter = false
     @State private var backupInfo = ""
+
+    private func finishRestore(_ d: Data?, _ reason: String) {
+        guard let d else {
+            backupInfo = "Файл не прочитался: \(reason). Если он в iCloud, открой «Файлы», подожди, пока исчезнет значок загрузки, и повтори."
+            return
+        }
+        let sum = BackupManager.summary(d)
+        if let n = BackupManager.restore(d) {
+            backupInfo = "Восстановлено записей: \(n). \(sum)"
+            restored = true
+            showRestartAlert = true
+            Haptics.success()
+        } else {
+            backupInfo = "Это не файл копии Yume (или он повреждён)."
+        }
+    }
 
     private let presets: [(String, String)] = [
         ("Фиолетовый", "A87AFF"), ("Розовый", "FF6FA8"), ("Синий", "4F9DFF"),
@@ -2193,22 +2246,24 @@ struct SettingsView: View {
                                 if case .failure(let e) = result { backupInfo = "Файл не выбран: \(e.localizedDescription)" }
                                 return
                             }
-                            backupInfo = "Читаю файл…"
+                            backupInfo = "Читаю файл… если он в iCloud, подожди до минуты."
                             Task {
-                                let d = await Task.detached { BackupManager.readFile(url) }.value
-                                guard let d else {
-                                    backupInfo = "Файл не скачался из iCloud. Открой «Файлы», нажми на него, чтобы он загрузился, и повтори."
-                                    return
-                                }
-                                let sum = BackupManager.summary(d)
-                                if let n = BackupManager.restore(d) {
-                                    backupInfo = "Восстановлено записей: \(n). \(sum)"
-                                    restored = true
-                                    showRestartAlert = true
-                                    Haptics.success()
-                                } else {
-                                    backupInfo = "Это не файл копии Yume (или он повреждён)."
-                                }
+                                let r = await Task.detached { BackupManager.readFileDetailed(url) }.value
+                                finishRestore(r.0, r.1)
+                            }
+                        }
+                        Button { showFolderImporter = true } label: {
+                            Label("Восстановить: выбрать папку с копией", systemImage: "folder")
+                        }
+                        .fileImporter(isPresented: $showFolderImporter, allowedContentTypes: [.folder]) { result in
+                            guard case .success(let url) = result else {
+                                if case .failure(let e) = result { backupInfo = "Папка не выбрана: \(e.localizedDescription)" }
+                                return
+                            }
+                            backupInfo = "Ищу файл Yume-backup в папке и жду загрузки из iCloud (до минуты)…"
+                            Task {
+                                let r = await Task.detached { BackupManager.readFromFolder(url) }.value
+                                finishRestore(r.0, r.1)
                             }
                         }
                         if restored {
