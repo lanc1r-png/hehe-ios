@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 import AVKit
 import AVFoundation
 import Foundation
@@ -177,11 +178,156 @@ struct GlassPill: View {
     }
 }
 
+/// Все обложки тайтла: главная и запасные (сайт хранит старые под новой).
+extension AnimelibAPI {
+    func covers(slug: String, main: URL?) async -> [URL] {
+        var out: [URL] = []
+        if let main { out.append(main) }
+        func add(_ s: String?) {
+            guard let s, s.hasPrefix("http"), let u = URL(string: s), !out.contains(u) else { return }
+            out.append(u)
+        }
+        func walk(_ v: Any) {
+            if let d = v as? [String: Any] {
+                if let x = (d["default"] as? String) ?? (d["md"] as? String) ?? (d["thumbnail"] as? String), x.hasPrefix("http") {
+                    add(x); return
+                }
+                for x in d.values { walk(x) }
+            } else if let a = v as? [Any] {
+                a.forEach(walk)
+            }
+        }
+        let path = LibSite.current.apiPath + "/" + slug
+        if let data = try? await rawData(path + "/covers"), let root = J.obj(data) as? [String: Any] {
+            walk(root["data"] ?? root)
+        }
+        if out.count < 2,
+           let data = try? await rawData(path, query: [URLQueryItem(name: "fields[]", value: "covers")]),
+           let root = J.obj(data) as? [String: Any], let d = root["data"] as? [String: Any], let c = d["covers"] {
+            walk(c)
+        }
+        return out
+    }
+}
+
+struct CoverPage: View {
+    let url: URL
+    let onLong: () -> Void
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let image {
+                ZoomableImageView(image: image, onTap: { _ in })
+                    .simultaneousGesture(LongPressGesture(minimumDuration: 0.6).onEnded { _ in
+                        Haptics.bump(); onLong()
+                    })
+            } else {
+                ProgressView().tint(.white)
+            }
+        }
+        .task(id: url) {
+            image = await ImageLoader.shared.image(url, referer: LibSite.current.referer, maxPixel: 3000)
+        }
+    }
+}
+
+/// Обложки на весь экран: двойной тап приближает, зажатие предлагает сохранить оригинал в «Фото».
+struct CoverGalleryView: View {
+    let main: URL?
+    let slug: String?
+    @State private var urls: [URL] = []
+    @State private var page = 0
+    @State private var saveTarget: URL?
+    @State private var note: String?
+    @Environment(\.dismiss) private var dismiss
+
+    private func save(_ u: URL) {
+        Task {
+            var req = URLRequest(url: u)
+            req.setValue(LibSite.current.referer, forHTTPHeaderField: "Referer")
+            guard let (data, _) = try? await URLSession.shared.data(for: req), UIImage(data: data) != nil else {
+                note = "Не удалось скачать обложку"
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
+            }) { ok, _ in
+                DispatchQueue.main.async {
+                    note = ok ? "Сохранено в Фото" : "Нет доступа к Фото: разреши в Настройках iPhone"
+                    if ok { Haptics.success() }
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            TabView(selection: $page) {
+                ForEach(Array(urls.enumerated()), id: \.offset) { i, u in
+                    CoverPage(url: u) { saveTarget = u }.tag(i)
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+            VStack {
+                HStack {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark").font(.headline)
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .glassShape(Circle())
+                    }
+                    Spacer()
+                    if urls.count > 1 {
+                        Text("\(page + 1) / \(urls.count)")
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .glassCapsule()
+                    }
+                }
+                .padding(.horizontal, 16).padding(.top, 8)
+                Spacer()
+                if let n = note {
+                    Text(n).font(.footnote.weight(.semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .glassCapsule()
+                        .padding(.bottom, 30)
+                        .transition(.opacity)
+                } else {
+                    Text(urls.count > 1 ? "Листай · двойной тап — приблизить · зажми — сохранить" : "Двойной тап — приблизить · зажми — сохранить")
+                        .font(.caption).foregroundStyle(.white.opacity(0.55))
+                        .padding(.bottom, 24)
+                }
+            }
+        }
+        .task {
+            if let m = main { urls = [m] }
+            if let slug { urls = await AnimelibAPI.shared.covers(slug: slug, main: main) }
+        }
+        .task(id: note) {
+            guard note != nil else { return }
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            withAnimation { note = nil }
+        }
+        .confirmationDialog("Обложка", isPresented: Binding(get: { saveTarget != nil }, set: { if !$0 { saveTarget = nil } }),
+                            titleVisibility: .visible) {
+            Button("Сохранить в Фото (оригинал)") { if let u = saveTarget { save(u) } }
+            Button("Отмена", role: .cancel) {}
+        }
+        .statusBarHidden(true)
+    }
+}
+
 struct TitleHero: View {
     let cover: URL?
     let title: String
     let subtitle: String?
     let pills: [(String, String)]
+    var slug: String? = nil
+    @State private var showCovers = false
     var body: some View {
         VStack(spacing: 14) {
             RemoteImage(url: cover, maxPixel: 700)
@@ -189,6 +335,8 @@ struct TitleHero: View {
                 .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.7))
                 .shadow(color: .black.opacity(0.45), radius: 22, y: 12)
+                .contentShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .onTapGesture(count: 2) { Haptics.tap(); showCovers = true }
             VStack(spacing: 5) {
                 Text(title)
                     .font(.title2.weight(.bold))
@@ -213,6 +361,7 @@ struct TitleHero: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 4)
+        .fullScreenCover(isPresented: $showCovers) { CoverGalleryView(main: cover, slug: slug) }
     }
 }
 
@@ -4269,7 +4418,7 @@ struct DetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 TitleHero(cover: vm.anime.largeImageURL ?? vm.anime.imageURL, title: vm.anime.displayTitle,
                           subtitle: (vm.anime.name != nil && vm.anime.name != vm.anime.displayTitle) ? vm.anime.name : nil,
-                          pills: animePills)
+                          pills: animePills, slug: vm.anime.slugUrl)
 
                 if !vm.episodes.isEmpty {
                     PrimaryActionButton(icon: "play.fill", title: continueTitle) { openContinue() }
@@ -8591,7 +8740,7 @@ struct NovelDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 TitleHero(cover: vm.anime.largeImageURL, title: vm.anime.displayTitle,
                           subtitle: (vm.anime.name != nil && vm.anime.name != vm.anime.displayTitle) ? vm.anime.name : nil,
-                          pills: novelPills)
+                          pills: novelPills, slug: vm.anime.slugUrl)
 
                 if !vm.chapters.isEmpty {
                     PrimaryActionButton(icon: "book.fill",
