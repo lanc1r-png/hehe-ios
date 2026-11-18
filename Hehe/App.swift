@@ -305,6 +305,10 @@ struct Anime: Codable, Identifiable, Hashable {
             : (cover?.thumbnail ?? cover?.md ?? cover?.default)
         return s.flatMap(URL.init(string:))
     }
+    /// Для крупных карточек на главной: средний размер, чтобы не мылилось.
+    var posterURL: URL? {
+        (cover?.md ?? cover?.default ?? cover?.thumbnail).flatMap(URL.init(string:))
+    }
     /// Для крупной обложки на странице тайтла.
     var largeImageURL: URL? {
         (cover?.default ?? cover?.md ?? cover?.thumbnail).flatMap(URL.init(string:))
@@ -2677,7 +2681,7 @@ final class HomeViewModel: ObservableObject {
         if let r = rb { popular = r.items; popularPage = 1; popularHasNext = r.hasNext }
         if let r = rc { newest = r.items }
         if let r = rd { top = r.items }
-        ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.imageURL })
+        ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.posterURL }, maxPixel: 720)
         error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
     }
 
@@ -2761,7 +2765,7 @@ struct PosterCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            RemoteImage(url: anime.imageURL)
+            RemoteImage(url: width > 140 ? anime.posterURL : anime.imageURL, maxPixel: width > 140 ? 720 : 480)
                 .frame(width: width, height: width * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.chip, lineWidth: 1))
@@ -2805,13 +2809,23 @@ struct AnimeRow: View {
     var body: some View {
         HStack(spacing: 12) {
             if let rank {
-                Text("\(rank)")
-                    .font(.headline.bold())
-                    .foregroundStyle(rank <= 3 ? Theme.accent : Color.secondary)
-                    .frame(width: 22)
+                if light {
+                    Text("\(rank)")
+                        .font(.system(size: 30, weight: .heavy, design: .rounded))
+                        .foregroundStyle(rank <= 3
+                                         ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent2],
+                                                                        startPoint: .top, endPoint: .bottom))
+                                         : AnyShapeStyle(Color.secondary.opacity(0.55)))
+                        .frame(width: 40)
+                } else {
+                    Text("\(rank)")
+                        .font(.headline.bold())
+                        .foregroundStyle(rank <= 3 ? Theme.accent : Color.secondary)
+                        .frame(width: 22)
+                }
             }
-            RemoteImage(url: anime.imageURL)
-                .frame(width: light ? 58 : 52, height: light ? 87 : 78)
+            RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: light ? 720 : 480)
+                .frame(width: light ? 62 : 52, height: light ? 93 : 78)
                 .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
             VStack(alignment: .leading, spacing: 4) {
                 Text(anime.displayTitle)
@@ -2828,6 +2842,8 @@ struct AnimeRow: View {
                 Label(r, systemImage: "star.fill")
                     .font(.caption.bold())
                     .foregroundStyle(.yellow)
+                    .padding(.horizontal, light ? 9 : 0).padding(.vertical, light ? 5 : 0)
+                    .background { if light { Capsule().fill(Theme.chip) } }
             }
         }
         .padding(light ? EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0) : EdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10))
@@ -2837,6 +2853,54 @@ struct AnimeRow: View {
         .overlay(alignment: .bottom) {
             if light { Divider().opacity(0.5).padding(.leading, 34) }
         }
+    }
+}
+
+/// Первое место списка «Сейчас смотрят/читают»: крупная карточка с размытым фоном из обложки.
+struct PopularHero: View {
+    let anime: Anime
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            RemoteImage(url: anime.posterURL, maxPixel: 720)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .scaleEffect(1.4)
+                .blur(radius: 28)
+                .overlay(LinearGradient(colors: [.black.opacity(0.30), .black.opacity(0.72)],
+                                        startPoint: .top, endPoint: .bottom))
+            HStack(alignment: .bottom, spacing: 16) {
+                RemoteImage(url: anime.posterURL, maxPixel: 720)
+                    .frame(width: 112, height: 168)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("№1 сейчас", systemImage: "flame.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .glassCapsule()
+                    Text(anime.displayTitle)
+                        .font(.title3.bold())
+                        .foregroundStyle(.white)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                    Text([anime.type?.title, LibSite.current.isBook ? nil : anime.episodesCount.map { "\($0) эп." }]
+                        .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                    if let r = anime.rateAvg {
+                        Label(r, systemImage: "star.fill")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.yellow)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 200)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 }
 
@@ -2965,7 +3029,12 @@ struct HomeView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Сейчас читают" : "Сейчас смотрят") { router.openCatalog(sort: .views) }
                                 LazyVStack(spacing: 0) {
-                                    ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
+                                    if let first = vm.popular.first {
+                                        TitleLink(anime: first) { PopularHero(anime: first) }
+                                            .buttonStyle(.pressable)
+                                            .padding(.bottom, 8)
+                                    }
+                                    ForEach(Array(vm.popular.enumerated()).dropFirst(), id: \.element.id) { i, a in
                                         TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true) }
                                             .buttonStyle(.pressable)
                                     }
