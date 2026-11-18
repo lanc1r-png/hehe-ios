@@ -9191,6 +9191,24 @@ struct ReaderBarBackground: ViewModifier {
     }
 }
 
+/// Мягкое размытие у края экрана под панелями читалки: текст не наезжает на кнопки.
+struct EdgeBlur: View {
+    let top: Bool
+    let height: CGFloat
+
+    var body: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .frame(height: height)
+            .mask(LinearGradient(stops: [
+                .init(color: .black, location: 0),
+                .init(color: .black.opacity(0.8), location: 0.55),
+                .init(color: .clear, location: 1)
+            ], startPoint: top ? .top : .bottom, endPoint: top ? .bottom : .top))
+            .allowsHitTesting(false)
+    }
+}
+
 struct SolidSheetBackground: ViewModifier {
     let color: Color
     func body(content: Content) -> some View {
@@ -9503,12 +9521,6 @@ struct MangaReaderView: View {
         switch effAnim {
         case "book":
             GeometryReader { geo in
-                let ref = pages[min(current, pages.count - 1)]
-                let ratio = ref.ratio > 0 ? ref.ratio : 1.5
-                let w0 = geo.size.width
-                let h0 = w0 * ratio
-                let fitH = min(h0, geo.size.height)
-                let fitW = h0 > geo.size.height ? fitH / ratio : w0
                 ZStack {
                     Color.black
                         .contentShape(Rectangle())
@@ -9518,7 +9530,7 @@ struct MangaReaderView: View {
                             ? AnyView(MangaPageView(page: pages[i], dim: 0.9, autoBG: effAutoBG, onTap: handleTap))
                             : AnyView(endCard)
                     }
-                    .frame(width: fitW, height: fitH)
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
@@ -10706,7 +10718,7 @@ struct NovelReaderView: View {
 
     private func pageMargins() -> UIEdgeInsets {
         let ins = windowInsets
-        return UIEdgeInsets(top: ins.top + 16, left: CGFloat(margin), bottom: ins.bottom + 36, right: CGFloat(margin))
+        return UIEdgeInsets(top: ins.top + 58, left: CGFloat(margin), bottom: ins.bottom + 76, right: CGFloat(margin))
     }
 
     private func textSize(_ full: CGSize, _ m: UIEdgeInsets) -> CGSize {
@@ -11002,6 +11014,18 @@ struct NovelReaderView: View {
             }
             }
             .task(id: index) { await load() }
+            .overlay {
+                if !chromeHidden {
+                    VStack(spacing: 0) {
+                        EdgeBlur(top: true, height: windowInsets.top + 64)
+                        Spacer(minLength: 0)
+                        EdgeBlur(top: false, height: windowInsets.bottom + 84)
+                    }
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 if !chromeHidden {
                 HStack {
