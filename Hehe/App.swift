@@ -2185,6 +2185,7 @@ struct SettingsView: View {
     @State private var showRestartAlert = false
     @State private var showFolderImporter = false
     @State private var backupInfo = ""
+    @State private var confirmSignOut = false
 
     private func finishRestore(_ d: Data?, _ reason: String) {
         guard let d else {
@@ -2271,38 +2272,32 @@ struct SettingsView: View {
     }
 
     private var hero: some View {
-        VStack(spacing: 16) {
-            HStack(spacing: 14) {
-                Image(systemName: "sparkles.tv.fill")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 66, height: 66)
-                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .shadow(color: Theme.accent.opacity(0.45), radius: 12, y: 6)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Yume").font(.title.bold())
-                    Text(heroSubtitle).font(.footnote).foregroundStyle(.secondary)
-                    if let u = auth.user {
-                        Label(u.username, systemImage: "person.crop.circle.fill")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Theme.accent)
-                    }
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles.tv.fill")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Yume").font(.headline)
+                    Text(heroSubtitle).font(.caption).foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 0)
+                Text("♥ \(FavoritesStore.current.items.count) · ↓ \(offline.allEntries.count) · \(offline.totalBytes == 0 ? "0 МБ" : fmtBytes(offline.totalBytes))")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
-            HStack(spacing: 10) {
-                heroStat("heart.fill", "\(FavoritesStore.current.items.count)", "Избранное")
-                heroStat("arrow.down.circle.fill", "\(offline.allEntries.count)", "Скачано")
-                heroStat("internaldrive.fill", fmtBytes(offline.totalBytes), "Занято")
+            Spacer(minLength: 0)
+            if let u = auth.user {
+                Text(u.username)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .glassCapsule()
             }
         }
-        .padding(16)
-        .background {
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .fill(LinearGradient(colors: [Theme.accent.opacity(0.28), Theme.card],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing))
-        }
+        .padding(12)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     private func heroStat(_ icon: String, _ value: String, _ title: String) -> some View {
@@ -2320,25 +2315,25 @@ struct SettingsView: View {
 
     private func iconBadge(_ name: String) -> some View {
         Image(systemName: name)
-            .font(.system(size: 14, weight: .semibold))
+            .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.white)
-            .frame(width: 30, height: 30)
+            .frame(width: 26, height: 26)
             .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    private var rowDivider: some View { Divider().padding(.leading, 42) }
+    private var rowDivider: some View { Divider().padding(.leading, 38) }
 
     private func listCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 0) { content() }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func section<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.title3.weight(.bold)).padding(.horizontal, 6)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.subheadline.weight(.bold)).foregroundStyle(.secondary).padding(.horizontal, 6)
             listCard { content() }
             if let footer {
                 Text(footer).font(.caption).foregroundStyle(.secondary)
@@ -2353,17 +2348,18 @@ struct SettingsView: View {
             iconBadge(icon)
             Toggle(title, isOn: on).tint(Theme.accent)
         }
-        .padding(.vertical, 8)
+        .font(.subheadline)
+        .padding(.vertical, 5)
     }
 
     private func actionRow(_ icon: String, _ title: String, tint: Color = .primary, _ run: @escaping () -> Void) -> some View {
         Button(action: run) {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).foregroundStyle(tint)
+                Text(title).font(.subheadline).foregroundStyle(tint)
                 Spacer(minLength: 0)
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
@@ -2376,12 +2372,12 @@ struct SettingsView: View {
         } label: {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).foregroundStyle(.primary)
+                Text(title).font(.subheadline).foregroundStyle(.primary)
                 Spacer(minLength: 8)
                 if let value { Text(value).font(.footnote).foregroundStyle(.secondary) }
                 Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
@@ -2391,18 +2387,18 @@ struct SettingsView: View {
         Text(t).font(.caption).foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
     }
 
     private func segRow(_ title: String, _ sel: Binding<String>, _ options: [(String, String)]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.footnote).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
             Picker(title, selection: sel) {
                 ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
             }
             .pickerStyle(.segmented)
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
     }
 
     // MARK: внешний вид
@@ -2417,101 +2413,80 @@ struct SettingsView: View {
             } else {
                 HStack(spacing: 0) { lightBG; darkBG }
             }
-            VStack(alignment: .leading, spacing: 5) {
-                Capsule().fill(Theme.accent).frame(width: 30, height: 7)
-                Capsule().fill(id == "light" ? Color.black.opacity(0.18) : Color.white.opacity(0.28)).frame(width: 46, height: 5)
-                Capsule().fill(id == "light" ? Color.black.opacity(0.12) : Color.white.opacity(0.18)).frame(width: 36, height: 5)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .padding(.leading, 12)
         }
-        .frame(height: 62)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .frame(width: 18, height: 18)
+        .clipShape(Circle())
+        .overlay(Circle().stroke(Color.primary.opacity(0.25), lineWidth: 0.5))
     }
 
-    private var themeBlock: some View {
-        card("Оформление", icon: "paintpalette.fill") {
-            HStack(spacing: 10) {
-                ForEach([("system", "Как в системе"), ("dark", "Тёмная"), ("light", "Светлая")], id: \.0) { t in
+    private var platformSwitch: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 4) {
+                ForEach(platforms, id: \.0) { pl in
+                    let on = platform == pl.0
+                    Button { choosePlatform(pl.0) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: platformIcon(pl.0)).font(.system(size: 14, weight: .semibold))
+                            Text(pl.1).font(.subheadline.weight(.semibold))
+                        }
+                        .foregroundStyle(on ? Color.white : Color.primary)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .background {
+                            if on { Capsule().fill(Theme.accent) }
+                        }
+                        .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(4)
+            .background(Theme.card, in: Capsule())
+            Text(platformHint)
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+        }
+    }
+
+    private var appearanceBlock: some View {
+        section("Внешний вид") {
+            HStack(spacing: 8) {
+                ForEach([("system", "Системная"), ("dark", "Тёмная"), ("light", "Светлая")], id: \.0) { t in
                     let on = appTheme == t.0
                     Button { Haptics.select(); appTheme = t.0 } label: {
-                        VStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             themePreview(t.0)
                             Text(t.1).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                         }
                         .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .background(on ? Theme.accent.opacity(0.2) : Theme.chip, in: Capsule())
+                        .overlay(Capsule().stroke(Theme.accent, lineWidth: on ? 2 : 0))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 8)
+            rowDivider
+            HStack(spacing: 0) {
+                ForEach(presets, id: \.1) { p in
+                    let on = accentHex.uppercased() == p.1
+                    Circle()
+                        .fill(Color(hex: p.1))
+                        .frame(width: 26, height: 26)
+                        .overlay { if on { Image(systemName: "checkmark").font(.caption2.bold()).foregroundStyle(.white) } }
+                        .padding(3)
+                        .overlay(Circle().stroke(Color(hex: p.1), lineWidth: on ? 2 : 0))
                         .frame(maxWidth: .infinity)
-                        .padding(8)
-                        .background(on ? Theme.accent.opacity(0.18) : Theme.chip,
-                                    in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(Theme.accent, lineWidth: on ? 2.5 : 0))
-                    }
-                    .buttonStyle(.pressable)
+                        .contentShape(Rectangle())
+                        .onTapGesture { Haptics.select(); accentHex = p.1 }
                 }
+                ColorPicker("Свой цвет", selection: $custom, supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                    .onChange(of: custom) { c in accentHex = c.hexString }
             }
-        }
-    }
-
-    private var accentBlock: some View {
-        card("Цвет акцента", icon: "drop.fill") {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 14) {
-                    ForEach(presets, id: \.1) { p in
-                        let on = accentHex.uppercased() == p.1
-                        Circle()
-                            .fill(Color(hex: p.1))
-                            .frame(width: 40, height: 40)
-                            .overlay {
-                                if on { Image(systemName: "checkmark").font(.footnote.bold()).foregroundStyle(.white) }
-                            }
-                            .padding(4)
-                            .overlay(Circle().stroke(Color(hex: p.1), lineWidth: on ? 2.5 : 0))
-                            .shadow(color: Color(hex: p.1).opacity(on ? 0.5 : 0), radius: 8, y: 3)
-                            .onTapGesture { Haptics.select(); accentHex = p.1 }
-                    }
-                }
-                .padding(.vertical, 6)
-                .padding(.horizontal, 2)
-            }
-            ColorPicker("Свой цвет", selection: $custom, supportsOpacity: false)
-                .onChange(of: custom) { c in accentHex = c.hexString }
-        }
-    }
-
-    private var platformBlock: some View {
-        card("Платформа", icon: "square.stack.3d.up.fill") {
-            HStack(spacing: 10) {
-                ForEach(platforms, id: \.0) { pl in
-                    let on = platform == pl.0
-                    Button { choosePlatform(pl.0) } label: {
-                        VStack(spacing: 6) {
-                            Image(systemName: platformIcon(pl.0)).font(.title2)
-                            Text(pl.1).font(.subheadline.weight(.semibold))
-                            Text(pl.2).font(.caption2).opacity(0.7)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .foregroundStyle(on ? Color.white : Color.primary)
-                        .background(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip),
-                                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .overlay(alignment: .topTrailing) {
-                            if on {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.footnote)
-                                    .foregroundStyle(.white)
-                                    .padding(7)
-                                    .transition(.scale.combined(with: .opacity))
-                            }
-                        }
-                        .scaleEffect(on ? 1 : 0.96)
-                    }
-                    .buttonStyle(.pressable)
-                }
-            }
-            Text(platformHint)
-                .font(.caption).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 8)
         }
     }
 
@@ -2670,21 +2645,16 @@ struct SettingsView: View {
             textRow("Открывает сайт внутри приложения и записывает, какие запросы он отправляет, когда ты отмечаешь серию или главу. Нужен, чтобы настроить синхронизацию с сайтом.")
             rowDivider
             if let u = auth.user {
-                HStack(spacing: 12) {
-                    iconBadge("person.crop.circle.fill")
-                    Text("Вы вошли как \(u.username)")
-                    Spacer(minLength: 0)
+                actionRow("rectangle.portrait.and.arrow.right", "Выйти из аккаунта · \(u.username)", tint: .red) {
+                    confirmSignOut = true
                 }
-                .padding(.vertical, 10)
-                rowDivider
-                actionRow("rectangle.portrait.and.arrow.right", "Выйти", tint: .red) { auth.signOut() }
             } else {
                 HStack(spacing: 12) {
                     iconBadge("person.crop.circle.fill")
-                    Text("Вход выполняется во вкладке «Профиль».").foregroundStyle(.secondary)
+                    Text("Вход выполняется во вкладке «Профиль».").font(.subheadline).foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                 }
-                .padding(.vertical, 10)
+                .padding(.vertical, 8)
             }
             rowDivider
             HStack(spacing: 12) {
@@ -2703,15 +2673,10 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 22) {
+                VStack(spacing: 16) {
                     hero
-                    VStack(spacing: 12) {
-                        Text("Внешний вид").font(.title3.weight(.bold))
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
-                        themeBlock
-                        accentBlock
-                        platformBlock
-                    }
+                    platformSwitch
+                    appearanceBlock
                     feelBlock
                     if platform == "ranobe" { ranobeBlock }
                     if platform == "manga" { mangaBlock }
@@ -2727,12 +2692,16 @@ struct SettingsView: View {
             }
             .background(AppBackground())
             .navigationTitle("Настройки")
+            .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+                Button("Выйти", role: .destructive) { auth.signOut() }
+                Button("Отмена", role: .cancel) {}
+            }
             .alert("Данные восстановлены", isPresented: $showRestartAlert) {
                 Button("Закрыть приложение") { UserDefaults.standard.synchronize(); exit(0) }
             } message: {
                 Text("Чтобы всё подхватилось, приложение закроется. Открой Yume снова.")
             }
-            .navigationBarTitleDisplayMode(.large)
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
