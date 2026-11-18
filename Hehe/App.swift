@@ -2286,38 +2286,36 @@ struct SettingsView: View {
     }
 
     private var hero: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "sparkles.tv.fill")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("Yume").font(.headline)
-                    Text(heroSubtitle).font(.caption).foregroundStyle(.secondary)
+        VStack(spacing: 14) {
+            HStack(spacing: 14) {
+                Image(systemName: "sparkles.tv.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 64, height: 64)
+                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
+                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(auth.user?.username ?? "Yume").font(.title3.weight(.bold)).lineLimit(1)
+                    Text(heroSubtitle).font(.subheadline).foregroundStyle(.secondary)
                 }
-                Text("♥ \(FavoritesStore.current.items.count) · ↓ \(offline.allEntries.count) · \(offline.totalBytes == 0 ? "0 МБ" : fmtBytes(offline.totalBytes))")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
-            if let u = auth.user {
-                Text(u.username)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.accent)
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .glassCapsule()
+            HStack(spacing: 8) {
+                heroStat("heart.fill", "\(FavoritesStore.current.items.count)", "избранное")
+                heroStat("arrow.down.circle.fill", "\(offline.allEntries.count)", "скачано")
+                heroStat("internaldrive.fill", offline.totalBytes == 0 ? "0 МБ" : fmtBytes(offline.totalBytes), "занято")
             }
         }
-        .padding(12)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
     }
 
     private func heroStat(_ icon: String, _ value: String, _ title: String) -> some View {
         VStack(spacing: 3) {
             Image(systemName: icon).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.accent)
-            Text(value).font(.subheadline.weight(.bold).monospacedDigit()).lineLimit(1).minimumScaleFactor(0.7)
+            Text(value).font(.headline.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.7)
             Text(title).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
@@ -2328,30 +2326,33 @@ struct SettingsView: View {
     // MARK: ряды в стиле «Настроек» iOS
 
     private func iconBadge(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 12, weight: .semibold))
+        let palette: [Color] = [Color(hex: "0A84FF"), Color(hex: "30D158"), Color(hex: "FF9F0A"), Color(hex: "BF5AF2"),
+                                Color(hex: "FF375F"), Color(hex: "64D2FF"), Color(hex: "5E5CE6"), Color(hex: "8E8E93")]
+        let h = name.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xFFFF }
+        return Image(systemName: name)
+            .font(.system(size: 15, weight: .semibold))
             .foregroundStyle(.white)
-            .frame(width: 26, height: 26)
-            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(width: 30, height: 30)
+            .background(palette[h % palette.count].gradient, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    private var rowDivider: some View { Divider().padding(.leading, 38) }
+    private var rowDivider: some View { Divider().padding(.leading, 44) }
 
     private func listCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 0) { content() }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
     }
 
     private func section<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.subheadline.weight(.bold)).foregroundStyle(.secondary).padding(.horizontal, 6)
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase).padding(.horizontal, 18)
             listCard { content() }
             if let footer {
-                Text(footer).font(.caption).foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
+                Text(footer).font(.footnote).foregroundStyle(.secondary)
+                    .padding(.horizontal, 18)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -2362,18 +2363,18 @@ struct SettingsView: View {
             iconBadge(icon)
             Toggle(title, isOn: on).tint(Theme.accent)
         }
-        .font(.subheadline)
-        .padding(.vertical, 5)
+        .font(.body)
+        .padding(.vertical, 9)
     }
 
     private func actionRow(_ icon: String, _ title: String, tint: Color = .primary, _ run: @escaping () -> Void) -> some View {
         Button(action: run) {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).font(.subheadline).foregroundStyle(tint)
+                Text(title).font(.body).foregroundStyle(tint)
                 Spacer(minLength: 0)
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
@@ -2386,108 +2387,117 @@ struct SettingsView: View {
         } label: {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).font(.subheadline).foregroundStyle(.primary)
+                Text(title).font(.body).foregroundStyle(.primary)
                 Spacer(minLength: 8)
-                if let value { Text(value).font(.footnote).foregroundStyle(.secondary) }
-                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                if let value { Text(value).font(.subheadline).foregroundStyle(.secondary) }
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
     }
 
     private func textRow(_ t: String) -> some View {
-        Text(t).font(.caption).foregroundStyle(.secondary)
+        Text(t).font(.subheadline).foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.vertical, 8)
+            .padding(.vertical, 12)
     }
 
     private func segRow(_ title: String, _ sel: Binding<String>, _ options: [(String, String)]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(title).font(.subheadline).foregroundStyle(.secondary)
             Picker(title, selection: sel) {
                 ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
             }
             .pickerStyle(.segmented)
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 12)
     }
 
     // MARK: внешний вид
 
     private func themePreview(_ id: String) -> some View {
         let darkBG = Color(white: 0.11), lightBG = Color(white: 0.96)
-        return ZStack {
-            if id == "dark" {
-                darkBG
-            } else if id == "light" {
-                lightBG
-            } else {
-                HStack(spacing: 0) { lightBG; darkBG }
+        func screen(_ bg: Color, _ fg: Color) -> some View {
+            ZStack(alignment: .topLeading) {
+                bg
+                VStack(alignment: .leading, spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2).fill(fg.opacity(0.5)).frame(width: 22, height: 4)
+                    RoundedRectangle(cornerRadius: 3).fill(fg.opacity(0.18)).frame(height: 10)
+                    RoundedRectangle(cornerRadius: 3).fill(fg.opacity(0.18)).frame(height: 10)
+                }
+                .padding(7)
             }
         }
-        .frame(width: 18, height: 18)
-        .clipShape(Circle())
-        .overlay(Circle().stroke(Color.primary.opacity(0.25), lineWidth: 0.5))
+        return ZStack {
+            if id == "dark" { screen(darkBG, .white) }
+            else if id == "light" { screen(lightBG, .black) }
+            else { HStack(spacing: 0) { screen(lightBG, .black); screen(darkBG, .white) } }
+        }
+        .frame(height: 58)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.18), lineWidth: 0.5))
     }
 
     private var platformSwitch: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             HStack(spacing: 4) {
                 ForEach(platforms, id: \.0) { pl in
                     let on = platform == pl.0
                     Button { choosePlatform(pl.0) } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: platformIcon(pl.0)).font(.system(size: 12, weight: .semibold))
-                            Text(pl.1).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
+                        VStack(spacing: 4) {
+                            Image(systemName: platformIcon(pl.0)).font(.system(size: 19, weight: .semibold))
+                            Text(pl.1).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                         }
                         .foregroundStyle(on ? Color.white : Color.primary)
-                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .frame(maxWidth: .infinity, minHeight: 58)
                         .background {
-                            if on { Capsule().fill(Theme.accent) }
+                            if on { RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Theme.accent) }
                         }
-                        .contentShape(Capsule())
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .padding(4)
-            .background(Theme.card, in: Capsule())
+            .padding(5)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 27, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 27, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
             Text(platformHint)
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.footnote).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 18)
         }
     }
 
     private var appearanceBlock: some View {
         section("Внешний вид") {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 ForEach([("system", "Системная"), ("dark", "Тёмная"), ("light", "Светлая")], id: \.0) { t in
                     let on = appTheme == t.0
                     Button { Haptics.select(); appTheme = t.0 } label: {
-                        HStack(spacing: 6) {
+                        VStack(spacing: 8) {
                             themePreview(t.0)
-                            Text(t.1).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .stroke(Theme.accent, lineWidth: on ? 2.5 : 0))
+                            Text(t.1).font(.footnote.weight(on ? .semibold : .regular))
+                                .foregroundStyle(on ? Theme.accent : Color.primary)
                         }
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity, minHeight: 40)
-                        .background(on ? Theme.accent.opacity(0.2) : Theme.chip, in: Capsule())
-                        .overlay(Capsule().stroke(Theme.accent, lineWidth: on ? 2 : 0))
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 14)
             rowDivider
             HStack(spacing: 0) {
                 ForEach(presets, id: \.1) { p in
                     let on = accentHex.uppercased() == p.1
                     Circle()
                         .fill(Color(hex: p.1))
-                        .frame(width: 26, height: 26)
+                        .frame(width: 30, height: 30)
                         .overlay { if on { Image(systemName: "checkmark").font(.caption2.bold()).foregroundStyle(.white) } }
                         .padding(3)
                         .overlay(Circle().stroke(Color(hex: p.1), lineWidth: on ? 2 : 0))
@@ -2500,7 +2510,7 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity)
                     .onChange(of: custom) { c in accentHex = c.hexString }
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 14)
         }
     }
 
@@ -2687,7 +2697,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 16) {
+                VStack(spacing: 24) {
                     hero
                     platformSwitch
                     appearanceBlock
@@ -2715,7 +2725,7 @@ struct SettingsView: View {
             } message: {
                 Text("Чтобы всё подхватилось, приложение закроется. Открой Yume снова.")
             }
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayMode(.large)
         }
     }
 }
