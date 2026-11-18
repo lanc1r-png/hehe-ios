@@ -675,7 +675,14 @@ actor AnimelibAPI {
         var req = URLRequest(url: url)
         for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, resp) = try await session.data(for: req)
+        // вошедшему пользователю сайт показывает и тайтлы 18+ (гостям они скрыты)
+        let tok = Keychain.get("lib.token")
+        if let t = tok { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
+        var (data, resp) = try await session.data(for: req)
+        if tok != nil, let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+            req.setValue(nil, forHTTPHeaderField: "Authorization")   // токен устарел: пробуем как гость
+            (data, resp) = try await session.data(for: req)
+        }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let body = String(data: data.prefix(300), encoding: .utf8) ?? ""
             throw APIError.http(http.statusCode, body)
@@ -942,14 +949,18 @@ actor AnimelibAPI {
         for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         // у HentaiLib контент закрыт для гостей: отправляем токен вошедшего пользователя
-        let auth = token ?? (LibSite.current.isHentai ? Keychain.get("lib.token") : nil)
+        let auth = token ?? Keychain.get("lib.token")
         if let t = auth { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         req.httpMethod = method
         if let j = json {
             req.httpBody = try JSONSerialization.data(withJSONObject: j)
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        let (data, resp) = try await session.data(for: req)
+        var (data, resp) = try await session.data(for: req)
+        if token == nil, auth != nil, let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+            req.setValue(nil, forHTTPHeaderField: "Authorization")
+            (data, resp) = try await session.data(for: req)
+        }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw APIError.http(http.statusCode, String(data: data.prefix(300), encoding: .utf8) ?? "")
         }
