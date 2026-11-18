@@ -1306,6 +1306,21 @@ func titleURL(_ a: Anime) -> URL? {
     }
 }
 
+/// Горизонтальные ленты на главной: всегда листаются, с упругим краем и мягкой фиксацией на карточке.
+struct HorizontalRail: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content
+                .scrollBounceBehavior(.always, axes: .horizontal)
+                .scrollClipDisabled()
+        } else if #available(iOS 16.4, *) {
+            content.scrollBounceBehavior(.always, axes: .horizontal)
+        } else {
+            content
+        }
+    }
+}
+
 struct PressableStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -3596,7 +3611,7 @@ struct HomeView: View {
 
     private func poster(_ list: [Anime]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 ForEach(list) { a in
                     TitleLink(anime: a) { PosterCard(anime: a, width: 154) }
                         .buttonStyle(.pressable)
@@ -3604,6 +3619,7 @@ struct HomeView: View {
             }
             .padding(.horizontal, 14)
         }
+        .modifier(HorizontalRail())
     }
 
     var body: some View {
@@ -3665,7 +3681,7 @@ struct HomeView: View {
                         if !vm.fresh.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Свежие главы" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
-                                poster(Array(vm.fresh.prefix(14)))
+                                poster(Array(vm.fresh.prefix(24)))
                             }
                         }
 
