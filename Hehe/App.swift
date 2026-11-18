@@ -744,7 +744,7 @@ actor AnimelibAPI {
     }
 
     /// Собирает тайтлы из любого ответа: объекты с id и slug_url (авторов, людей и команды пропускаем).
-    private func titlesIn(_ root: Any) -> [Anime] {
+    private func titlesIn(_ root: Any, onlyAnime: Bool = false) -> [Anime] {
         var out: [Anime] = []
         var seen = Set<Int>()
         let siteKey = LibSite.current.key
@@ -754,7 +754,8 @@ actor AnimelibAPI {
                 let isTitleLike = J.int(d["id"]) != nil && d["slug_url"] != nil
                     && !["people", "user", "team"].contains(model)
                 let sameSite = !["anime", "manga", "ranobe", "hentai"].contains(model) || model == siteKey
-                if isTitleLike, sameSite,
+                let wanted = onlyAnime ? (model == "anime" && isTitleLike) : sameSite
+                if isTitleLike, wanted,
                    let data = try? JSONSerialization.data(withJSONObject: d),
                    let a = try? decoder.decode(Anime.self, from: data) {
                     if seen.insert(a.id).inserted { out.append(a) }
@@ -770,15 +771,17 @@ actor AnimelibAPI {
     }
 
     /// «Похожие» и «Связанное» для карточки тайтла (формат ответа разбираем мягко).
-    func similarTitles(slug: String) async -> (similar: [Anime], related: [Anime], note: String) {
+    func similarTitles(slug: String) async -> (similar: [Anime], related: [Anime], adapt: [Anime], note: String) {
         let base = LibSite.current.apiPath + "/" + slug
         var notes: [String] = []
         var lists: [[Anime]] = []
+        var adapt: [Anime] = []
         for sub in ["similar", "relations"] {
             do {
                 let data = try await rawData(base + "/" + sub)
                 if let root = J.obj(data) {
                     lists.append(titlesIn(root).filter { $0.slugUrl != slug })
+                    if sub == "relations", LibSite.current.isBook { adapt = titlesIn(root, onlyAnime: true) }
                 } else {
                     lists.append([])
                     notes.append("\(sub): не JSON")
@@ -791,7 +794,7 @@ actor AnimelibAPI {
         let sim = lists[0]
         let simIDs = Set(sim.map { $0.id })
         let rel = lists[1].filter { !simIDs.contains($0.id) }
-        return (sim, rel, notes.joined(separator: "; "))
+        return (sim, rel, adapt, notes.joined(separator: "; "))
     }
 
     /// Списки жанров, тегов, типов и статусов берём у сайта.
@@ -9779,6 +9782,12 @@ struct MangaReaderView: View {
         switch effAnim {
         case "book":
             GeometryReader { geo in
+                let ref = pages[min(current, max(pages.count - 1, 0))]
+                let ratio = ref.ratio > 0 ? ref.ratio : 1.5
+                let w0 = geo.size.width
+                let h0 = w0 * ratio
+                let fitH = min(h0, geo.size.height)
+                let fitW = h0 > geo.size.height ? fitH / ratio : w0
                 ZStack {
                     Color.black
                         .contentShape(Rectangle())
@@ -9788,7 +9797,7 @@ struct MangaReaderView: View {
                             ? AnyView(MangaPageView(page: pages[i], dim: 0.9, autoBG: effAutoBG, onTap: handleTap))
                             : AnyView(endCard)
                     }
-                    .frame(width: geo.size.width, height: geo.size.height)
+                    .frame(width: fitW, height: fitH)
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
@@ -11818,6 +11827,7 @@ struct ChapterSearchSheet: View {
 final class SimilarViewModel: ObservableObject {
     @Published var similar: [Anime] = []
     @Published var related: [Anime] = []
+    @Published var adapt: [Anime] = []
     @Published var note = ""
     @Published var loaded = false
     private var loadedFor: Int?
@@ -11828,9 +11838,11 @@ final class SimilarViewModel: ObservableObject {
         let r = await AnimelibAPI.shared.similarTitles(slug: slug)
         similar = r.similar
         related = r.related
+        adapt = r.adapt
         note = r.note
         loaded = true
         ImageLoader.prefetch((r.similar + r.related).compactMap { $0.imageURL })
+        ImageLoader.prefetch(r.adapt.compactMap { $0.imageURL })
     }
 }
 
@@ -11889,18 +11901,28 @@ struct TitleActionsRow: View {
                 }
             }
             chip("bubble.left.and.bubble.right.fill", "Комментарии", nil, onComments)
-            if !vm.related.isEmpty || !vm.similar.isEmpty {
-                let both = !vm.related.isEmpty && !vm.similar.isEmpty
-                chip(both ? "square.stack.3d.up.fill" : (vm.related.isEmpty ? "sparkles" : "link"),
-                     both ? "Похожее" : (vm.related.isEmpty ? "Похожие" : "Связанное"),
-                     vm.related.count + vm.similar.count) { showSheet = true }
+            if !vm.related.isEmpty || !vm.similar.isEmpty || !vm.adapt.isEmpty {
+                let relEmpty = vm.related.isEmpty && vm.adapt.isEmpty
+                let both = !relEmpty && !vm.similar.isEmpty
+                chip(both ? "square.stack.3d.up.fill" : (relEmpty ? "sparkles" : "link"),
+                     both ? "Похожее" : (relEmpty ? "Похожие" : "Связанное"),
+                     vm.related.count + vm.similar.count + vm.adapt.count) { showSheet = true }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: anime.id) { await vm.load(anime) }
         .sheet(isPresented: $showSheet) {
-            SimilarSheet(related: vm.related, similar: vm.similar, start: startTab) { a in
+            SimilarSheet(related: vm.related, similar: vm.similar, adapt: vm.adapt, start: startTab) { a, isAdapt in
                 showSheet = false
+                if isAdapt {
+                    // экранизация живёт на сайте аниме: переключаем платформу и ищем её в каталоге
+                    UserDefaults.standard.set("anime", forKey: "set.platform")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        AppRouter.shared.openCatalog(query: a.displayTitle)
+                        AppRouter.shared.toast = "Платформа: Аниме"
+                    }
+                    return
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                     pushed = a
                     pushActive = true
@@ -11944,8 +11966,9 @@ struct SimilarCell: View {
 struct SimilarSheet: View {
     let related: [Anime]
     let similar: [Anime]
+    var adapt: [Anime] = []
     let start: Int
-    let onPick: (Anime) -> Void
+    let onPick: (Anime, Bool) -> Void
     @State private var tab = 0
     @State private var limit = 18
     @Environment(\.dismiss) private var dismiss
@@ -11954,6 +11977,7 @@ struct SimilarSheet: View {
     private var tabs: [(title: String, icon: String, list: [Anime])] {
         var t: [(title: String, icon: String, list: [Anime])] = []
         if !related.isEmpty { t.append(("Связанное", "link", related)) }
+        if !adapt.isEmpty { t.append(("Экранизации", "tv", adapt)) }
         if !similar.isEmpty { t.append(("Похожие", "sparkles", similar)) }
         return t
     }
@@ -11996,7 +12020,7 @@ struct SimilarSheet: View {
                     }
                     LazyVGrid(columns: columns, spacing: 14) {
                         ForEach(shown) { a in
-                            Button { Haptics.tap(); onPick(a) } label: { SimilarCell(anime: a) }
+                            Button { Haptics.tap(); onPick(a, all.indices.contains(tab) && all[tab].title == "Экранизации") } label: { SimilarCell(anime: a) }
                                 .buttonStyle(.plain)
                         }
                     }
