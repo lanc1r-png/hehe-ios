@@ -2271,287 +2271,459 @@ struct SettingsView: View {
     }
 
     private var hero: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "sparkles.tv.fill")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 66, height: 66)
-                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .shadow(color: Theme.accent.opacity(0.45), radius: 12, y: 6)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Yume").font(.title.bold())
-                Text(heroSubtitle).font(.footnote).foregroundStyle(.secondary)
-                if let u = auth.user {
-                    Label(u.username, systemImage: "person.crop.circle.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Theme.accent)
+        VStack(spacing: 16) {
+            HStack(spacing: 14) {
+                Image(systemName: "sparkles.tv.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 66, height: 66)
+                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
+                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .shadow(color: Theme.accent.opacity(0.45), radius: 12, y: 6)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Yume").font(.title.bold())
+                    Text(heroSubtitle).font(.footnote).foregroundStyle(.secondary)
+                    if let u = auth.user {
+                        Label(u.username, systemImage: "person.crop.circle.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Theme.accent)
+                    }
                 }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            HStack(spacing: 10) {
+                heroStat("heart.fill", "\(FavoritesStore.current.items.count)", "Избранное")
+                heroStat("arrow.down.circle.fill", "\(offline.allEntries.count)", "Скачано")
+                heroStat("internaldrive.fill", fmtBytes(offline.totalBytes), "Занято")
+            }
         }
         .padding(16)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .background {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(LinearGradient(colors: [Theme.accent.opacity(0.28), Theme.card],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+        }
+    }
+
+    private func heroStat(_ icon: String, _ value: String, _ title: String) -> some View {
+        VStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.accent)
+            Text(value).font(.subheadline.weight(.bold).monospacedDigit()).lineLimit(1).minimumScaleFactor(0.7)
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    // MARK: ряды в стиле «Настроек» iOS
+
+    private func iconBadge(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 30, height: 30)
+            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private var rowDivider: some View { Divider().padding(.leading, 42) }
+
+    private func listCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        VStack(spacing: 0) { content() }
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private func section<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.title3.weight(.bold)).padding(.horizontal, 6)
+            listCard { content() }
+            if let footer {
+                Text(footer).font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func toggleRow(_ icon: String, _ title: String, _ on: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            iconBadge(icon)
+            Toggle(title, isOn: on).tint(Theme.accent)
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func actionRow(_ icon: String, _ title: String, tint: Color = .primary, _ run: @escaping () -> Void) -> some View {
+        Button(action: run) {
+            HStack(spacing: 12) {
+                iconBadge(icon)
+                Text(title).foregroundStyle(tint)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.pressable)
+    }
+
+    private func linkRow<D: View>(_ icon: String, _ title: String, value: String? = nil,
+                                  @ViewBuilder _ dest: @escaping () -> D) -> some View {
+        NavigationLink {
+            dest()
+        } label: {
+            HStack(spacing: 12) {
+                iconBadge(icon)
+                Text(title).foregroundStyle(.primary)
+                Spacer(minLength: 8)
+                if let value { Text(value).font(.footnote).foregroundStyle(.secondary) }
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.pressable)
+    }
+
+    private func textRow(_ t: String) -> some View {
+        Text(t).font(.caption).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.vertical, 10)
+    }
+
+    private func segRow(_ title: String, _ sel: Binding<String>, _ options: [(String, String)]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.footnote).foregroundStyle(.secondary)
+            Picker(title, selection: sel) {
+                ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(.vertical, 10)
+    }
+
+    // MARK: внешний вид
+
+    private func themePreview(_ id: String) -> some View {
+        let darkBG = Color(white: 0.11), lightBG = Color(white: 0.96)
+        return ZStack {
+            if id == "dark" {
+                darkBG
+            } else if id == "light" {
+                lightBG
+            } else {
+                HStack(spacing: 0) { lightBG; darkBG }
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Capsule().fill(Theme.accent).frame(width: 30, height: 7)
+                Capsule().fill(id == "light" ? Color.black.opacity(0.18) : Color.white.opacity(0.28)).frame(width: 46, height: 5)
+                Capsule().fill(id == "light" ? Color.black.opacity(0.12) : Color.white.opacity(0.18)).frame(width: 36, height: 5)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .padding(.leading, 12)
+        }
+        .frame(height: 62)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var themeBlock: some View {
+        card("Оформление", icon: "paintpalette.fill") {
+            HStack(spacing: 10) {
+                ForEach([("system", "Как в системе"), ("dark", "Тёмная"), ("light", "Светлая")], id: \.0) { t in
+                    let on = appTheme == t.0
+                    Button { Haptics.select(); appTheme = t.0 } label: {
+                        VStack(spacing: 8) {
+                            themePreview(t.0)
+                            Text(t.1).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                        }
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(8)
+                        .background(on ? Theme.accent.opacity(0.18) : Theme.chip,
+                                    in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(Theme.accent, lineWidth: on ? 2.5 : 0))
+                    }
+                    .buttonStyle(.pressable)
+                }
+            }
+        }
+    }
+
+    private var accentBlock: some View {
+        card("Цвет акцента", icon: "drop.fill") {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(presets, id: \.1) { p in
+                        let on = accentHex.uppercased() == p.1
+                        Circle()
+                            .fill(Color(hex: p.1))
+                            .frame(width: 40, height: 40)
+                            .overlay {
+                                if on { Image(systemName: "checkmark").font(.footnote.bold()).foregroundStyle(.white) }
+                            }
+                            .padding(4)
+                            .overlay(Circle().stroke(Color(hex: p.1), lineWidth: on ? 2.5 : 0))
+                            .shadow(color: Color(hex: p.1).opacity(on ? 0.5 : 0), radius: 8, y: 3)
+                            .onTapGesture { Haptics.select(); accentHex = p.1 }
+                    }
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 2)
+            }
+            ColorPicker("Свой цвет", selection: $custom, supportsOpacity: false)
+                .onChange(of: custom) { c in accentHex = c.hexString }
+        }
+    }
+
+    private var platformBlock: some View {
+        card("Платформа", icon: "square.stack.3d.up.fill") {
+            HStack(spacing: 10) {
+                ForEach(platforms, id: \.0) { pl in
+                    let on = platform == pl.0
+                    Button { choosePlatform(pl.0) } label: {
+                        VStack(spacing: 6) {
+                            Image(systemName: platformIcon(pl.0)).font(.title2)
+                            Text(pl.1).font(.subheadline.weight(.semibold))
+                            Text(pl.2).font(.caption2).opacity(0.7)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .foregroundStyle(on ? Color.white : Color.primary)
+                        .background(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip),
+                                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay(alignment: .topTrailing) {
+                            if on {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.footnote)
+                                    .foregroundStyle(.white)
+                                    .padding(7)
+                                    .transition(.scale.combined(with: .opacity))
+                            }
+                        }
+                        .scaleEffect(on ? 1 : 0.96)
+                    }
+                    .buttonStyle(.pressable)
+                }
+            }
+            Text(platformHint)
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: чтение и просмотр
+
+    private var feelBlock: some View {
+        section("Ощущения") {
+            toggleRow("hand.tap.fill", "Вибрация при нажатиях", $haptics)
+                .onChange(of: haptics) { on in if on { Haptics.bump() } }
+            rowDivider
+            toggleRow("sun.max.fill", "Не гасить экран при чтении", $keepAwake)
+        }
+    }
+
+    private var ranobeBlock: some View {
+        section("Чтение ранобэ",
+                footer: "В режиме «Страницы» глава режется на страницы по размеру экрана. Размер шрифта и тему можно менять в самой читалке.") {
+            segRow("Режим", $novelMode, [("pages", "Страницы"), ("scroll", "Прокрутка")])
+            rowDivider
+            segRow("Листание", $novelAnim, [("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")])
+        }
+    }
+
+    private var mangaBlock: some View {
+        section("Чтение манги", footer: "Для каждого тайтла режим можно поменять прямо в читалке, он запомнится.") {
+            segRow("Режим по умолчанию", $mangaMode, [("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")])
+            rowDivider
+            segRow("Листание", $mangaAnim, [("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")])
+            rowDivider
+            toggleRow("hand.point.up.left.fill", "Листать тапом по краям экрана", $tapZones)
+            rowDivider
+            toggleRow("rectangle.inset.filled", "Фон под страницу (белый или чёрный по краям)", $mangaAutoBG)
+        }
+    }
+
+    private var playbackBlock: some View {
+        section("Воспроизведение",
+                footer: "Kodik открывается в веб-плеере: выбери качество и нажми «на весь экран», тогда включится родной плеер iOS. Если выключить первый пункт, весь экран останется внутри веб-плеера.") {
+            toggleRow("play.rectangle.fill", "Весь экран в родном плеере iOS", $autoNative)
+            rowDivider
+            toggleRow("bolt.fill", "Kodik: сразу родной плеер, без веб-плеера", $kodikDirect)
+            rowDivider
+            toggleRow("gobackward", "Продолжать с места остановки", $resume)
+            rowDivider
+            toggleRow("forward.end.fill", "Следующая серия сама после конца", $autoNext)
+        }
+    }
+
+    // MARK: данные
+
+    private var downloadsBlock: some View {
+        section("Загрузки · ранобэ и манга") {
+            if platform == "ranobe" || platform == "manga" {
+                linkRow("arrow.down.circle.fill", "Скачанное",
+                        value: "\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))") { OfflineLibraryView() }
+            } else {
+                textRow("Скачанные главы доступны на платформах «Ранобэ» и «Манга».")
+            }
+            rowDivider
+            HStack(spacing: 12) {
+                iconBadge("externaldrive.fill")
+                Picker("Лимит места", selection: $offLimit) {
+                    Text("Без лимита").tag(0)
+                    ForEach([1, 2, 3, 5, 10, 20, 50], id: \.self) { Text("\($0) ГБ").tag($0) }
+                }
+            }
+            .padding(.vertical, 6)
+            if offLimit > 0 {
+                rowDivider
+                segRow("При превышении", $offOverflow, [("refuse", "Отказаться"), ("purge", "Удалять прочитанное")])
+                textRow("Занято: \(fmtBytes(OfflineStore.usedBytes)) из \(offLimit) ГБ (ранобэ и манга вместе). «Отказаться»: загрузка останавливается на лимите. «Удалять прочитанное»: сначала стираются самые давние прочитанные главы.")
+            }
+            rowDivider
+            toggleRow("wifi", "Скачивать только по Wi‑Fi", $offWifi)
+            rowDivider
+            toggleRow("arrow.down.to.line", "Докачивать 3 следующие главы при чтении", $offPrefetch)
+            if offline.totalBytes > 0 {
+                rowDivider
+                actionRow("trash.fill", "Удалить все загрузки", tint: .red) { confirmOffline = true }
+            }
+        }
+        .confirmationDialog("Удалить все скачанные главы?", isPresented: $confirmOffline, titleVisibility: .visible) {
+            Button("Удалить", role: .destructive) { offline.removeAll() }
+        }
+    }
+
+    private var dataBlock: some View {
+        section("Данные", footer: info) {
+            actionRow("photo.stack.fill", "Очистить кэш обложек") {
+                ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
+            }
+            rowDivider
+            actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
+                ProgressStore.shared.clear(); HistoryStore.shared.clear()
+                HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear()
+                info = "История просмотра и чтения сброшена"
+            }
+            rowDivider
+            actionRow("heart.slash.fill", "Очистить избранное", tint: .red) {
+                FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
+            }
+        }
+    }
+
+    private var statsBlock: some View {
+        section("Статистика", footer: "Сколько просмотрено и прочитано, серия дней подряд.") {
+            linkRow("chart.bar.xaxis", "Моя активность") { StatsView() }
+        }
+    }
+
+    private var backupBlock: some View {
+        section("Резервная копия") {
+            textRow("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
+            rowDivider
+            HStack(spacing: 12) {
+                iconBadge("folder.fill")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Файлы → На iPhone → Yume").font(.footnote.weight(.semibold)).foregroundStyle(Theme.accent)
+                    if let d = BackupManager.lastAuto {
+                        Text("Обновлено: \(d.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 10)
+            rowDivider
+            textRow("Перед удалением приложения скопируй этот файл. После новой установки положи его в ту же папку и заново открой Yume: всё подхватится само.")
+            rowDivider
+            actionRow("arrow.down.doc.fill", "Загрузить из файла в папке приложения") {
+                let r = BackupManager.readAppFolderCopy()
+                BackupManager.acceptExternal()
+                finishRestore(r.0, r.1)
+            }
+            rowDivider
+            actionRow("square.and.arrow.up.fill", "Отправить копию (Telegram, Файлы…)") {
+                if let u = BackupManager.shareURL() { shareItem = ShareItem(url: u) }
+                else { backupInfo = "Не удалось подготовить файл." }
+            }
+            if restored {
+                rowDivider
+                actionRow("power", "Закрыть приложение, чтобы применить") { exit(0) }
+            }
+            if !backupInfo.isEmpty {
+                rowDivider
+                textRow(backupInfo)
+            }
+        }
+        .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
+    }
+
+    private var miscBlock: some View {
+        section("Прочее") {
+            linkRow("waveform.path.ecg", "Журнал запросов сайта") { SiteLogView() }
+            rowDivider
+            textRow("Открывает сайт внутри приложения и записывает, какие запросы он отправляет, когда ты отмечаешь серию или главу. Нужен, чтобы настроить синхронизацию с сайтом.")
+            rowDivider
+            if let u = auth.user {
+                HStack(spacing: 12) {
+                    iconBadge("person.crop.circle.fill")
+                    Text("Вы вошли как \(u.username)")
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 10)
+                rowDivider
+                actionRow("rectangle.portrait.and.arrow.right", "Выйти", tint: .red) { auth.signOut() }
+            } else {
+                HStack(spacing: 12) {
+                    iconBadge("person.crop.circle.fill")
+                    Text("Вход выполняется во вкладке «Профиль».").foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 10)
+            }
+            rowDivider
+            HStack(spacing: 12) {
+                iconBadge("info.circle.fill")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Yume · версия 1.0")
+                    Text("Данные: animelib.org. Приложение неофициальное.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 10)
+        }
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 14) {
+                VStack(spacing: 22) {
                     hero
-                    groupTitle("Внешний вид")
-                    card("Оформление", icon: "paintpalette.fill", tint: .pink) {
-                        Picker("Тема", selection: $appTheme) {
-                            Text("Как в системе").tag("system")
-                            Text("Тёмная").tag("dark")
-                            Text("Светлая").tag("light")
-                        }
-                        .pickerStyle(.segmented)
+                    VStack(spacing: 12) {
+                        Text("Внешний вид").font(.title3.weight(.bold))
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
+                        themeBlock
+                        accentBlock
+                        platformBlock
                     }
-
-                    card("Цвет акцента", icon: "drop.fill", tint: Theme.accent) {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 12) {
-                                ForEach(presets, id: \.1) { p in
-                                    Circle()
-                                        .fill(Color(hex: p.1))
-                                        .frame(width: 36, height: 36)
-                                        .overlay {
-                                            if accentHex.uppercased() == p.1 {
-                                                Image(systemName: "checkmark").font(.footnote.bold()).foregroundStyle(.white)
-                                            }
-                                        }
-                                        .onTapGesture { accentHex = p.1 }
-                                }
-                            }
-                        }
-                        ColorPicker("Свой цвет", selection: $custom, supportsOpacity: false)
-                            .onChange(of: custom) { c in accentHex = c.hexString }
-                    }
-
-                    card("Платформа", icon: "square.stack.3d.up.fill", tint: .blue) {
-                        HStack(spacing: 10) {
-                            ForEach(platforms, id: \.0) { pl in
-                                let on = platform == pl.0
-                                Button { choosePlatform(pl.0) } label: {
-                                    VStack(spacing: 6) {
-                                        Image(systemName: platformIcon(pl.0)).font(.title2)
-                                        Text(pl.1).font(.subheadline.weight(.semibold))
-                                        Text(pl.2).font(.caption2).opacity(0.7)
-                                    }
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 14)
-                                    .foregroundStyle(on ? Color.white : Color.primary)
-                                    .background(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip),
-                                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                                    .overlay(alignment: .topTrailing) {
-                                        if on {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .font(.footnote)
-                                                .foregroundStyle(.white)
-                                                .padding(7)
-                                                .transition(.scale.combined(with: .opacity))
-                                        }
-                                    }
-                                    .scaleEffect(on ? 1 : 0.96)
-                                }
-                                .buttonStyle(.pressable)
-                            }
-                        }
-                        Text(platformHint)
-                            .font(.caption).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    groupTitle("Чтение и просмотр")
-                    card("Ощущения", icon: "hand.tap.fill", tint: .orange) {
-                        Toggle("Вибрация при нажатиях", isOn: $haptics)
-                            .onChange(of: haptics) { on in if on { Haptics.bump() } }
-                        Toggle("Не гасить экран при чтении", isOn: $keepAwake)
-                    }
-                    .tint(Theme.accent)
-
-                    if platform == "ranobe" {
-                        card("Чтение ранобэ", icon: "text.book.closed.fill", tint: .teal) {
-                            Picker("Режим", selection: $novelMode) {
-                                Text("Страницы").tag("pages")
-                                Text("Прокрутка").tag("scroll")
-                            }
-                            .pickerStyle(.segmented)
-                            Picker("Листание", selection: $novelAnim) {
-                                Text("Сдвиг").tag("slide")
-                                Text("Плавно").tag("fade")
-                                Text("Как в книге").tag("book")
-                            }
-                            .pickerStyle(.segmented)
-                            Text("В режиме «Страницы» глава режется на страницы по размеру экрана. Размер шрифта и тему можно менять в самой читалке.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        .tint(Theme.accent)
-                    }
-
-                    if platform == "manga" {
-                        card("Чтение манги", icon: "books.vertical.fill", tint: .indigo) {
-                            Picker("Режим по умолчанию", selection: $mangaMode) {
-                                Text("Авто").tag("auto")
-                                Text("Страницы").tag("pages")
-                                Text("Лента").tag("scroll")
-                            }
-                            .pickerStyle(.segmented)
-                            Picker("Листание", selection: $mangaAnim) {
-                                Text("Сдвиг").tag("slide")
-                                Text("Плавно").tag("fade")
-                                Text("Как в книге").tag("book")
-                            }
-                            .pickerStyle(.segmented)
-                            Toggle("Листать тапом по краям экрана", isOn: $tapZones)
-                            Toggle("Фон под страницу (белый или чёрный по краям)", isOn: $mangaAutoBG)
-                            Text("Для каждого тайтла режим можно поменять прямо в читалке, он запомнится.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        .tint(Theme.accent)
-                    }
-
-                    card("Воспроизведение", icon: "play.rectangle.fill", tint: .red) {
-                        Toggle("Весь экран в родном плеере iOS", isOn: $autoNative)
-                        Toggle("Kodik: сразу родной плеер, без веб-плеера", isOn: $kodikDirect)
-                        Toggle("Продолжать с места остановки", isOn: $resume)
-                        Toggle("Следующая серия сама после конца", isOn: $autoNext)
-                        Text("Kodik открывается в веб-плеере: выбери качество и нажми «на весь экран», тогда включится родной плеер iOS. Если выключить первый пункт, весь экран останется внутри веб-плеера.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    .tint(Theme.accent)
-
-                    groupTitle("Данные")
-                    card("Загрузки · ранобэ и манга", icon: "arrow.down.circle.fill", tint: .green) {
-                        if platform == "ranobe" || platform == "manga" {
-                            NavigationLink {
-                                OfflineLibraryView()
-                            } label: {
-                                HStack {
-                                    Label("Скачанное", systemImage: "arrow.down.circle")
-                                    Spacer()
-                                    Text("\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                            .buttonStyle(.pressable)
-                        } else {
-                            Text("Скачанные главы доступны на платформах «Ранобэ» и «Манга».")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Picker("Лимит места", selection: $offLimit) {
-                            Text("Без лимита").tag(0)
-                            ForEach([1, 2, 3, 5, 10, 20, 50], id: \.self) { Text("\($0) ГБ").tag($0) }
-                        }
-                        if offLimit > 0 {
-                            Picker("При превышении", selection: $offOverflow) {
-                                Text("Отказаться").tag("refuse")
-                                Text("Удалять прочитанное").tag("purge")
-                            }
-                            .pickerStyle(.segmented)
-                            Text("Занято: \(fmtBytes(OfflineStore.usedBytes)) из \(offLimit) ГБ (ранобэ и манга вместе). «Отказаться»: загрузка останавливается на лимите. «Удалять прочитанное»: сначала стираются самые давние прочитанные главы.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Toggle("Скачивать только по Wi‑Fi", isOn: $offWifi)
-                        Toggle("Докачивать 3 следующие главы при чтении", isOn: $offPrefetch)
-                        if offline.totalBytes > 0 {
-                            Button("Удалить все загрузки", role: .destructive) { confirmOffline = true }
-                        }
-                    }
-                    .tint(Theme.accent)
-                    .confirmationDialog("Удалить все скачанные главы?", isPresented: $confirmOffline, titleVisibility: .visible) {
-                        Button("Удалить", role: .destructive) { offline.removeAll() }
-                    }
-
-                    card("Данные", icon: "internaldrive.fill", tint: .gray) {
-                        Button("Очистить кэш обложек") {
-                            ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
-                        }
-                        Button("Сбросить историю просмотра") {
-                            ProgressStore.shared.clear(); HistoryStore.shared.clear()
-                            HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear()
-                            info = "История просмотра и чтения сброшена"
-                        }
-                        Button("Очистить избранное") {
-                            FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
-                        }
-                        if let i = info { Text(i).font(.caption).foregroundStyle(.secondary) }
-                    }
-
-                    card("Статистика", icon: "chart.bar.xaxis", tint: .purple) {
-                        NavigationLink {
-                            StatsView()
-                        } label: {
-                            Label("Моя активность", systemImage: "chart.bar.xaxis")
-                        }
-                        Text("Сколько просмотрено и прочитано, серия дней подряд.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-
-                    card("Резервная копия", icon: "icloud.and.arrow.up.fill", tint: .cyan) {
-                        Text("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Label("Файлы → На iPhone → Yume", systemImage: "folder.fill")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(Theme.accent)
-                        if let d = BackupManager.lastAuto {
-                            Text("Последнее обновление: \(d.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                        Text("Перед удалением приложения скопируй этот файл. После новой установки положи его в ту же папку и заново открой Yume: всё подхватится само.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Button {
-                            let r = BackupManager.readAppFolderCopy()
-                            BackupManager.acceptExternal()
-                            finishRestore(r.0, r.1)
-                        } label: {
-                            Label("Загрузить из файла в папке приложения", systemImage: "arrow.down.doc")
-                        }
-                        Button {
-                            if let u = BackupManager.shareURL() { shareItem = ShareItem(url: u) }
-                            else { backupInfo = "Не удалось подготовить файл." }
-                        } label: {
-                            Label("Отправить копию (Telegram, Файлы…)", systemImage: "square.and.arrow.up")
-                        }
-                        .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
-                        if restored {
-                            Button("Закрыть приложение, чтобы применить") { exit(0) }
-                                .foregroundStyle(Theme.accent)
-                        }
-                        if !backupInfo.isEmpty {
-                            Text(backupInfo).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-
-                    groupTitle("Прочее")
-                    card("Для разработчика", icon: "hammer.fill", tint: .gray) {
-                        NavigationLink {
-                            SiteLogView()
-                        } label: {
-                            Label("Журнал запросов сайта", systemImage: "waveform.path.ecg")
-                        }
-                        Text("Открывает сайт внутри приложения и записывает, какие запросы он отправляет, когда ты отмечаешь серию или главу. Нужен, чтобы настроить синхронизацию с сайтом.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-
-                    card("Аккаунт", icon: "person.crop.circle.fill", tint: .mint) {
-                        if let u = auth.user {
-                            Text("Вы вошли как \(u.username)")
-                            Button("Выйти", role: .destructive) { auth.signOut() }
-                        } else {
-                            Text("Вход выполняется во вкладке «Профиль».").foregroundStyle(.secondary)
-                        }
-                    }
-
-                    card("О приложении", icon: "info.circle.fill", tint: .brown) {
-                        Text("Yume · версия 1.0")
-                        Text("Данные: animelib.org. Приложение неофициальное.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
+                    feelBlock
+                    if platform == "ranobe" { ranobeBlock }
+                    if platform == "manga" { mangaBlock }
+                    playbackBlock
+                    downloadsBlock
+                    dataBlock
+                    statsBlock
+                    backupBlock
+                    miscBlock
                 }
                 .padding(14)
+                .padding(.bottom, 90)
             }
             .background(AppBackground())
             .navigationTitle("Настройки")
