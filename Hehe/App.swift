@@ -2237,20 +2237,17 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 30, height: 30)
-                    .background(LinearGradient(colors: [tint, tint.opacity(0.6)], startPoint: .topLeading, endPoint: .bottomTrailing),
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 32, height: 32)
+                    .background(Theme.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 Text(title).font(.headline).lineLimit(1).minimumScaleFactor(0.8)
             }
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
-        .background(LinearGradient(colors: [tint.opacity(0.12), Theme.card], startPoint: .topLeading, endPoint: .bottomTrailing),
-                    in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(tint.opacity(0.18)))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private func groupTitle(_ t: String) -> some View {
@@ -2290,10 +2287,7 @@ struct SettingsView: View {
             Spacer(minLength: 0)
         }
         .padding(16)
-        .background(LinearGradient(colors: [Theme.accent.opacity(0.30), Theme.accent2.opacity(0.10)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing),
-                    in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Theme.accent.opacity(0.25)))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 
     var body: some View {
@@ -2344,11 +2338,8 @@ struct SettingsView: View {
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 14)
                                     .foregroundStyle(on ? Color.white : Color.primary)
-                                    .background(
-                                        on ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.6)],
-                                                                          startPoint: .topLeading, endPoint: .bottomTrailing))
-                                           : AnyShapeStyle(Theme.chip),
-                                        in: RoundedRectangle(cornerRadius: 16))
+                                    .background(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.chip),
+                                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                                     .overlay(alignment: .topTrailing) {
                                         if on {
                                             Image(systemName: "checkmark.circle.fill")
@@ -2565,7 +2556,7 @@ struct SettingsView: View {
             } message: {
                 Text("Чтобы всё подхватилось, приложение закроется. Открой Yume снова.")
             }
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayMode(.large)
         }
     }
 }
@@ -2721,6 +2712,17 @@ struct TopBlur: View {
     }
 }
 
+extension View {
+    /// Маленькая стеклянная капсула для бейджей и кнопок (на iOS 26 настоящее стекло, ниже — блюр).
+    @ViewBuilder func glassCapsule() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: Capsule())
+        } else {
+            self.background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+}
+
 struct SectionHeader: View {
     let title: String
     var action: (() -> Void)? = nil
@@ -2764,7 +2766,8 @@ struct PosterCard: View {
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.55), in: Capsule())
+                            .background(Color.black.opacity(0.22), in: Capsule())
+                            .glassCapsule()
                             .padding(6)
                     }
                 }
@@ -2774,12 +2777,13 @@ struct PosterCard: View {
                             .font(.caption2.bold())
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.55), in: Capsule())
+                            .background(Color.black.opacity(0.22), in: Capsule())
+                            .glassCapsule()
                             .padding(6)
                     }
                 }
             Text(anime.displayTitle)
-                .font(.footnote.weight(.medium))
+                .font(width > 140 ? .subheadline.weight(.medium) : .footnote.weight(.medium))
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
                 .frame(width: width, alignment: .leading)
@@ -2790,6 +2794,8 @@ struct PosterCard: View {
 struct AnimeRow: View {
     let anime: Anime
     var rank: Int? = nil
+    /// Лёгкий вид без плашки: обложка, название, рейтинг.
+    var light = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -2800,8 +2806,8 @@ struct AnimeRow: View {
                     .frame(width: 22)
             }
             RemoteImage(url: anime.imageURL)
-                .frame(width: 52, height: 78)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .frame(width: light ? 58 : 52, height: light ? 87 : 78)
+                .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
             VStack(alignment: .leading, spacing: 4) {
                 Text(anime.displayTitle)
                     .font(.subheadline.weight(.semibold))
@@ -2819,8 +2825,13 @@ struct AnimeRow: View {
                     .foregroundStyle(.yellow)
             }
         }
-        .padding(10)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+        .padding(light ? EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0) : EdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10))
+        .background {
+            if !light { RoundedRectangle(cornerRadius: 16).fill(Theme.card) }
+        }
+        .overlay(alignment: .bottom) {
+            if light { Divider().opacity(0.5).padding(.leading, 34) }
+        }
     }
 }
 
@@ -2874,7 +2885,7 @@ struct HomeView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(list) { a in
-                    TitleLink(anime: a) { PosterCard(anime: a) }
+                    TitleLink(anime: a) { PosterCard(anime: a, width: 154) }
                         .buttonStyle(.pressable)
                 }
             }
@@ -2884,22 +2895,9 @@ struct HomeView: View {
 
     var body: some View {
         NavigationStack {
-            GeometryReader { geo in
+            Group {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(LibSite.current.title)
-                                .font(.system(size: 32, weight: .heavy, design: .rounded))
-                            SearchBar(text: $query) {
-                                let q = query.trimmingCharacters(in: .whitespaces)
-                                guard !q.isEmpty else { return }
-                                SearchHistory.shared.add(q)
-                                router.openCatalog(query: q)
-                                query = ""
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.top, geo.safeAreaInsets.top + 4)
 
                         if let e = vm.error, vm.fresh.isEmpty {
                             VStack(spacing: 12) {
@@ -2961,9 +2959,9 @@ struct HomeView: View {
                         if !vm.popular.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Сейчас читают" : "Сейчас смотрят") { router.openCatalog(sort: .views) }
-                                LazyVStack(spacing: 8) {
+                                LazyVStack(spacing: 0) {
                                     ForEach(Array(vm.popular.enumerated()), id: \.element.id) { i, a in
-                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1) }
+                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true) }
                                             .buttonStyle(.pressable)
                                     }
                                     if vm.canLoadMorePopular {
@@ -2998,16 +2996,24 @@ struct HomeView: View {
                         }
 
                         if vm.isLoading && vm.fresh.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.top, 30) }
-                        Color.clear.frame(height: 80)
+                        Color.clear.frame(height: 120)
                     }
+                    .padding(.top, 6)
                 }
                 .scrollDismissesKeyboard(.immediately)
                 .refreshable { await vm.load(force: true) }
-                .ignoresSafeArea(edges: .top)
-                .overlay(alignment: .top) { TopBlur(inset: geo.safeAreaInsets.top) }
             }
             .background(AppBackground())
-            .toolbar(.hidden, for: .navigationBar)
+            .navigationTitle(LibSite.current.title)
+            .navigationBarTitleDisplayMode(.large)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск по названию")
+            .onSubmit(of: .search) {
+                let q = query.trimmingCharacters(in: .whitespaces)
+                guard !q.isEmpty else { return }
+                SearchHistory.shared.add(q)
+                router.openCatalog(query: q)
+                query = ""
+            }
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .task { await vm.load() }
@@ -6591,6 +6597,7 @@ struct ProfileView: View {
     @StateObject private var vm = ProfileViewModel()
     @StateObject private var friendsVM = FriendsViewModel()
     @State private var showLogin = false
+    @State private var confirmSignOut = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     private func folderIcon(_ name: String) -> String {
@@ -6612,7 +6619,31 @@ struct ProfileView: View {
             .minimumScaleFactor(0.8)
             .foregroundStyle(tint)
             .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
+            .glassCapsule()
+    }
+
+    private func folderTile(_ f: BookmarkFolder) -> some View {
+        let on = f.id == vm.selected
+        return Button { Haptics.select(); Task { await vm.select(f.id) } } label: {
+            HStack(spacing: 10) {
+                Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold)).frame(width: 24)
+                Text(f.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 4)
+                Text(f.count.map(String.init) ?? "")
+                    .font(.title3.bold().monospacedDigit())
+            }
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+            .foregroundStyle(on ? Color.white : Color.primary)
+            .background {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.card))
+            }
+        }
+        .buttonStyle(.pressable)
     }
 
     private func friendsTile(userID: Int) -> some View {
@@ -6654,11 +6685,7 @@ struct ProfileView: View {
                 Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
             }
             .padding(14)
-            .background(
-                LinearGradient(colors: [Theme.accent.opacity(0.22), Theme.card],
-                               startPoint: .leading, endPoint: .trailing),
-                in: RoundedRectangle(cornerRadius: 20))
-            .overlay(RoundedRectangle(cornerRadius: 20).stroke(Theme.chip))
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         }
         .buttonStyle(.pressable)
     }
@@ -6708,9 +6735,6 @@ struct ProfileView: View {
                                     if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
                                     if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
                                 }
-                                Button("Выйти") { auth.signOut() }
-                                    .font(.footnote)
-                                    .foregroundStyle(.red)
                             }
                             .padding(.top, 10)
                             .padding(.horizontal, 14)
@@ -6718,8 +6742,7 @@ struct ProfileView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .background(Theme.card)
-                        .clipShape(RoundedRectangle(cornerRadius: 22))
-                        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.chip))
+                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
 
                         friendsTile(userID: u.id)
 
@@ -6736,33 +6759,14 @@ struct ProfileView: View {
                         }
 
                         if !vm.folders.isEmpty {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 10)], spacing: 10) {
-                                ForEach(vm.folders) { f in
-                                    Button { Task { await vm.select(f.id) } } label: {
-                                        VStack(alignment: .leading, spacing: 6) {
-                                            HStack {
-                                                Image(systemName: folderIcon(f.name)).font(.subheadline)
-                                                Spacer()
-                                                Text(f.count.map(String.init) ?? "")
-                                                    .font(.title3.bold())
-                                            }
-                                            Text(f.name)
-                                                .font(.caption.weight(.semibold))
-                                                .lineLimit(1)
-                                                .minimumScaleFactor(0.8)
-                                        }
-                                        .padding(12)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .foregroundStyle(f.id == vm.selected ? Color.white : Color.primary)
-                                        .background(
-                                            f.id == vm.selected
-                                                ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.6)],
-                                                                               startPoint: .topLeading, endPoint: .bottomTrailing))
-                                                : AnyShapeStyle(Material.ultraThinMaterial),
-                                            in: RoundedRectangle(cornerRadius: 16))
-                                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.chip))
+                            let rows: [[BookmarkFolder]] = stride(from: 0, to: vm.folders.count, by: 2).map {
+                                Array(vm.folders[$0..<min($0 + 2, vm.folders.count)])
+                            }
+                            VStack(spacing: 10) {
+                                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                                    HStack(spacing: 10) {
+                                        ForEach(row) { folderTile($0) }
                                     }
-                                    .buttonStyle(.pressable)
                                 }
                             }
                         }
@@ -6830,6 +6834,17 @@ struct ProfileView: View {
             .background(AppBackground())
             .navigationTitle("Профиль")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if auth.user != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { confirmSignOut = true } label: { Image(systemName: "rectangle.portrait.and.arrow.right") }
+                    }
+                }
+            }
+            .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+                Button("Выйти", role: .destructive) { auth.signOut() }
+                Button("Отмена", role: .cancel) {}
+            }
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .sheet(isPresented: $showLogin) { LoginSheet() }
