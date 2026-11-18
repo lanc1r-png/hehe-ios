@@ -64,7 +64,8 @@ struct LibSite: Hashable {
     let title: String
 
     var isRanobe: Bool { key == "ranobe" }
-    var isManga: Bool { key == "manga" }
+    var isManga: Bool { key == "manga" || key == "hentai" }
+    var isHentai: Bool { key == "hentai" }
     /// Ранобэ и манга устроены одинаково: тайтл, тома и главы.
     var isBook: Bool { key != "anime" }
 
@@ -79,10 +80,15 @@ struct LibSite: Hashable {
                                origin: "https://mangalib.me", apiPath: "/manga",
                                postType: "manga", title: "Манга")
 
+    static let hentai = LibSite(key: "hentai", id: "4", referer: "https://kz.hentailib.me/",
+                                origin: "https://kz.hentailib.me", apiPath: "/manga",
+                                postType: "manga", title: "Hentai")
+
     static var current: LibSite {
         switch UserDefaults.standard.string(forKey: "set.platform") {
         case "ranobe": return .ranobe
         case "manga": return .manga
+        case "hentai": return .hentai
         default: return .anime
         }
     }
@@ -747,7 +753,7 @@ actor AnimelibAPI {
                 let model = (d["model"] as? String)?.lowercased() ?? ""
                 let isTitleLike = J.int(d["id"]) != nil && d["slug_url"] != nil
                     && !["people", "user", "team"].contains(model)
-                let sameSite = !["anime", "manga", "ranobe"].contains(model) || model == siteKey
+                let sameSite = !["anime", "manga", "ranobe", "hentai"].contains(model) || model == siteKey
                 if isTitleLike, sameSite,
                    let data = try? JSONSerialization.data(withJSONObject: d),
                    let a = try? decoder.decode(Anime.self, from: data) {
@@ -991,6 +997,7 @@ func titleURL(_ a: Anime) -> URL? {
     switch LibSite.current.key {
     case "ranobe": return URL(string: "https://ranobelib.me/ru/book/\(slug)")
     case "manga": return URL(string: "https://mangalib.me/ru/manga/\(slug)")
+    case "hentai": return URL(string: "https://kz.hentailib.me/ru/manga/\(slug)")
     default: return URL(string: "https://animelib.org/ru/anime/\(slug)")
     }
 }
@@ -1288,8 +1295,10 @@ final class FavoritesStore: ObservableObject {
     static let shared = FavoritesStore(key: "favorites.v1")
     static let novels = FavoritesStore(key: "favorites.novels.v1")
     static let manga = FavoritesStore(key: "favorites.manga.v1")
+    static let hentai = FavoritesStore(key: "favorites.hentai.v1")
     static var current: FavoritesStore {
         let site = LibSite.current
+        if site.isHentai { return hentai }
         return site.isManga ? manga : (site.isRanobe ? novels : shared)
     }
     @Published private(set) var items: [Anime] = []
@@ -1979,8 +1988,8 @@ enum BackupManager {
                 return sum + a.count
             }
         }
-        let fav = count(["favorites.v1", "favorites.novels.v1", "favorites.manga.v1"])
-        let hist = count(["history.v1", "history.novels.v1", "history.manga.v1"])
+        let fav = count(["favorites.v1", "favorites.novels.v1", "favorites.manga.v1", "favorites.hentai.v1"])
+        let hist = count(["history.v1", "history.novels.v1", "history.manga.v1", "history.hentai.v1"])
         var s = "В копии: избранное \(fav), история \(hist)"
         if let d = root["date"] as? Date { s += ", сохранена \(d.formatted(date: .abbreviated, time: .shortened))" }
         return s + "."
@@ -2109,6 +2118,7 @@ struct SiteLogView: View {
         switch LibSite.current.key {
         case "ranobe": base = "https://ranobelib.me/ru/"
         case "manga": base = "https://mangalib.me/ru/"
+        case "hentai": base = "https://kz.hentailib.me/ru/"
         default: base = "https://animelib.org/ru/"
         }
         return URL(string: base + path) ?? URL(string: base)!
@@ -2211,13 +2221,15 @@ struct SettingsView: View {
     private let platforms: [(String, String, String, Bool)] = [
         ("anime", "Аниме", "AnimeLib", true),
         ("ranobe", "Ранобэ", "RanobeLib", true),
-        ("manga", "Манга", "MangaLib", true)
+        ("manga", "Манга", "MangaLib", true),
+        ("hentai", "Hentai", "HentaiLib", true)
     ]
 
     private func platformIcon(_ id: String) -> String {
         switch id {
         case "ranobe": return "text.book.closed.fill"
         case "manga": return "books.vertical.fill"
+        case "hentai": return "flame.fill"
         default: return "play.rectangle.fill"
         }
     }
@@ -2226,6 +2238,7 @@ struct SettingsView: View {
         switch platform {
         case "ranobe": return "Ранобэ: читалка с темами и шрифтами, скачивание глав для чтения без сети."
         case "manga": return "Манга: страницы или лента, комментарии к главам, прогресс чтения."
+        case "hentai": return "HentaiLib (18+): та же читалка, что у манги; избранное и история отдельные."
         default: return "Аниме: плеер с озвучкой и субтитрами, комментарии к сериям, автопереход."
         }
     }
@@ -2426,9 +2439,9 @@ struct SettingsView: View {
                 ForEach(platforms, id: \.0) { pl in
                     let on = platform == pl.0
                     Button { choosePlatform(pl.0) } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: platformIcon(pl.0)).font(.system(size: 14, weight: .semibold))
-                            Text(pl.1).font(.subheadline.weight(.semibold))
+                        HStack(spacing: 4) {
+                            Image(systemName: platformIcon(pl.0)).font(.system(size: 12, weight: .semibold))
+                            Text(pl.1).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
                         }
                         .foregroundStyle(on ? Color.white : Color.primary)
                         .frame(maxWidth: .infinity, minHeight: 40)
@@ -2540,7 +2553,7 @@ struct SettingsView: View {
 
     private var downloadsBlock: some View {
         section("Загрузки · ранобэ и манга") {
-            if platform == "ranobe" || platform == "manga" {
+            if platform != "anime" {
                 linkRow("arrow.down.circle.fill", "Скачанное",
                         value: "\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))") { OfflineLibraryView() }
             } else {
@@ -2582,12 +2595,12 @@ struct SettingsView: View {
             rowDivider
             actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
                 ProgressStore.shared.clear(); HistoryStore.shared.clear()
-                HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear(); ReadPosStore.shared.clear()
+                HistoryStore.novels.clear(); HistoryStore.manga.clear(); HistoryStore.hentai.clear(); ReadStore.shared.clear(); ReadPosStore.shared.clear()
                 info = "История просмотра и чтения сброшена"
             }
             rowDivider
             actionRow("heart.slash.fill", "Очистить избранное", tint: .red) {
-                FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); info = "Избранное очищено"
+                FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); FavoritesStore.hentai.clear(); info = "Избранное очищено"
             }
         }
     }
@@ -2680,7 +2693,7 @@ struct SettingsView: View {
                     appearanceBlock
                     feelBlock
                     if platform == "ranobe" { ranobeBlock }
-                    if platform == "manga" { mangaBlock }
+                    if platform == "manga" || platform == "hentai" { mangaBlock }
                     playbackBlock
                     downloadsBlock
                     dataBlock
@@ -2737,8 +2750,10 @@ final class HistoryStore: ObservableObject {
     static let shared = HistoryStore(key: "history.v1")
     static let novels = HistoryStore(key: "history.novels.v1")
     static let manga = HistoryStore(key: "history.manga.v1")
+    static let hentai = HistoryStore(key: "history.hentai.v1")
     static var current: HistoryStore {
         let site = LibSite.current
+        if site.isHentai { return hentai }
         return site.isManga ? manga : (site.isRanobe ? novels : shared)
     }
     @Published private(set) var items: [HistoryItem] = []
@@ -6364,6 +6379,7 @@ struct FriendsSyncView: View {
         switch LibSite.current.key {
         case "ranobe": host = "https://ranobelib.me"
         case "manga": host = "https://mangalib.me"
+        case "hentai": host = "https://kz.hentailib.me"
         default: host = "https://animelib.org"
         }
         return URL(string: "\(host)/ru/user/\(userID)") ?? URL(string: host)!
@@ -7091,7 +7107,10 @@ struct Novel: Codable, Identifiable, Hashable {
 
 extension Anime {
     /// Ключ в хранилище прочитанного: у манги и ранобэ id тайтлов могут совпасть.
-    var readKey: Int { LibSite.current.isManga ? -id : id }
+    var readKey: Int {
+        let site = LibSite.current
+        return site.isHentai ? -(id + 500_000_000) : (site.isManga ? -id : id)
+    }
 }
 
 struct NovelChapter: Identifiable, Hashable {
@@ -7898,7 +7917,7 @@ final class DownloadManager: ObservableObject {
             for u in urls {
                 var req = URLRequest(url: u)
                 req.timeoutInterval = 30
-                req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
                 req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 req.setValue(agent, forHTTPHeaderField: "User-Agent")
                 if let (data, resp) = try? await DownloadManager.session.data(for: req),
@@ -8569,7 +8588,7 @@ actor MangaImageStore {
                         continue
                     }
                     var req = URLRequest(url: u)
-                    req.setValue(LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                    req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
                     req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                     req.setValue(MangaImageStore.agent, forHTTPHeaderField: "User-Agent")
                     do {
