@@ -1491,9 +1491,13 @@ final class FavoritesStore: ObservableObject {
 /// Свои названия для папок избранного («Читаю», «В планах»…): хранятся отдельно, уходят в бэкап.
 enum FavNames {
     private static let key = "fav.names.v1"
+    private static var cache: [String: String]?
     private static func all() -> [String: String] {
-        guard let d = UserDefaults.standard.string(forKey: key)?.data(using: .utf8),
-              let v = try? JSONDecoder().decode([String: String].self, from: d) else { return [:] }
+        if let c = cache { return c }
+        var v: [String: String] = [:]
+        if let d = UserDefaults.standard.string(forKey: key)?.data(using: .utf8),
+           let dec = try? JSONDecoder().decode([String: String].self, from: d) { v = dec }
+        cache = v
         return v
     }
     private static func k(_ st: ListStatus, _ book: Bool) -> String { st.rawValue + (book ? ".b" : ".a") }
@@ -1505,6 +1509,7 @@ enum FavNames {
         var v = all()
         let t = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if t.isEmpty { v.removeValue(forKey: k(st, book)) } else { v[k(st, book)] = String(t.prefix(24)) }
+        cache = v
         if let d = try? JSONEncoder().encode(v), let str = String(data: d, encoding: .utf8) {
             UserDefaults.standard.set(str, forKey: key)
         }
@@ -3261,8 +3266,8 @@ struct PosterCard: View {
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.22), in: Capsule())
-                            .glassCapsule()
+                            .background(Color.black.opacity(0.5), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
                             .padding(6)
                     }
                 }
@@ -3272,8 +3277,8 @@ struct PosterCard: View {
                             .font(.caption2.bold())
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.22), in: Capsule())
-                            .glassCapsule()
+                            .background(Color.black.opacity(0.5), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
                             .padding(6)
                     }
                 }
@@ -4092,19 +4097,18 @@ struct AnimeCard: View {
     let anime: Anime
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 640)
+            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 520)
                 .aspectRatio(2/3, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
                         Label(r, systemImage: "star.fill")
                             .font(.caption2.bold())
                             .padding(.horizontal, 8).padding(.vertical, 4)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.22), in: Capsule())
-                            .glassCapsule()
+                            .background(Color.black.opacity(0.5), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
                             .padding(7)
                     }
                 }
@@ -7750,13 +7754,21 @@ final class ReadPosStore {
 
     func get(_ k: Int) -> ReadPos? { items[String(k)] }
 
+    private var saveTask: Task<Void, Never>?
+
     func set(_ k: Int, _ pos: ReadPos) {
         items[String(k)] = pos
         if items.count > 300 {
             let keep = items.sorted { $0.value.t > $1.value.t }.prefix(250)
             items = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
-        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+        // на диск не чаще раза в секунду: при прокрутке позиция меняется десятки раз
+        saveTask?.cancel()
+        saveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if let d = try? JSONEncoder().encode(self.items) { UserDefaults.standard.set(d, forKey: self.key) }
+        }
     }
 
     func clear() {
