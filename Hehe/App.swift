@@ -2715,10 +2715,15 @@ struct TopBlur: View {
 extension View {
     /// Маленькая стеклянная капсула для бейджей и кнопок (на iOS 26 настоящее стекло, ниже — блюр).
     @ViewBuilder func glassCapsule() -> some View {
+        glassShape(Capsule())
+    }
+
+    /// Настоящее стекло iOS 26 (подчиняется системным настройкам прозрачности), ниже — обычный блюр.
+    @ViewBuilder func glassShape<S: Shape>(_ shape: S) -> some View {
         if #available(iOS 26.0, *) {
-            self.glassEffect(.regular, in: Capsule())
+            self.glassEffect(.regular, in: shape)
         } else {
-            self.background(.ultraThinMaterial, in: Capsule())
+            self.background(.ultraThinMaterial, in: shape)
         }
     }
 }
@@ -8855,8 +8860,7 @@ struct MangaReaderSettings: View {
                             .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(.primary)
                             .frame(width: 46, height: 46)
-                            .background(.regularMaterial, in: Circle())
-                            .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                            .glassShape(Circle())
                     }
                     .buttonStyle(.plain)
                     Spacer()
@@ -8932,13 +8936,48 @@ struct MangaReaderSettings: View {
 
 extension View {
     /// Стекло в духе iOS: размытие, лёгкая светлая подложка, блик по краю и мягкая тень.
-    func liquidGlass<S: Shape>(_ shape: S) -> some View {
+    @ViewBuilder func liquidGlass<S: Shape>(_ shape: S) -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: shape)
+        } else {
+            legacyGlass(shape)
+        }
+    }
+
+    func legacyGlass<S: Shape>(_ shape: S) -> some View {
         self
             .background(shape.fill(.ultraThinMaterial))
             .background(shape.fill(Color.white.opacity(0.10)))
             .overlay(shape.stroke(LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.06), .white.opacity(0.25)],
                                                  startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 0.9))
             .shadow(color: .black.opacity(0.4), radius: 14, y: 6)
+    }
+}
+
+/// Группа стеклянных элементов: на iOS 26 они делят одну область и не «просвечивают» друг сквозь друга.
+struct GlassGroup<Content: View>: View {
+    let spacing: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) { content() }
+        } else {
+            content()
+        }
+    }
+}
+
+/// Верхняя панель читалки: на iOS 26 системная стеклянная, ниже — размытая.
+struct ReaderBarBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+        } else {
+            content
+                .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+        }
     }
 }
 
@@ -9329,6 +9368,7 @@ struct MangaReaderView: View {
     }
 
     private var topBar: some View {
+        GlassGroup(spacing: 10) {
         HStack(spacing: 10) {
             Button { dismiss() } label: {
                 Image(systemName: "xmark").font(.system(size: 17, weight: .semibold))
@@ -9366,6 +9406,7 @@ struct MangaReaderView: View {
             }
             .padding(.horizontal, 4)
             .liquidGlass(Capsule())
+        }
         }
         .foregroundStyle(.white)
         .environment(\.colorScheme, .dark)
@@ -10036,8 +10077,7 @@ struct NovelReaderSettings: View {
             .font(.system(size: 17, weight: .semibold))
             .foregroundStyle(.primary)
             .frame(width: 46, height: 46)
-            .background(.regularMaterial, in: Circle())
-            .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+            .glassShape(Circle())
     }
 
     private func step(_ d: Double) {
@@ -10764,9 +10804,7 @@ struct NovelReaderView: View {
                         .disabled(index >= chapters.count - 1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(.ultraThinMaterial, in: Capsule())
-                .overlay(Capsule().stroke(fg.opacity(0.14), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
+                .liquidGlass(Capsule())
                 .foregroundStyle(fg)
                 .padding(.horizontal, 24).padding(.bottom, 4)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -10777,8 +10815,7 @@ struct NovelReaderView: View {
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(readerThemeIsDark(activeTheme) ? .dark : .light, for: .navigationBar)
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
+            .modifier(ReaderBarBackground())
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
