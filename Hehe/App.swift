@@ -1335,10 +1335,87 @@ final class FavoritesStore: ObservableObject {
 }
 
 // MARK: - Списки избранного: статусы, сортировка, «Продолжить»
+/// Свои названия для папок избранного («Читаю», «В планах»…): хранятся отдельно, уходят в бэкап.
+enum FavNames {
+    private static let key = "fav.names.v1"
+    private static func all() -> [String: String] {
+        guard let d = UserDefaults.standard.string(forKey: key)?.data(using: .utf8),
+              let v = try? JSONDecoder().decode([String: String].self, from: d) else { return [:] }
+        return v
+    }
+    private static func k(_ st: ListStatus, _ book: Bool) -> String { st.rawValue + (book ? ".b" : ".a") }
+    static func get(_ st: ListStatus, book: Bool) -> String? {
+        let v = all()[k(st, book)]
+        return (v?.isEmpty ?? true) ? nil : v
+    }
+    static func set(_ st: ListStatus, book: Bool, _ name: String?) {
+        var v = all()
+        let t = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if t.isEmpty { v.removeValue(forKey: k(st, book)) } else { v[k(st, book)] = String(t.prefix(24)) }
+        if let d = try? JSONEncoder().encode(v), let str = String(data: d, encoding: .utf8) {
+            UserDefaults.standard.set(str, forKey: key)
+        }
+    }
+}
+
+/// Главный цвет обложки: фон страницы и карточек слегка подкрашивается им.
+enum CoverTint {
+    @MainActor private static var cache: [String: Color] = [:]
+
+    @MainActor
+    static func color(_ url: URL?) async -> Color? {
+        guard let url else { return nil }
+        if let c = cache[url.absoluteString] { return c }
+        guard let img = await ImageLoader.shared.image(url, referer: LibSite.current.referer, maxPixel: 40),
+              let cg = img.cgImage else { return nil }
+        let w = 8, h = 8
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var r = 0.0, g = 0.0, b = 0.0, n = 0.0
+        for i in 0..<(w * h) {
+            let rr = Double(px[i * 4]) / 255, gg = Double(px[i * 4 + 1]) / 255, bb = Double(px[i * 4 + 2]) / 255
+            let mx = max(rr, gg, bb), mn = min(rr, gg, bb)
+            let wgt = 0.15 + (mx - mn) * 2          // яркие, цветные пиксели весомее серых
+            r += rr * wgt; g += gg * wgt; b += bb * wgt; n += wgt
+        }
+        guard n > 0 else { return nil }
+        var hue: CGFloat = 0, sat: CGFloat = 0, bri: CGFloat = 0, al: CGFloat = 0
+        UIColor(red: r / n, green: g / n, blue: b / n, alpha: 1).getHue(&hue, saturation: &sat, brightness: &bri, alpha: &al)
+        let c = Color(hue: Double(hue), saturation: Double(min(1, max(sat, 0.4) * 1.15)), brightness: Double(min(0.85, max(bri, 0.55))))
+        cache[url.absoluteString] = c
+        return c
+    }
+}
+
+struct CoverTintLayer: View {
+    let url: URL?
+    var strength: Double = 0.5
+    var horizontal = false
+    @State private var color: Color?
+
+    var body: some View {
+        LinearGradient(colors: [(color ?? .clear).opacity(strength), (color ?? .clear).opacity(0)],
+                       startPoint: horizontal ? .leading : .top, endPoint: horizontal ? .trailing : .bottom)
+            .opacity(color == nil ? 0 : 1)
+            .animation(.easeOut(duration: 0.6), value: color != nil)
+            .allowsHitTesting(false)
+            .task(id: url) { color = await CoverTint.color(url) }
+    }
+}
+
 enum ListStatus: String, CaseIterable, Codable {
     case active, planned, done, dropped
 
     func title(book: Bool) -> String {
+        if let custom = FavNames.get(self, book: book) { return custom }
+        return defaultTitle(book: book)
+    }
+
+    func defaultTitle(book: Bool) -> String {
         switch self {
         case .active: return book ? "Читаю" : "Смотрю"
         case .planned: return "В планах"
@@ -1727,6 +1804,9 @@ struct FavoritesView: View {
     @State private var pushContinue = false
     @State private var refreshing = false
     @State private var showNew = false
+    @State private var renaming: ListStatus?
+    @State private var renameText = ""
+    @State private var namesTick = 0
     private let book = LibSite.current.isBook
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
@@ -1757,10 +1837,11 @@ struct FavoritesView: View {
     private func chip(_ title: String, _ count: Int, _ on: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text("\(title) \(count)")
-                .font(.footnote.weight(.semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(on ? Theme.accent : Theme.chip, in: Capsule())
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(on ? Theme.accent : Color.clear, in: Capsule())
+                .background { if !on { Capsule().fill(.ultraThinMaterial) } }
                 .foregroundStyle(on ? Color.white : Color.primary)
         }
         .buttonStyle(.pressable)
@@ -1773,6 +1854,18 @@ struct FavoritesView: View {
                 ForEach(ListStatus.allCases, id: \.self) { st in
                     chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st) {
                         filter = st
+                    }
+                    .contextMenu {
+                        Button {
+                            renameText = st.title(book: book)
+                            renaming = st
+                        } label: { Label("Переименовать", systemImage: "pencil") }
+                        if FavNames.get(st, book: book) != nil {
+                            Button {
+                                FavNames.set(st, book: book, nil)
+                                namesTick += 1
+                            } label: { Label("Вернуть название", systemImage: "arrow.uturn.backward") }
+                        }
                     }
                 }
             }
@@ -1843,6 +1936,17 @@ struct FavoritesView: View {
             .refreshable { await refresh(force: true) }
             .task { await refresh(force: false) }
             .background(AppBackground())
+            .alert("Название папки", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+                TextField("Название", text: $renameText)
+                Button("Сохранить") {
+                    if let st = renaming { FavNames.set(st, book: book, renameText); namesTick += 1 }
+                    renaming = nil
+                }
+                Button("Отмена", role: .cancel) { renaming = nil }
+            } message: {
+                Text("Папка «\(renaming?.defaultTitle(book: book) ?? "")» будет называться так. Фильтр и статус не изменятся.")
+            }
+            .id(namesTick)
             .navigationTitle("Избранное")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -2199,6 +2303,7 @@ struct SettingsView: View {
     @State private var showFolderImporter = false
     @State private var backupInfo = ""
     @State private var confirmSignOut = false
+    @AppStorage("backup.sent") private var backupSent: Double = 0
 
     private func finishRestore(_ d: Data?, _ reason: String) {
         guard let d else {
@@ -2623,6 +2728,39 @@ struct SettingsView: View {
         }
     }
 
+    private var hasDataToLose: Bool {
+        !(FavoritesStore.shared.items.isEmpty && FavoritesStore.novels.items.isEmpty
+          && FavoritesStore.manga.items.isEmpty && FavoritesStore.hentai.items.isEmpty
+          && HistoryStore.shared.items.isEmpty && HistoryStore.novels.items.isEmpty
+          && HistoryStore.manga.items.isEmpty && HistoryStore.hentai.items.isEmpty)
+    }
+
+    @ViewBuilder
+    private var backupWarning: some View {
+        let days = backupSent == 0 ? nil : Int((Date().timeIntervalSince1970 - backupSent) / 86400)
+        if hasDataToLose, days == nil || days! >= 7 {
+            Button {
+                if let u = BackupManager.shareURL() { backupSent = Date().timeIntervalSince1970; shareItem = ShareItem(url: u) }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.icloud.fill").font(.title3).foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(days == nil ? "Копия ещё не отправлялась" : "Копия не отправлялась \(days!) дн.")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                        Text("Отправь файл в Telegram или Файлы: при переустановке данные не пропадут.")
+                            .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "square.and.arrow.up").foregroundStyle(Theme.accent)
+                }
+                .padding(14)
+                .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.orange.opacity(0.35), lineWidth: 0.5))
+            }
+            .buttonStyle(.pressable)
+        }
+    }
+
     private var backupBlock: some View {
         section("Резервная копия") {
             textRow("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
@@ -2649,7 +2787,7 @@ struct SettingsView: View {
             }
             rowDivider
             actionRow("square.and.arrow.up.fill", "Отправить копию (Telegram, Файлы…)") {
-                if let u = BackupManager.shareURL() { shareItem = ShareItem(url: u) }
+                if let u = BackupManager.shareURL() { backupSent = Date().timeIntervalSince1970; shareItem = ShareItem(url: u) }
                 else { backupInfo = "Не удалось подготовить файл." }
             }
             if restored {
@@ -2700,6 +2838,7 @@ struct SettingsView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
+                    backupWarning
                     hero
                     platformSwitch
                     appearanceBlock
@@ -3111,8 +3250,12 @@ struct ContinueCard: View {
         }
         .padding(10)
         .frame(width: 290)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Theme.card))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background {
+            CoverTintLayer(url: item.anime.imageURL, strength: 0.4, horizontal: true)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
     }
 }
 
@@ -3496,9 +3639,9 @@ struct SearchBar: View {
                 .buttonStyle(.pressable)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .background(.ultraThinMaterial, in: Capsule())
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .glassShape(Capsule())
     }
 }
 
@@ -3628,18 +3771,25 @@ struct CatalogView: View {
             Group {
                 if rolling { ProgressView() } else { Image(systemName: "dice.fill").font(.headline) }
             }
-            .frame(width: 42, height: 42)
-            .background(Material.ultraThinMaterial, in: Circle())
+            .frame(width: 44, height: 44)
+            .glassShape(Circle())
         }
         .buttonStyle(.pressable)
     }
 
     private var filterButton: some View {
         Button { showFilters = true } label: {
-            Image(systemName: "slider.horizontal.3")
-                .font(.headline)
-                .frame(width: 42, height: 42)
-                .background(vm.filter.activeCount > 0 ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Material.ultraThinMaterial), in: Circle())
+            Group {
+                if vm.filter.activeCount > 0 {
+                    Image(systemName: "slider.horizontal.3").font(.headline)
+                        .frame(width: 44, height: 44)
+                        .background(Theme.accent, in: Circle())
+                } else {
+                    Image(systemName: "slider.horizontal.3").font(.headline)
+                        .frame(width: 44, height: 44)
+                        .glassShape(Circle())
+                }
+            }
                 .overlay(alignment: .topTrailing) {
                     if vm.filter.activeCount > 0 {
                         Text("\(vm.filter.activeCount)")
@@ -3661,7 +3811,7 @@ struct CatalogView: View {
                 VStack(spacing: 10) {
                     HStack {
                         Text(LibSite.current.title)
-                            .font(.system(size: 32, weight: .heavy, design: .rounded))
+                            .font(.largeTitle.bold())
                         Spacer()
                         randomButton
                         filterButton
@@ -3760,23 +3910,24 @@ struct AnimeCard: View {
     let anime: Anime
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            RemoteImage(url: anime.imageURL)
+            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 640)
                 .aspectRatio(2/3, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.chip, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
                         Label(r, systemImage: "star.fill")
                             .font(.caption2.bold())
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 4)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
                             .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.55), in: Capsule())
-                            .padding(6)
+                            .background(Color.black.opacity(0.22), in: Capsule())
+                            .glassCapsule()
+                            .padding(7)
                     }
                 }
             Text(anime.displayTitle)
-                .font(.footnote.weight(.medium))
+                .font(.footnote.weight(.semibold))
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
         }
@@ -3947,6 +4098,7 @@ struct DetailView: View {
             RemoteImage(url: vm.anime.imageURL, maxPixel: 96)
                 .blur(radius: 16)
                 .opacity(0.55)
+            CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
@@ -8132,6 +8284,7 @@ struct NovelDetailView: View {
         ZStack {
             Theme.base
             RemoteImage(url: vm.anime.imageURL, maxPixel: 96).blur(radius: 16).opacity(0.55)
+            CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
