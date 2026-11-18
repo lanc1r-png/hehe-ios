@@ -3015,6 +3015,17 @@ struct HomeView: View {
     }
 }
 
+/// На iOS 26 таб-бар сворачивается в компактную капсулу при прокрутке вниз.
+struct TabBarMinimize: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.tabBarMinimizeBehavior(.onScrollDown)
+        } else {
+            content
+        }
+    }
+}
+
 struct RootView: View {
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.platform") private var platform = "anime"
@@ -3063,6 +3074,7 @@ struct RootView: View {
                 .tag(4)
         }
         .id(accentHex + platform)
+        .modifier(TabBarMinimize())
         .transition(.opacity)
         .tint(Color(hex: accentHex))
         .preferredColorScheme(scheme)
