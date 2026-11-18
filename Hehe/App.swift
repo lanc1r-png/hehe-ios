@@ -386,16 +386,39 @@ struct PrimaryActionButton: View {
 }
 
 struct GenreStrip: View {
-    let items: [String]
+    let genres: [NamedItem]
+    var tags: [NamedItem] = []
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, t in
-                    Text(t)
-                        .font(.footnote.weight(.medium))
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(Theme.accent.opacity(0.2), in: Capsule())
-                        .overlay(Capsule().stroke(Theme.accent.opacity(0.35), lineWidth: 0.6))
+                ForEach(Array(genres.enumerated()), id: \.offset) { _, g in
+                    Button {
+                        guard let id = g.id else { return }
+                        Haptics.tap()
+                        AppRouter.shared.openCatalog(genre: id)
+                    } label: {
+                        Text(g.title)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Theme.accent.opacity(0.2), in: Capsule())
+                            .overlay(Capsule().stroke(Theme.accent.opacity(0.35), lineWidth: 0.6))
+                    }
+                    .buttonStyle(.pressable)
+                }
+                ForEach(Array(tags.enumerated()), id: \.offset) { _, t in
+                    Button {
+                        guard let id = t.id else { return }
+                        Haptics.tap()
+                        AppRouter.shared.openCatalog(tag: id)
+                    } label: {
+                        Text("#" + t.title)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Theme.chip, in: Capsule())
+                    }
+                    .buttonStyle(.pressable)
                 }
             }
             .padding(.horizontal, 16)
@@ -552,6 +575,7 @@ struct Anime: Codable, Identifiable, Hashable {
     let cover: Cover?
     let summary: String?
     let genres: [NamedItem]?
+    let tags: [NamedItem]?
     let authors: [NamedItem]?
     let otherNames: [String]?
     let episodesCount: Int?
@@ -583,7 +607,7 @@ struct Anime: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, summary, genres, authors, cover, status, type
+        case id, name, summary, genres, tags, authors, cover, status, type
         case rusName = "rus_name"
         case engName = "eng_name"
         case slugUrl = "slug_url"
@@ -604,6 +628,7 @@ struct Anime: Codable, Identifiable, Hashable {
         cover = try? c.decode(Cover.self, forKey: .cover)
         summary = (try? c.decode(RichText.self, forKey: .summary))?.text
         genres = try? c.decode([NamedItem].self, forKey: .genres)
+        tags = try? c.decode([NamedItem].self, forKey: .tags)
         authors = try? c.decode([NamedItem].self, forKey: .authors)
         otherNames = try? c.decode([String].self, forKey: .otherNames)
         episodesCount = try? c.decode(Int.self, forKey: .episodesCount)
@@ -1137,6 +1162,7 @@ actor AnimelibAPI {
         let base = ["summary", "genres", "authors", "otherNames"]
         func query(_ f: [String]) -> [URLQueryItem] { f.map { URLQueryItem(name: "fields[]", value: $0) } }
         let path = LibSite.current.apiPath + "/" + slug
+        if let a = try? await get(path, query: query(base + ["tags", "rate_avg"]), as: Envelope<Anime>.self).data { return a }
         do {
             return try await get(path, query: query(base + ["rate_avg"]), as: Envelope<Anime>.self).data
         } catch {
@@ -3168,7 +3194,18 @@ final class AppRouter: ObservableObject {
     @Published var tab = 0
     @Published var pendingQuery: String?
     @Published var pendingSort: CatalogFilter.SortOption?
+    @Published var pendingGenres: Set<Int>?
+    @Published var pendingTags: Set<Int>?
     @Published var toast: String?
+
+    /// Каталог с одним выбранным жанром или тегом (по нажатию на него на странице тайтла).
+    func openCatalog(genre: Int? = nil, tag: Int? = nil) {
+        pendingQuery = ""
+        pendingSort = .views
+        pendingGenres = genre.map { [$0] } ?? []
+        pendingTags = tag.map { [$0] } ?? []
+        tab = 1
+    }
 
     func openCatalog(query: String = "", sort: CatalogFilter.SortOption? = nil) {
         pendingQuery = query
@@ -4190,6 +4227,10 @@ struct CatalogView: View {
                 var changed = false
                 if let q = router.pendingQuery { vm.filter.query = q; router.pendingQuery = nil; changed = true }
                 if let so = router.pendingSort { vm.filter.sortBy = so; router.pendingSort = nil; changed = true }
+                if let g = router.pendingGenres, let t = router.pendingTags {
+                    vm.filter.genres = g; vm.filter.tags = t; vm.filter.types = []; vm.filter.statuses = []
+                    router.pendingGenres = nil; router.pendingTags = nil; changed = true
+                }
                 if changed { Task { await vm.reload() } }
             }
         }
@@ -4424,7 +4465,9 @@ struct DetailView: View {
                     PrimaryActionButton(icon: "play.fill", title: continueTitle) { openContinue() }
                 }
 
-                if let g = vm.anime.genres, !g.isEmpty { GenreStrip(items: g.map { $0.title }) }
+                if !(vm.anime.genres ?? []).isEmpty || !(vm.anime.tags ?? []).isEmpty {
+                    GenreStrip(genres: vm.anime.genres ?? [], tags: vm.anime.tags ?? [])
+                }
 
                 if let s = vm.anime.summary, !s.isEmpty { SummaryCard(text: s, expanded: $expanded) }
 
@@ -8751,7 +8794,9 @@ struct NovelDetailView: View {
                     }
                 }
 
-                if let g = vm.anime.genres, !g.isEmpty { GenreStrip(items: g.map { $0.title }) }
+                if !(vm.anime.genres ?? []).isEmpty || !(vm.anime.tags ?? []).isEmpty {
+                    GenreStrip(genres: vm.anime.genres ?? [], tags: vm.anime.tags ?? [])
+                }
 
                 if let s = vm.anime.summary, !s.isEmpty { SummaryCard(text: s, expanded: $expanded) }
 
