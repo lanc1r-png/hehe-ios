@@ -1751,6 +1751,7 @@ struct FavCard: View {
     let anime: Anime
     let status: ListStatus?
     let book: Bool
+    var newCount: Int = 0
     let onStatus: (ListStatus?) -> Void
     let onContinue: () -> Void
 
@@ -1789,6 +1790,19 @@ struct FavCard: View {
                     .buttonStyle(.plain)
                     .position(x: geo.size.width - 22, y: geo.size.width * 1.5 - 22)
                 }
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if newCount > 0 {
+                Text("+\(newCount)")
+                    .font(.system(size: 11, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Theme.accent, in: Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 0.8))
+                    .shadow(color: .black.opacity(0.3), radius: 3, y: 1)
+                    .padding(7)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -1918,7 +1932,7 @@ struct FavoritesView: View {
                     }
                     LazyVGrid(columns: columns, spacing: 18) {
                         ForEach(visible) { anime in
-                            FavCard(anime: anime, status: meta.status(anime), book: book,
+                            FavCard(anime: anime, status: meta.status(anime), book: book, newCount: meta.newCount(anime),
                                     onStatus: { st in
                                         meta.setStatus(anime, st)
                                         Haptics.select()
