@@ -825,7 +825,9 @@ actor AnimelibAPI {
         var req = URLRequest(url: url)
         for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
+        // у HentaiLib контент закрыт для гостей: отправляем токен вошедшего пользователя
+        let auth = token ?? (LibSite.current.isHentai ? Keychain.get("lib.token") : nil)
+        if let t = auth { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         req.httpMethod = method
         if let j = json {
             req.httpBody = try JSONSerialization.data(withJSONObject: j)
@@ -8466,25 +8468,27 @@ struct MangaPage: Identifiable, Hashable {
 
 actor MangaImageServers {
     static let shared = MangaImageServers()
-    private var cached: [String]?
+    private var cachedBy: [String: [String]] = [:]
     private let fallback = "https://img3.cdnlibs.org"
 
     func bases() async -> [String] {
-        if let c = cached { return c }
+        let siteID = LibSite.current.id
+        if let c = cachedBy[siteID] { return c }
         var list: [String] = []
         let q = [URLQueryItem(name: "fields[]", value: "imageServers")]
         if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q),
            let root = J.obj(data) as? [String: Any],
            let d = root["data"] as? [String: Any],
            let arr = d["imageServers"] as? [[String: Any]] {
-            let mine = arr.filter { srv in
+            let matched = arr.filter { srv in
                 guard let ids = srv["site_ids"] as? [Any], !ids.isEmpty else { return true }
-                return ids.contains { J.int($0) == 1 }
+                return ids.contains { J.int($0) == Int(siteID) }
             }
+            let mine = matched.isEmpty ? arr : matched
             let main = mine.filter { ($0["id"] as? String) == "main" }
             let rest = mine.filter { ($0["id"] as? String) != "main" }
             list = (main + rest).compactMap { J.str($0["url"]) }
-            if !list.isEmpty { cached = list + (list.contains(fallback) ? [] : [fallback]) }
+            if !list.isEmpty { cachedBy[siteID] = list + (list.contains(fallback) ? [] : [fallback]) }
         }
         if !list.contains(fallback) { list.append(fallback) }
         return list
