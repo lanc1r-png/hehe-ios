@@ -1866,7 +1866,8 @@ enum BackupManager {
                                    "activity", "bookmarks", "highlights", "favmeta", "fav.", "friends"]
 
     private static func allowed(_ key: String) -> Bool {
-        prefixes.contains { key.hasPrefix($0) }
+        if key.hasPrefix("friends.cache") { return false }   // кэш, подтянется заново
+        return prefixes.contains { key.hasPrefix($0) }
     }
 
     static var autoURL: URL {
@@ -1881,7 +1882,7 @@ enum BackupManager {
 
     static func data(date: Date = Date()) -> Data? {
         let root: [String: Any] = ["app": "Yume", "version": 1, "date": date, "defaults": snapshot()]
-        return try? PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+        return try? PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)
     }
 
     // Копия живёт только в папке приложения (Файлы → На iPhone → Yume).
@@ -2581,7 +2582,7 @@ struct SettingsView: View {
             rowDivider
             actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
                 ProgressStore.shared.clear(); HistoryStore.shared.clear()
-                HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear()
+                HistoryStore.novels.clear(); HistoryStore.manga.clear(); ReadStore.shared.clear(); ReadPosStore.shared.clear()
                 info = "История просмотра и чтения сброшена"
             }
             rowDivider
@@ -3072,6 +3073,11 @@ struct ContinueCard: View {
                         ProgressView(value: min(p.position / p.duration, 1))
                             .tint(Theme.accent)
                     }
+                }
+                if LibSite.current.isBook, let rp = ReadPosStore.shared.get(item.anime.readKey),
+                   rp.c == item.episodeID, rp.pct > 0 {
+                    Text("Прочитано \(rp.pct)%").font(.caption2).foregroundStyle(Theme.accent)
+                    ProgressView(value: Double(rp.pct) / 100).tint(Theme.accent)
                 }
             }
             Spacer(minLength: 0)
@@ -7365,6 +7371,43 @@ final class ReadStore: ObservableObject {
     }
 }
 
+/// Где остановился читатель: глава и место внутри неё (страница манги или смещение в тексте ранобэ).
+struct ReadPos: Codable {
+    var c: Int      // id главы
+    var p: Int      // манга: страница с нуля; ранобэ (страницы): смещение в тексте
+    var b: Int      // ранобэ (прокрутка): номер блока
+    var pct: Int    // прочитано в главе, %
+    var t: Int      // когда, секунды
+}
+
+@MainActor
+final class ReadPosStore {
+    static let shared = ReadPosStore()
+    private var items: [String: ReadPos] = [:]
+    private let key = "readpos.v1"
+
+    init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([String: ReadPos].self, from: d) { items = v }
+    }
+
+    func get(_ k: Int) -> ReadPos? { items[String(k)] }
+
+    func set(_ k: Int, _ pos: ReadPos) {
+        items[String(k)] = pos
+        if items.count > 300 {
+            let keep = items.sorted { $0.value.t > $1.value.t }.prefix(250)
+            items = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+
+    func clear() {
+        items = [:]
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
 /// Ссылка на тайтл: для аниме ведёт на экран аниме, для ранобэ на экран ранобэ.
 struct TitleLink<Content: View>: View {
     let anime: Anime
@@ -8063,6 +8106,14 @@ struct NovelDetailView: View {
         .ignoresSafeArea()
     }
 
+    private var resumePctText: String {
+        if let rp = ReadPosStore.shared.get(vm.anime.readKey), rp.pct > 0,
+           vm.chapters.indices.contains(resumeIndex), vm.chapters[resumeIndex].id == rp.c {
+            return " · \(rp.pct)%"
+        }
+        return ""
+    }
+
     private var resumeIndex: Int {
         if let last = read.lastChapter(vm.anime.readKey),
            let i = vm.chapters.firstIndex(where: { $0.id == last }) { return i }
@@ -8240,7 +8291,7 @@ struct NovelDetailView: View {
                             Image(systemName: "book.fill")
                             Text(read.lastChapter(vm.anime.readKey) == nil
                                  ? "Начать читать"
-                                 : "Продолжить: Глава \(vm.chapters[resumeIndex].number)")
+                                 : "Продолжить: Глава \(vm.chapters[resumeIndex].number)" + resumePctText)
                                 .font(.headline)
                         }
                         .frame(maxWidth: .infinity)
@@ -9411,6 +9462,13 @@ struct MangaReaderView: View {
 
     private var shown: Int { vertical ? scrollPage : current }
 
+    private func persistPos() {
+        guard let ch = chapter, !loading, !pages.isEmpty, pendingPage == nil else { return }
+        let n = min(shown, pages.count)
+        let pct = pages.count > 1 ? min(100, n * 100 / (pages.count - 1)) : 0
+        ReadPosStore.shared.set(novel.readKey, ReadPos(c: ch.id, p: n, b: 0, pct: pct, t: Int(Date().timeIntervalSince1970)))
+    }
+
     private var vertical: Bool {
         switch titleMode == "auto" ? defaultMode : titleMode {
         case "scroll": return true
@@ -9760,6 +9818,7 @@ struct MangaReaderView: View {
                 if !chromeHidden { bottomBar.transition(.move(edge: .bottom).combined(with: .opacity)) }
             }
         }
+        .onChange(of: shown) { _ in persistPos() }
         .statusBarHidden(chromeHidden)
         .preferredColorScheme(.dark)
         .task(id: index) { await load() }
@@ -9800,6 +9859,7 @@ struct MangaReaderView: View {
         }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
+            persistPos()
             UIApplication.shared.isIdleTimerDisabled = false
             preloadTask?.cancel()
             historyTask?.cancel()
@@ -9849,12 +9909,7 @@ struct MangaReaderView: View {
 
     private func scheduleHistory(_ ch: NovelChapter) {
         historyTask?.cancel()
-        let n = novel
-        historyTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
-            guard !Task.isCancelled else { return }
-            HistoryStore.current.recordChapter(anime: n, chapterID: ch.id, title: ch.title)
-        }
+        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
     }
 
     private func load() async {
@@ -9866,6 +9921,9 @@ struct MangaReaderView: View {
         current = 0
         scrollPage = 0
         reachedEnd = false
+        if pendingPage == nil, let pos = ReadPosStore.shared.get(novel.readKey), pos.c == ch.id, pos.p > 0 {
+            pendingPage = pos.p
+        }
         ReadStore.shared.mark(novel.readKey, ch.id)
         scheduleHistory(ch)
         do {
@@ -10653,6 +10711,8 @@ struct NovelReaderView: View {
     @State private var noteFor: NoteRequest?
     @State private var lastLongPress = Date.distantPast
     @State private var pendingOffset: Int?
+    @State private var restoreBlock: Int?
+    @State private var visibleBlock = -1
     @State private var hlRev = 0
     @ObservedObject private var bms = BookmarkStore.shared
     @ObservedObject private var hls = HighlightStore.shared
@@ -10740,6 +10800,22 @@ struct NovelReaderView: View {
     }
 
     private var chapterID: Int { chapters.indices.contains(index) ? chapters[index].id : 0 }
+
+    /// Запоминает место в главе: страницы (смещение в тексте) или прокрутка (номер блока).
+    private func persistPos() {
+        guard chapters.indices.contains(index), !loading, !paginating else { return }
+        let now = Int(Date().timeIntervalSince1970)
+        if mode == "pages" {
+            guard pendingOffset == nil, !pages.isEmpty, let r = pageRange(pageIndex) else { return }
+            let pct = pages.count > 1 ? min(100, pageIndex * 100 / (pages.count - 1)) : 0
+            ReadPosStore.shared.set(novel.readKey, ReadPos(c: chapterID, p: r.0, b: 0, pct: pct, t: now))
+        } else {
+            guard restoreBlock == nil, visibleBlock >= 0, !blocks.isEmpty else { return }
+            let b = max(visibleBlock - 3, 0)
+            let pct = min(100, b * 100 / max(blocks.count - 1, 1))
+            ReadPosStore.shared.set(novel.readKey, ReadPos(c: chapterID, p: 0, b: b, pct: pct, t: now))
+        }
+    }
 
     private var chapterLabel: String {
         chapters.indices.contains(index) ? "Том \(chapters[index].volume) · \(chapters[index].title)" : ""
@@ -10974,7 +11050,7 @@ struct NovelReaderView: View {
                                 .opacity(0.55)
                         }
                         if loading { ProgressView().frame(maxWidth: .infinity).padding(.top, 40) }
-                        ForEach(blocks) { b in blockView(b) }
+                        ForEach(blocks) { b in blockView(b).id(b.id).onAppear { visibleBlock = b.id } }
                         if let e = error {
                             Text(e).font(.footnote).foregroundStyle(.orange)
                         }
@@ -11008,6 +11084,14 @@ struct NovelReaderView: View {
                 }
                 .background(bg.ignoresSafeArea())
                 .onChange(of: index) { _ in proxy.scrollTo("top", anchor: .top) }
+                .onChange(of: loading) { l in
+                    if !l, let b = restoreBlock {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            proxy.scrollTo(b, anchor: .top)
+                            restoreBlock = nil
+                        }
+                    }
+                }
             }
             } else {
                 pagedBody
@@ -11045,6 +11129,8 @@ struct NovelReaderView: View {
                 }
             }
             .toolbar(chromeHidden ? .hidden : .visible, for: .navigationBar)
+            .onChange(of: pageIndex) { _ in persistPos() }
+            .onChange(of: visibleBlock) { _ in persistPos() }
             .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
@@ -11126,6 +11212,7 @@ struct NovelReaderView: View {
         }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
+            persistPos()
             UIApplication.shared.isIdleTimerDisabled = false
             historyTask?.cancel()
         }
@@ -11133,12 +11220,7 @@ struct NovelReaderView: View {
 
     private func scheduleHistory(_ ch: NovelChapter) {
         historyTask?.cancel()
-        let n = novel
-        historyTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
-            guard !Task.isCancelled else { return }
-            HistoryStore.current.recordChapter(anime: n, chapterID: ch.id, title: ch.title)
-        }
+        HistoryStore.current.recordChapter(anime: novel, chapterID: ch.id, title: ch.title)
     }
 
     private func load() async {
@@ -11150,6 +11232,11 @@ struct NovelReaderView: View {
         blocks = []
         pages = []
         pageIndex = 0
+        visibleBlock = -1
+        if pendingOffset == nil, restoreBlock == nil, let pos = ReadPosStore.shared.get(novel.readKey), pos.c == ch.id {
+            if mode == "pages" { if pos.p > 0 { pendingOffset = pos.p } }
+            else if pos.b > 0 { restoreBlock = pos.b }
+        }
         ReadStore.shared.mark(novel.readKey, ch.id)
         scheduleHistory(ch)
         if let local = store.blocks(novel: novel.id, chapter: ch.id) {
