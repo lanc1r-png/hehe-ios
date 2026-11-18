@@ -163,6 +163,119 @@ struct Pill: View {
     }
 }
 
+// MARK: - Страница тайтла: общие детали оформления
+struct GlassPill: View {
+    let icon: String
+    let text: String
+    var tint: Color? = nil
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(tint ?? Color.primary)
+            .padding(.horizontal, 11).padding(.vertical, 6)
+            .glassCapsule()
+    }
+}
+
+struct TitleHero: View {
+    let cover: URL?
+    let title: String
+    let subtitle: String?
+    let pills: [(String, String)]
+    var body: some View {
+        VStack(spacing: 14) {
+            RemoteImage(url: cover, maxPixel: 700)
+                .frame(width: 172, height: 258)
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.7))
+                .shadow(color: .black.opacity(0.45), radius: 22, y: 12)
+            VStack(spacing: 5) {
+                Text(title)
+                    .font(.title2.weight(.bold))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+            }
+            .padding(.horizontal, 8)
+            if !pills.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(pills.enumerated()), id: \.offset) { _, p in
+                            GlassPill(icon: p.0, text: p.1, tint: p.0 == "star.fill" ? .yellow : nil)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .padding(.horizontal, -16)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
+    }
+}
+
+struct PrimaryActionButton: View {
+    let icon: String
+    let title: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon).font(.headline)
+                Text(title).font(.headline).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, minHeight: 54)
+            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing),
+                        in: Capsule())
+            .shadow(color: Theme.accent.opacity(0.45), radius: 14, y: 6)
+        }
+        .buttonStyle(.pressable)
+    }
+}
+
+struct GenreStrip: View {
+    let items: [String]
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, t in
+                    Text(t)
+                        .font(.footnote.weight(.medium))
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Theme.accent.opacity(0.2), in: Capsule())
+                        .overlay(Capsule().stroke(Theme.accent.opacity(0.35), lineWidth: 0.6))
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.horizontal, -16)
+    }
+}
+
+struct SummaryCard: View {
+    let text: String
+    @Binding var expanded: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(text).font(.callout).lineSpacing(3).lineLimit(expanded ? nil : 5)
+            if text.count > 220 {
+                Button(expanded ? "Свернуть" : "Читать полностью") {
+                    withAnimation(.easeInOut(duration: 0.25)) { expanded.toggle() }
+                }
+                .font(.footnote.weight(.bold))
+                .foregroundStyle(Theme.accent)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
+    }
+}
+
 /// Раскладка «теги в несколько строк».
 struct FlowLayout: Layout {
     var spacing: CGFloat = 8
@@ -4109,6 +4222,25 @@ struct DetailView: View {
         selected = vm.episodes[idx]
     }
 
+    private var animePills: [(String, String)] {
+        var p: [(String, String)] = []
+        if let r = vm.anime.rateAvg { p.append(("star.fill", r)) }
+        if let s = vm.anime.status?.title, !s.isEmpty { p.append(("dot.radiowaves.left.and.right", s)) }
+        if let t = vm.anime.type?.title, !t.isEmpty { p.append(("tv", t)) }
+        if let a = vm.anime.ageRestriction?.title, !a.isEmpty { p.append(("exclamationmark.shield", a)) }
+        if let n = vm.anime.episodesCount { p.append(("list.bullet", "\(n) эп.")) }
+        return p
+    }
+
+    private var continueTitle: String {
+        if let h = HistoryStore.shared.items.first(where: { $0.anime.id == vm.anime.id }),
+           let i = vm.episodes.firstIndex(where: { $0.id == h.episodeID }) {
+            let next = progress.get(h.episodeID)?.finished == true && i + 1 < vm.episodes.count ? i + 1 : i
+            return "Продолжить: серия \(vm.episodes[next].number ?? "")"
+        }
+        return "Смотреть"
+    }
+
     private var backdrop: some View {
         ZStack {
             Theme.base
@@ -4124,55 +4256,24 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HStack(alignment: .top, spacing: 14) {
-                    RemoteImage(url: vm.anime.imageURL)
-                        .frame(width: 120, height: 180)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                        .shadow(color: .black.opacity(0.5), radius: 10, y: 5)
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(vm.anime.displayTitle).font(.title3.bold())
-                        if let n = vm.anime.name, n != vm.anime.displayTitle {
-                            Text(n).font(.caption).foregroundStyle(.secondary)
-                        }
-                        FlowLayout(spacing: 6) {
-                            if let s = vm.anime.status?.title, !s.isEmpty { Pill(icon: "dot.radiowaves.left.and.right", text: s) }
-                            if let t = vm.anime.type?.title, !t.isEmpty { Pill(icon: "tv", text: t) }
-                            if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Pill(icon: "exclamationmark.shield", text: a) }
-                            if let r = vm.anime.rateAvg { Pill(icon: "star.fill", text: r) }
-                        }
-                    }
+                TitleHero(cover: vm.anime.largeImageURL ?? vm.anime.imageURL, title: vm.anime.displayTitle,
+                          subtitle: (vm.anime.name != nil && vm.anime.name != vm.anime.displayTitle) ? vm.anime.name : nil,
+                          pills: animePills)
+
+                if !vm.episodes.isEmpty {
+                    PrimaryActionButton(icon: "play.fill", title: continueTitle) { openContinue() }
                 }
 
-                if let g = vm.anime.genres, !g.isEmpty {
-                    FlowLayout(spacing: 6) {
-                        ForEach(g, id: \.id) { item in
-                            Text(item.title)
-                                .font(.caption)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Theme.accent.opacity(0.28), in: Capsule())
-                        }
-                    }
-                }
+                if let g = vm.anime.genres, !g.isEmpty { GenreStrip(items: g.map { $0.title }) }
 
-                if let s = vm.anime.summary, !s.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(s).font(.callout).lineLimit(expanded ? nil : 5)
-                        if s.count > 220 {
-                            Button(expanded ? "Свернуть" : "Читать полностью") {
-                                withAnimation { expanded.toggle() }
-                            }
-                            .font(.footnote.bold())
-                        }
-                    }
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
-                }
+                if let s = vm.anime.summary, !s.isEmpty { SummaryCard(text: s, expanded: $expanded) }
 
                 TitleActionsRow(anime: vm.anime) { showComments = true }
 
-                Text("Серии").font(.title3.bold())
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Серии").font(.title2.bold())
+                    if !vm.episodes.isEmpty { Text("\(vm.episodes.count)").font(.subheadline).foregroundStyle(.secondary) }
+                }
                 if vm.isLoading { ProgressView() }
                 if let e = vm.error { Text(e).foregroundStyle(.red).font(.footnote) }
                 if !vm.isLoading && vm.episodes.isEmpty && vm.error == nil {
@@ -4186,8 +4287,8 @@ struct DetailView: View {
                                 Text(ep.number ?? "–")
                                     .font(.subheadline.bold())
                                     .foregroundStyle(pr != nil ? Color.secondary : Color.primary)
-                                    .frame(width: 38, height: 38)
-                                    .background(pr != nil ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
+                                    .frame(width: 44, height: 44)
+                                    .background(pr != nil ? Color.gray.opacity(0.22) : Theme.accent.opacity(0.28), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text((ep.name?.isEmpty == false ? ep.name! : "Серия \(ep.number ?? "")"))
                                         .font(.subheadline)
@@ -4210,7 +4311,8 @@ struct DetailView: View {
                                     .foregroundStyle(pr != nil ? Color.gray : Theme.accent)
                             }
                             .padding(10)
-                            .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+                            .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 0.5))
                         }
                         .buttonStyle(.pressable)
                     }
@@ -4219,8 +4321,9 @@ struct DetailView: View {
             .padding(16)
         }
         .background(backdrop)
-        .navigationTitle(vm.anime.displayTitle)
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -8409,6 +8512,17 @@ struct NovelDetailView: View {
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
     }
 
+    private var novelPills: [(String, String)] {
+        var p: [(String, String)] = []
+        if let r = vm.anime.rateAvg { p.append(("star.fill", r)) }
+        if let s = vm.anime.status?.title, !s.isEmpty { p.append(("dot.radiowaves.left.and.right", s)) }
+        if let t = vm.anime.type?.title, !t.isEmpty { p.append(("book", t)) }
+        if let a = vm.anime.ageRestriction?.title, !a.isEmpty { p.append(("exclamationmark.shield", a)) }
+        if !vm.chapters.isEmpty { p.append(("list.bullet", "\(vm.chapters.count) гл.")) }
+        if let last = vm.chapters.compactMap({ $0.date }).max() { p.append(("clock", ChapterAge.ago(last))) }
+        return p
+    }
+
     private func row(_ i: Int) -> some View {
         let c = vm.chapters[i]
         let isRead = read.isRead(vm.anime.readKey, c.id)
@@ -8421,8 +8535,8 @@ struct NovelDetailView: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                         .foregroundStyle(isRead ? Color.secondary : Color.primary)
-                        .frame(width: 42, height: 42)
-                        .background(isRead ? Color.gray.opacity(0.3) : Theme.accent.opacity(0.28), in: Circle())
+                        .frame(width: 46, height: 46)
+                        .background(isRead ? Color.gray.opacity(0.22) : Theme.accent.opacity(0.28), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
                         Text(c.name.isEmpty ? "Глава \(c.number)" : c.name)
                             .font(.subheadline)
@@ -8448,7 +8562,8 @@ struct NovelDetailView: View {
             ChapterDownloadButton(novel: vm.anime, chapters: vm.chapters, chapter: c)
         }
         .padding(10)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 0.5))
         .contextMenu {
             if saved {
                 Button(role: .destructive) { store.remove(novel: vm.anime.id, chapter: c.id) } label: {
@@ -8463,76 +8578,27 @@ struct NovelDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HStack(alignment: .top, spacing: 14) {
-                    RemoteImage(url: vm.anime.largeImageURL, maxPixel: 600)
-                        .frame(width: 120, height: 180)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                        .shadow(color: .black.opacity(0.5), radius: 10, y: 5)
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(vm.anime.displayTitle).font(.title3.bold())
-                        if let n = vm.anime.name, n != vm.anime.displayTitle {
-                            Text(n).font(.caption).foregroundStyle(.secondary)
-                        }
-                        FlowLayout(spacing: 6) {
-                            if let s = vm.anime.status?.title, !s.isEmpty { Pill(icon: "dot.radiowaves.left.and.right", text: s) }
-                            if let t = vm.anime.type?.title, !t.isEmpty { Pill(icon: "book", text: t) }
-                            if let a = vm.anime.ageRestriction?.title, !a.isEmpty { Pill(icon: "exclamationmark.shield", text: a) }
-                            if let r = vm.anime.rateAvg { Pill(icon: "star.fill", text: r) }
-                            if !vm.chapters.isEmpty { Pill(icon: "list.bullet", text: "\(vm.chapters.count) гл.") }
-                            if let last = vm.chapters.compactMap({ $0.date }).max() {
-                                Pill(icon: "clock", text: "Новая глава: " + ChapterAge.ago(last))
-                            }
-                        }
-                    }
-                }
+                TitleHero(cover: vm.anime.largeImageURL, title: vm.anime.displayTitle,
+                          subtitle: (vm.anime.name != nil && vm.anime.name != vm.anime.displayTitle) ? vm.anime.name : nil,
+                          pills: novelPills)
 
                 if !vm.chapters.isEmpty {
-                    Button { reader = ReaderStart(id: resumeIndex) } label: {
-                        HStack {
-                            Image(systemName: "book.fill")
-                            Text(read.lastChapter(vm.anime.readKey) == nil
-                                 ? "Начать читать"
-                                 : "Продолжить: Глава \(vm.chapters[resumeIndex].number)" + resumePctText)
-                                .font(.headline)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(Theme.accent, in: RoundedRectangle(cornerRadius: 16))
-                        .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.pressable)
-                }
-
-                if let g = vm.anime.genres, !g.isEmpty {
-                    FlowLayout(spacing: 6) {
-                        ForEach(g, id: \.id) { item in
-                            Text(item.title)
-                                .font(.caption)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(Theme.accent.opacity(0.28), in: Capsule())
-                        }
+                    PrimaryActionButton(icon: "book.fill",
+                                        title: read.lastChapter(vm.anime.readKey) == nil
+                                            ? "Начать читать"
+                                            : "Продолжить: Глава \(vm.chapters[resumeIndex].number)" + resumePctText) {
+                        reader = ReaderStart(id: resumeIndex)
                     }
                 }
 
-                if let s = vm.anime.summary, !s.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(s).font(.callout).lineLimit(expanded ? nil : 5)
-                        if s.count > 220 {
-                            Button(expanded ? "Свернуть" : "Читать полностью") {
-                                withAnimation { expanded.toggle() }
-                            }
-                            .font(.footnote.bold())
-                        }
-                    }
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
-                }
+                if let g = vm.anime.genres, !g.isEmpty { GenreStrip(items: g.map { $0.title }) }
+
+                if let s = vm.anime.summary, !s.isEmpty { SummaryCard(text: s, expanded: $expanded) }
 
                 TitleActionsRow(anime: vm.anime) { showComments = true }
 
                 HStack {
-                    Text("Главы").font(.title3.bold())
+                    Text("Главы").font(.title2.bold())
                     Spacer()
                     if !vm.chapters.isEmpty { downloadMenu }
                     if vm.chapters.count > 1 {
@@ -8561,12 +8627,13 @@ struct NovelDetailView: View {
                     ForEach(Array(groups.enumerated()), id: \.offset) { _, g in
                         HStack {
                             Text("Том \(g.volume)")
-                                .font(.footnote.bold())
-                                .foregroundStyle(.secondary)
+                                .font(.footnote.weight(.bold))
+                                .padding(.horizontal, 12).padding(.vertical, 5)
+                                .glassCapsule()
                             Spacer()
                             volumeButton(g.indices)
                         }
-                        .padding(.top, 8)
+                        .padding(.top, 12)
                         ForEach(reversed ? Array(g.indices.reversed()) : g.indices, id: \.self) { i in
                             row(i)
                         }
@@ -8576,8 +8643,9 @@ struct NovelDetailView: View {
             .padding(16)
         }
         .background(backdrop)
-        .navigationTitle(vm.anime.displayTitle)
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .navigationDestination(for: AuthorRef.self) { AuthorView(author: $0) }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
