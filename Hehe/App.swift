@@ -10521,6 +10521,21 @@ struct MangaReaderView: View {
                 Spacer()
                 if !chromeHidden { bottomBar.transition(.move(edge: .bottom).combined(with: .opacity)) }
             }
+            // маленький счётчик страниц, пока меню скрыто
+            if chromeHidden, !pages.isEmpty, !loading {
+                VStack {
+                    Spacer()
+                    Text("\(min(shown + 1, pages.count)) / \(pages.count)")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Color.black.opacity(0.45), in: Capsule())
+                        .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                        .padding(.bottom, 10)
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
         }
         .onChange(of: shown) { _ in persistPos() }
         .statusBarHidden(chromeHidden)
