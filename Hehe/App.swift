@@ -3601,6 +3601,7 @@ struct ContinueHero: View {
 /// Широкая карточка: обложка слева, данные справа.
 struct WideCard: View {
     let anime: Anime
+    var mark: String? = nil
     var body: some View {
         HStack(spacing: 12) {
             RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 420)
@@ -3615,8 +3616,15 @@ struct WideCard: View {
                     Text(t).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                if let r = anime.rateAvg {
-                    RatingBadge(text: r)
+                HStack(spacing: 6) {
+                    if let r = anime.rateAvg { RatingBadge(text: r) }
+                    if let mark {
+                        Text(mark)
+                            .font(.system(size: 10, weight: .heavy))
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .foregroundStyle(.white)
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
+                    }
                 }
             }
             Spacer(minLength: 0)
@@ -3649,13 +3657,13 @@ struct HomeView: View {
         return pool[day % pool.count]
     }
 
-    private func wideRail(_ list: [Anime]) -> some View {
+    private func wideRail(_ list: [Anime], newIDs: Set<Int>? = nil) -> some View {
         var seen = Set<Int>()
         let unique = list.filter { seen.insert($0.id).inserted }
         return ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: 12) {
                 ForEach(unique) { a in
-                    TitleLink(anime: a) { WideCard(anime: a) }
+                    TitleLink(anime: a) { WideCard(anime: a, mark: newIDs.map { $0.contains(a.id) ? "НОВОЕ" : "НОВАЯ ГЛАВА" }) }
                         .buttonStyle(.pressable)
                 }
             }
@@ -3764,8 +3772,8 @@ struct HomeView: View {
 
                         if !vm.fresh.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: ranobe ? "Последние обновления" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
-                                poster(Array(vm.fresh.prefix(ranobe ? 20 : 14)), newIDs: ranobe ? Set(vm.newest.map { $0.id }) : [])
+                                SectionHeader(title: ranobe ? "Свежие главы" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
+                                poster(Array(vm.fresh.prefix(14)))
                             }
                         }
 
@@ -3799,10 +3807,29 @@ struct HomeView: View {
                             }
                         }
 
-                        if !vm.newest.isEmpty && !ranobe {
-                            VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
-                                wideRail(vm.newest)
+                        if !vm.newest.isEmpty {
+                            if ranobe {
+                                // «Последние обновления»: новые тайтлы вперемешку с тайтлами, где вышла новая глава
+                                let newIDs = Set(vm.newest.map { $0.id })
+                                let merged: [Anime] = {
+                                    var out: [Anime] = []
+                                    let a = vm.newest, b = vm.fresh
+                                    for i in 0..<max(a.count, b.count) {
+                                        if i < b.count { out.append(b[i]) }
+                                        if i < a.count { out.append(a[i]) }
+                                    }
+                                    var seen = Set<Int>()
+                                    return out.filter { seen.insert($0.id).inserted }
+                                }()
+                                VStack(alignment: .leading, spacing: 10) {
+                                    SectionHeader(title: "Последние обновления") { router.openCatalog(sort: .lastEpisode) }
+                                    wideRail(Array(merged.prefix(24)), newIDs: newIDs)
+                                }
+                            } else {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
+                                    wideRail(vm.newest)
+                                }
                             }
                         }
 
