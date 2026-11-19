@@ -9753,15 +9753,22 @@ struct MangaReaderSettings: View {
     let detected: String
     @Environment(\.dismiss) private var dismiss
 
-    private func sectionTitle(_ t: String) -> some View {
-        Text(t).font(.title3.weight(.bold)).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4)
+    // MARK: кирпичики
+    private func header(_ icon: String, _ t: String, _ color: Color) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: 13, weight: .bold)).foregroundStyle(color)
+            Text(t.uppercased()).font(.footnote.weight(.bold)).tracking(0.6).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 6)
     }
 
     private func card<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 0) { content() }
             .padding(.horizontal, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 0.5))
     }
 
     private func note(_ t: String) -> some View {
@@ -9771,23 +9778,30 @@ struct MangaReaderSettings: View {
             .padding(.vertical, 12)
     }
 
-    /// Плитки выбора в духе тем Apple Books: у выбранной толстая рамка.
-    private func choice(_ options: [(String, String)], _ sel: Binding<String>) -> some View {
+    /// Плитки с иконкой: выбранная заливается акцентным градиентом.
+    private func tiles(_ options: [(String, String, String)], _ sel: Binding<String>) -> some View {
         HStack(spacing: 10) {
             ForEach(options, id: \.0) { o in
                 let on = sel.wrappedValue == o.0
                 Button {
                     Haptics.select()
-                    sel.wrappedValue = o.0
+                    withAnimation(.easeOut(duration: 0.18)) { sel.wrappedValue = o.0 }
                 } label: {
-                    Text(o.1)
-                        .font(.system(size: 16, weight: on ? .semibold : .medium))
-                        .lineLimit(1).minimumScaleFactor(0.7)
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity, minHeight: 62)
-                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(Color.primary, lineWidth: on ? 3 : 0))
+                    VStack(spacing: 8) {
+                        Image(systemName: o.2).font(.system(size: 22, weight: .semibold))
+                        Text(o.1).font(.system(size: 14, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
+                    }
+                    .foregroundStyle(on ? Color.white : Color.primary.opacity(0.85))
+                    .frame(maxWidth: .infinity, minHeight: 76)
+                    .background {
+                        if on {
+                            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                .fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                .shadow(color: Theme.accent.opacity(0.45), radius: 10, y: 4)
+                        } else {
+                            RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.primary.opacity(0.08))
+                        }
+                    }
                 }
                 .buttonStyle(.plain)
             }
@@ -9795,28 +9809,52 @@ struct MangaReaderSettings: View {
         .padding(.vertical, 14)
     }
 
-    private func slider(_ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, _ fmt: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title).font(.system(size: 16))
+    private func iconBox(_ icon: String, _ color: Color) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 30, height: 30)
+            .background(color.gradient, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func slider(_ icon: String, _ color: Color, _ title: String, _ v: Binding<Double>, _ range: ClosedRange<Double>, _ fmt: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                iconBox(icon, color)
+                Text(title).font(.system(size: 17))
                 Spacer()
-                Text(fmt).font(.system(size: 15).monospacedDigit()).foregroundStyle(.secondary)
+                Text(fmt).font(.system(size: 15, weight: .medium).monospacedDigit()).foregroundStyle(.secondary)
             }
             Slider(value: v, in: range).tint(Theme.accent)
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 12)
     }
 
-    private func toggle(_ title: String, _ on: Binding<Bool>) -> some View {
-        Toggle(title, isOn: on).tint(Theme.accent)
-            .font(.system(size: 17))
-            .frame(minHeight: 54)
+    private func toggle(_ icon: String, _ color: Color, _ title: String, _ on: Binding<Bool>) -> some View {
+        Toggle(isOn: on) {
+            HStack(spacing: 12) {
+                iconBox(icon, color)
+                Text(title).font(.system(size: 17))
+            }
+        }
+        .tint(Theme.accent)
+        .frame(minHeight: 54)
     }
 
     private func str(_ b: Binding<Bool>) -> Binding<String> {
         Binding(get: { b.wrappedValue ? "own" : "all" }, set: { b.wrappedValue = ($0 == "own") })
     }
 
+    /// Выбор режима: для этого тайтла пишет его режим, для всех — ещё и общий по умолчанию (отдельный блок больше не нужен).
+    private var modeBinding: Binding<String> {
+        Binding(get: { titleMode },
+                set: { v in
+                    titleMode = v
+                    if !own { defaultMode = v }
+                })
+    }
+
+    // MARK: экран
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
@@ -9836,58 +9874,72 @@ struct MangaReaderSettings: View {
             .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 8)
 
             ScrollView {
-                VStack(spacing: 20) {
-                    VStack(spacing: 0) {
-                        choice([("all", "Для всех"), ("own", "Для этого тайтла")], str($own))
-                            .padding(.vertical, 0)
+                VStack(spacing: 18) {
+                    // для кого настройки
+                    VStack(spacing: 8) {
+                        HStack(spacing: 4) {
+                            ForEach([("all", "Для всех"), ("own", "Для этого тайтла")], id: \.0) { o in
+                                let on = str($own).wrappedValue == o.0
+                                Button {
+                                    Haptics.select()
+                                    withAnimation(.easeOut(duration: 0.2)) { str($own).wrappedValue = o.0 }
+                                } label: {
+                                    Text(o.1)
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(on ? Color.white : Color.primary.opacity(0.8))
+                                        .frame(maxWidth: .infinity, minHeight: 42)
+                                        .background {
+                                            if on {
+                                                Capsule().fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
+                                            }
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(4)
+                        .background(Color.primary.opacity(0.08), in: Capsule())
                         Text(own ? "Эти настройки действуют только в этом тайтле, остальные не меняются."
                                  : "Изменения касаются всех тайтлов, у которых нет своих настроек.")
                             .font(.footnote).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 4).padding(.top, 8)
+                            .padding(.horizontal, 6)
                     }
 
-                    sectionTitle("Режим чтения")
+                    header("rectangle.split.1x2", "Режим чтения", Theme.accent)
                     card {
-                        choice([("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")], $titleMode)
+                        tiles([("auto", "Авто", "wand.and.stars"), ("pages", "Страницы", "book"), ("scroll", "Лента", "arrow.up.and.down.text.horizontal")], modeBinding)
                         Divider()
-                        note("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)». Режим всегда запоминается для тайтла.")
+                        note("«Страницы» для манги: листаешь свайпом. «Лента» для манхвы: прокручиваешь вниз. «Авто»: сейчас выбрано «\(detected)». Режим запоминается для тайтла\(own ? "." : ", а выбранный здесь станет режимом по умолчанию для остальных.")")
                     }
 
-                    sectionTitle("Листание")
+                    header("hand.draw", "Листание", .orange)
                     card {
-                        choice([("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")], $anim)
+                        tiles([("slide", "Сдвиг", "arrow.left.and.right"), ("fade", "Плавно", "circle.lefthalf.filled"), ("book", "Как в книге", "book.pages")], $anim)
                         Divider()
                         note("Работает в режиме «Страницы».")
                     }
 
-                    sectionTitle("Автопрокрутка")
+                    header("play.circle", "Автопрокрутка", .green)
                     card {
-                        slider("Скорость", $speed, 15...240, "\(Int(speed))")
+                        slider("speedometer", .green, "Скорость", $speed, 15...240, "\(Int(speed))")
                         Divider()
-                        toggle("Сама переходить к следующей главе", $autoNext)
+                        toggle("forward.end.fill", .blue, "Сама переходить к следующей главе", $autoNext)
                         Divider()
                         note("Кнопка ▶ внизу в режиме «Лента». Касание ставит прокрутку на паузу.")
                     }
 
-                    sectionTitle("Экран")
+                    header("sun.max", "Экран", .yellow)
                     card {
-                        slider("Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
+                        slider("moon.fill", .indigo, "Затемнение", $dim, 0...0.7, "\(Int(dim * 100))%")
                         Divider()
-                        slider("Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
+                        slider("flame.fill", .orange, "Тёплый свет", $warm, 0...0.5, "\(Int(warm * 200))%")
                         Divider()
-                        toggle("Чёрно-белый режим", $gray)
+                        toggle("circle.lefthalf.striped.horizontal", .gray, "Чёрно-белый режим", $gray)
                         Divider()
-                        toggle("Фон под страницу", $autoBG)
+                        toggle("rectangle.inset.filled", .teal, "Фон под страницу", $autoBG)
                         Divider()
                         note("Фон под страницу делает поля вокруг белыми или чёрными, чтобы не было тёмных полос у светлых страниц.")
-                    }
-
-                    sectionTitle("По умолчанию")
-                    card {
-                        choice([("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")], $defaultMode)
-                        Divider()
-                        note("Для остальных тайтлов, пока у них выбрано «Авто».")
                     }
                 }
                 .padding(.horizontal, 16)
@@ -9897,6 +9949,174 @@ struct MangaReaderSettings: View {
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.hidden)
+    }
+}
+
+/// Список глав внутри читалки: поиск, сортировка, группы по томам, отметки прочитанного, быстрый переход.
+struct MangaChapterPicker: View {
+    let chapters: [NovelChapter]
+    let current: Int
+    let readKey: Int
+    let onPick: (Int) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var read = ReadStore.shared
+    @State private var query = ""
+    @State private var newestFirst = true
+
+    private var entries: [(i: Int, ch: NovelChapter)] {
+        var list = chapters.enumerated().map { (i: $0.offset, ch: $0.element) }
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        if !q.isEmpty {
+            list = list.filter { $0.ch.number.lowercased().contains(q) || $0.ch.name.lowercased().contains(q) || "том \($0.ch.volume)".contains(q) }
+        }
+        return newestFirst ? Array(list.reversed()) : list
+    }
+
+    private var groups: [(vol: String, items: [(i: Int, ch: NovelChapter)])] {
+        var out: [(vol: String, items: [(i: Int, ch: NovelChapter)])] = []
+        for e in entries {
+            if let last = out.last, last.vol == e.ch.volume { out[out.count - 1].items.append(e) }
+            else { out.append((vol: e.ch.volume, items: [e])) }
+        }
+        return out
+    }
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "ru_RU"); f.dateStyle = .medium; return f
+    }()
+
+    private func row(_ e: (i: Int, ch: NovelChapter)) -> some View {
+        let isCur = e.i == current
+        let isRead = read.isRead(readKey, e.ch.id)
+        return Button {
+            onPick(e.i)
+            dismiss()
+        } label: {
+            HStack(spacing: 14) {
+                Text(e.ch.number)
+                    .font(.system(size: 15, weight: .bold).monospacedDigit())
+                    .minimumScaleFactor(0.6).lineLimit(1)
+                    .foregroundStyle(isCur ? Color.white : Color.primary)
+                    .frame(width: 52, height: 44)
+                    .background {
+                        if isCur {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        } else {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.primary.opacity(0.08))
+                        }
+                    }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(e.ch.name.isEmpty ? "Глава \(e.ch.number)" : e.ch.name)
+                        .font(.system(size: 16, weight: isCur ? .semibold : .regular))
+                        .foregroundStyle(isRead && !isCur ? Color.secondary : Color.primary)
+                        .lineLimit(2).multilineTextAlignment(.leading)
+                    if let d = e.ch.date {
+                        Text(Self.dateFmt.string(from: d)).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                if isCur {
+                    Image(systemName: "book.fill").foregroundStyle(Theme.accent)
+                } else if isRead {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent.opacity(0.7))
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(isCur ? Theme.accent.opacity(0.14) : Color.clear, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .id(e.i)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                VStack(spacing: 2) {
+                    Text("Главы").font(.headline)
+                    Text("\(chapters.count) всего · прочитано \(chapters.filter { read.isRead(readKey, $0.id) }.count)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark").font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(.primary).frame(width: 46, height: 46).glassShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 10)
+
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Номер или название", text: $query)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                            .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14).frame(height: 44)
+                .background(Color.primary.opacity(0.08), in: Capsule())
+                Button {
+                    Haptics.select()
+                    newestFirst.toggle()
+                } label: {
+                    Image(systemName: newestFirst ? "arrow.down" : "arrow.up")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .frame(width: 44, height: 44)
+                        .background(Color.primary.opacity(0.08), in: Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16).padding(.bottom, 8)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 4, pinnedViews: [.sectionHeaders]) {
+                        ForEach(groups, id: \.vol) { g in
+                            Section {
+                                ForEach(g.items, id: \.i) { row($0) }
+                            } header: {
+                                Text("Том \(g.vol)")
+                                    .font(.footnote.weight(.bold)).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12).padding(.vertical, 6)
+                                    .background(.ultraThinMaterial)
+                            }
+                        }
+                        if groups.isEmpty {
+                            Text("Ничего не найдено").foregroundStyle(.secondary).padding(.top, 40)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.bottom, 24)
+                }
+                .onAppear {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { proxy.scrollTo(current, anchor: .center) }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    Button {
+                        query = ""
+                        withAnimation { proxy.scrollTo(current, anchor: .center) }
+                    } label: {
+                        Label("К текущей", systemImage: "scope")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                            .glassShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(16)
+                }
+            }
+        }
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .presentationDetents([.large])
         .presentationDragIndicator(.hidden)
     }
 }
@@ -10095,6 +10315,7 @@ struct MangaReaderView: View {
     @State private var scrollPage = 0
     @State private var historyTask: Task<Void, Never>?
     @State private var showBookmarks = false
+    @State private var showChapters = false
     @State private var pendingPage: Int?
     @State private var jumpTick = 0
     @ObservedObject private var bms = BookmarkStore.shared
@@ -10212,7 +10433,7 @@ struct MangaReaderView: View {
         autoOn = on
         if on {
             scroller.speed = CGFloat(effSpeed)
-            scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && pagesReady() }
+            scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && !showChapters && pagesReady() }
             scroller.onEnd = {
                 guard reachedEnd else { return false }
                 Task { @MainActor in
@@ -10381,16 +10602,8 @@ struct MangaReaderView: View {
                     Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
                         .frame(width: 42, height: 46)
                 }
-                Menu {
-                    Button { toggleBookmark() } label: {
-                        Label(pageBookmark == nil ? "Закладка на эту страницу" : "Убрать закладку",
-                              systemImage: pageBookmark == nil ? "bookmark" : "bookmark.slash")
-                    }
-                    Button { showBookmarks = true } label: { Label("Все закладки", systemImage: "list.bullet") }
-                } label: {
-                    Image(systemName: pageBookmark == nil ? "bookmark" : "bookmark.fill").frame(width: 42, height: 46)
-                } primaryAction: {
-                    toggleBookmark()
+                Button { showChapters = true } label: {
+                    Image(systemName: "list.bullet").frame(width: 42, height: 46)
                 }
                 Button { showComments = true } label: {
                     Image(systemName: "bubble.left.and.bubble.right").frame(width: 42, height: 46)
@@ -10573,6 +10786,14 @@ struct MangaReaderView: View {
                                 autoNext: bind(\.autoNext, $autoNext), speed: bind(\.speed, $autoSpeed),
                                 dim: bind(\.dim, $gDim), warm: bind(\.warm, $gWarm), gray: bind(\.gray, $gGray),
                                 detected: autoVertical ? "лента" : "страницы")
+        }
+        .sheet(isPresented: $showChapters) {
+            MangaChapterPicker(chapters: chapters, current: index, readKey: novel.readKey) { i in
+                guard i != index else { return }
+                Haptics.tap()
+                pendingPage = nil
+                index = i
+            }
         }
         .sheet(isPresented: $showComments) {
             if let c = chapter {
