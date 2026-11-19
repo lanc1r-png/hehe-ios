@@ -666,7 +666,7 @@ struct CatalogFilter: Equatable {
         }
 
         func label(_ ranobe: Bool) -> String {
-            if ranobe && self == .lastEpisode { return "Свежие главы" }
+            if ranobe && self == .lastEpisode { return "Последние обновления" }
             if ranobe && self == .views { return "По чтению" }
             return title
         }
@@ -3267,6 +3267,8 @@ struct SectionHeader: View {
 struct PosterCard: View {
     let anime: Anime
     var width: CGFloat = 124
+    /// Необязательная пометка в правом верхнем углу («Новое» и т. п.)
+    var mark: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3282,6 +3284,16 @@ struct PosterCard: View {
                             .foregroundStyle(.white)
                             .background(Color.black.opacity(0.5), in: Capsule())
                             .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
+                            .padding(6)
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if let mark {
+                        Text(mark)
+                            .font(.system(size: 10, weight: .heavy))
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .foregroundStyle(.white)
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
                             .padding(6)
                     }
                 }
@@ -3639,14 +3651,14 @@ struct HomeView: View {
         }
     }
 
-    private func poster(_ list: [Anime]) -> some View {
+    private func poster(_ list: [Anime], newIDs: Set<Int> = []) -> some View {
         // повторяющиеся id ломают ленивую ленту: карточки перестают нажиматься и листаться
         var seen = Set<Int>()
         let unique = list.filter { seen.insert($0.id).inserted }
         return ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(unique) { a in
-                    TitleLink(anime: a) { PosterCard(anime: a, width: 154) }
+                    TitleLink(anime: a) { PosterCard(anime: a, width: 154, mark: newIDs.contains(a.id) ? "НОВОЕ" : nil) }
                         .buttonStyle(.pressable)
                 }
             }
@@ -3740,8 +3752,8 @@ struct HomeView: View {
 
                         if !vm.fresh.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
-                                SectionHeader(title: ranobe ? "Свежие главы" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
-                                poster(Array(vm.fresh.prefix(14)))
+                                SectionHeader(title: ranobe ? "Последние обновления" : "Свежие серии") { router.openCatalog(sort: .lastEpisode) }
+                                poster(Array(vm.fresh.prefix(ranobe ? 20 : 14)), newIDs: ranobe ? Set(vm.newest.map { $0.id }) : [])
                             }
                         }
 
@@ -3775,7 +3787,7 @@ struct HomeView: View {
                             }
                         }
 
-                        if !vm.newest.isEmpty {
+                        if !vm.newest.isEmpty && !ranobe {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
                                 wideRail(vm.newest)
