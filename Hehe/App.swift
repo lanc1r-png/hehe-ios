@@ -6586,7 +6586,12 @@ struct BookmarkSheet: View {
         guard let t = auth.token else { return }
         busy = true
         defer { busy = false }
-        let bodies: [[String: Any]] = [
+        var bodies: [[String: Any]] = []
+        // формат сайта (по журналу запросов)
+        if let slug = anime.slugUrl {
+            bodies.append(["media_type": LibSite.current.postType, "media_slug": slug, "bookmark": ["status": f.id], "meta": [String: Any]()])
+        }
+        bodies += [
             ["id": anime.id, "type": f.id, "model": LibSite.current.postType],
             ["bookmark": ["type": f.id], "id": anime.id, "model": LibSite.current.postType],
             ["type": f.id, "relation_id": anime.id, "relation_type": LibSite.current.postType]
