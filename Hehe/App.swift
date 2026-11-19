@@ -1208,7 +1208,7 @@ actor ImageLoader {
 
     init() {
         let cfg = URLSessionConfiguration.default
-        cfg.urlCache = URLCache(memoryCapacity: 24 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024, diskPath: "hehe-images")
+        cfg.urlCache = ImageLoader.diskCache
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         cfg.httpMaximumConnectionsPerHost = 8
         cfg.timeoutIntervalForRequest = 20
@@ -1216,6 +1216,19 @@ actor ImageLoader {
     }
 
     func clearDisk() { session.configuration.urlCache?.removeAllCachedResponses() }
+
+    /// Дисковый кэш обложек (до 500 МБ).
+    nonisolated static let diskCache = URLCache(memoryCapacity: 24 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024, diskPath: "hehe-images")
+
+    /// Сколько занимают оба временных кэша картинок: обложки и просмотренные страницы манги (не скачанные главы).
+    nonisolated static var cachesBytes: Int { diskCache.currentDiskUsage + MangaImageStore.diskCache.currentDiskUsage }
+
+    /// Очищает оба кэша картинок: в памяти и на диске. Скачанные главы не трогаются.
+    nonisolated static func clearAllCaches() {
+        ImageCache.shared.removeAllObjects()
+        diskCache.removeAllCachedResponses()
+        MangaImageStore.diskCache.removeAllCachedResponses()
+    }
 
     func image(_ url: URL, referer: String, maxPixel: CGFloat) async -> UIImage? {
         let key = "\(url.absoluteString)#\(Int(maxPixel))"
@@ -2474,6 +2487,7 @@ struct SiteLogView: View {
 }
 
 struct SettingsView: View {
+    @State private var imageCacheBytes = 0
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.autoNative") private var autoNative = true
     @AppStorage("set.resume") private var resume = true
@@ -2909,9 +2923,12 @@ struct SettingsView: View {
 
     private var dataBlock: some View {
         section("Данные", footer: info) {
-            actionRow("photo.stack.fill", "Очистить кэш обложек") {
-                ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
+            actionRow("photo.stack.fill", "Очистить кэш картинок" + (imageCacheBytes > 0 ? " · " + fmtBytes(imageCacheBytes) : "")) {
+                ImageLoader.clearAllCaches()
+                imageCacheBytes = ImageLoader.cachesBytes
+                info = "Кэш обложек и просмотренных страниц очищен. Скачанные главы на месте."
             }
+            .onAppear { imageCacheBytes = ImageLoader.cachesBytes }
             rowDivider
             actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
                 ProgressStore.shared.clear(); HistoryStore.shared.clear()
@@ -9329,12 +9346,15 @@ actor MangaImageStore {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 25
         cfg.httpMaximumConnectionsPerHost = 4
-        cfg.urlCache = URLCache(memoryCapacity: 30_000_000, diskCapacity: 400_000_000)
+        cfg.urlCache = MangaImageStore.diskCache
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         return URLSession(configuration: cfg)
     }()
 
     private static let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    /// Временный кэш просмотренных страниц манги (до 400 МБ). Скачанные главы лежат отдельно.
+    nonisolated static let diskCache = URLCache(memoryCapacity: 30_000_000, diskCapacity: 400_000_000)
 
     func image(for page: MangaPage) async -> UIImage? {
         let key = ImageCache.key(page.url, page.maxPixel)
