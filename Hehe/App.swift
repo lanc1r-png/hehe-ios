@@ -4031,6 +4031,25 @@ final class CatalogViewModel: ObservableObject {
     private var hasNext = true
     private var generation = 0
     private(set) var loadedQuery = ""
+    /// id недавно добавленных тайтлов: нужны только для пометок в списке «Последние обновления»
+    @Published private(set) var newIDs: Set<Int> = []
+    private var newIDsLoaded = false
+
+    var showsUpdateMarks: Bool { LibSite.current.isBook && filter.sortBy == .lastEpisode }
+
+    func loadNewIDs() async {
+        guard showsUpdateMarks, !newIDsLoaded else { return }
+        newIDsLoaded = true
+        var f = CatalogFilter()
+        f.sortBy = .newest
+        var ids = Set<Int>()
+        for pg in 1...3 {
+            guard let r = try? await AnimelibAPI.shared.catalog(filter: f, page: pg) else { break }
+            ids.formUnion(r.items.map { $0.id })
+            if !r.hasNext { break }
+        }
+        newIDs = ids
+    }
 
     func reload() async {
         generation += 1
@@ -4324,8 +4343,9 @@ struct CatalogView: View {
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { anime in
-                        TitleLink(anime: anime) { AnimeCard(anime: anime) }
+                        TitleLink(anime: anime) { AnimeCard(anime: anime, mark: vm.showsUpdateMarks ? (vm.newIDs.contains(anime.id) ? "НОВОЕ" : "НОВАЯ ГЛАВА") : nil) }
                             .buttonStyle(.pressable)
+                            .task { await vm.loadNewIDs() }
                             .onAppear {
                                 if vm.items.suffix(8).contains(where: { $0.id == anime.id }) { Task { await vm.loadMore() } }
                             }
@@ -4381,12 +4401,24 @@ struct CatalogView: View {
 
 struct AnimeCard: View {
     let anime: Anime
+    /// Пометка в правом верхнем углу («НОВОЕ» / «НОВАЯ ГЛАВА») — только в списке по последним обновлениям
+    var mark: String? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 520)
                 .aspectRatio(2/3, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
+                .overlay(alignment: .topTrailing) {
+                    if let mark {
+                        Text(mark)
+                            .font(.system(size: 10, weight: .heavy))
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .foregroundStyle(.white)
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
+                            .padding(7)
+                    }
+                }
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
                         Label(r, systemImage: "star.fill")
