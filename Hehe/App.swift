@@ -3264,6 +3264,28 @@ struct SectionHeader: View {
     }
 }
 
+/// Компактная иконка-пометка на обложке: «НОВОЕ» — искра, «НОВАЯ ГЛАВА» — плюс главы. Почти не закрывает обложку.
+struct UpdateMark: View {
+    let text: String
+    private var isNew: Bool { text == "НОВОЕ" }
+    var body: some View {
+        Image(systemName: isNew ? "sparkles" : "plus")
+            .font(.system(size: 11, weight: .heavy))
+            .foregroundStyle(.white)
+            .frame(width: 24, height: 24)
+            .background {
+                if isNew {
+                    Circle().fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing))
+                } else {
+                    Circle().fill(Color.black.opacity(0.55))
+                }
+            }
+            .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 0.6))
+            .padding(6)
+            .accessibilityLabel(text)
+    }
+}
+
 struct PosterCard: View {
     let anime: Anime
     var width: CGFloat = 124
@@ -3288,14 +3310,7 @@ struct PosterCard: View {
                     }
                 }
                 .overlay(alignment: .topTrailing) {
-                    if let mark {
-                        Text(mark)
-                            .font(.system(size: 10, weight: .heavy))
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .foregroundStyle(.white)
-                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
-                            .padding(6)
-                    }
+                    if let mark { UpdateMark(text: mark) }
                 }
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
@@ -4410,14 +4425,7 @@ struct AnimeCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
                 .overlay(alignment: .topTrailing) {
-                    if let mark {
-                        Text(mark)
-                            .font(.system(size: 10, weight: .heavy))
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .foregroundStyle(.white)
-                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
-                            .padding(7)
-                    }
+                    if let mark { UpdateMark(text: mark) }
                 }
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
