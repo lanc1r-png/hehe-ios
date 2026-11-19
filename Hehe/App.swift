@@ -3346,11 +3346,7 @@ struct AnimeRow: View {
             }
             Spacer(minLength: 0)
             if let r = anime.rateAvg {
-                Label(r, systemImage: "star.fill")
-                    .font(.caption.bold())
-                    .foregroundStyle(.yellow)
-                    .padding(.horizontal, light ? 9 : 0).padding(.vertical, light ? 5 : 0)
-                    .background { if light { Capsule().fill(Theme.chip) } }
+                RatingBadge(text: r)
             }
         }
         .padding(light ? EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0) : EdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10))
@@ -3396,9 +3392,7 @@ struct PopularHero: View {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.75))
                     if let r = anime.rateAvg {
-                        Label(r, systemImage: "star.fill")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.yellow)
+                        RatingBadge(text: r)
                     }
                 }
                 Spacer(minLength: 0)
@@ -3458,6 +3452,19 @@ struct ContinueCard: View {
     }
 }
 
+/// Единая плашка рейтинга: белая звезда на тёмной капсуле, как на обложках в каталоге.
+struct RatingBadge: View {
+    let text: String
+    var body: some View {
+        Label(text, systemImage: "star.fill")
+            .font(.caption.bold())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background(Color.black.opacity(0.5), in: Capsule())
+            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
+    }
+}
+
 struct TodayHero: View {
     let anime: Anime
     private var verb: String { LibSite.current.isBook ? "Читать" : "Смотреть" }
@@ -3482,7 +3489,7 @@ struct TodayHero: View {
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
                 HStack(spacing: 8) {
-                    if let r = anime.rateAvg { Label(r, systemImage: "star.fill").foregroundStyle(.yellow) }
+                    if let r = anime.rateAvg { RatingBadge(text: r) }
                     if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
                 }
                 .font(.subheadline.weight(.semibold))
@@ -3580,11 +3587,7 @@ struct WideCard: View {
                 }
                 Spacer(minLength: 0)
                 if let r = anime.rateAvg {
-                    Label(r, systemImage: "star.fill")
-                        .font(.caption.bold())
-                        .foregroundStyle(.yellow)
-                        .padding(.horizontal, 9).padding(.vertical, 4)
-                        .background(Theme.chip, in: Capsule())
+                    RatingBadge(text: r)
                 }
             }
             Spacer(minLength: 0)
