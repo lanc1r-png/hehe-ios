@@ -9336,6 +9336,21 @@ actor MangaImageStore {
         if r.0 == nil { lastNote = r.1 }
         return r.0
     }
+
+    /// Только скачивает страницу в дисковый кэш, не декодируя её: память не занимается,
+    /// а когда до страницы дойдёт очередь, она откроется из кэша без сети.
+    nonisolated func warm(_ page: MangaPage) async {
+        if ImageCache.shared.object(forKey: ImageCache.key(page.url, page.maxPixel)) != nil { return }
+        for u in page.urls {
+            if Task.isCancelled || u.isFileURL { return }
+            var req = URLRequest(url: u)
+            req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
+            req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue(MangaImageStore.agent, forHTTPHeaderField: "User-Agent")
+            if let (_, resp) = try? await MangaImageStore.session.data(for: req),
+               let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) { return }
+        }
+    }
 }
 
 struct MangaPageView: View {
@@ -10524,25 +10539,32 @@ struct MangaReaderView: View {
         else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
     }
 
-    /// Фоновая подгрузка: сначала открытая страница, потом остальные по порядку, по две за раз.
+    /// Фоновая подгрузка. Декодируются (занимают память) только страницы рядом с текущей:
+    /// одна назад и три вперёд. Остальные страницы главы лишь скачиваются в дисковый кэш.
     private func preload(from start: Int) {
         preloadTask?.cancel()
         let list = pages
         guard !list.isEmpty else { return }
         let first = min(max(start, 0), list.count - 1)
         preloadTask = Task {
-            var order = Array(first..<list.count)
-            order += Array((0..<first).reversed())
+            // 1. Текущая страница, затем соседние: готовые картинки в памяти.
+            _ = await MangaImageStore.shared.image(for: list[first])
+            var near: [Int] = []
+            for k in 1...3 where first + k < list.count { near.append(first + k) }
+            if first > 0 { near.append(first - 1) }
+            await withTaskGroup(of: Void.self) { group in
+                for id in near { group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) } }
+            }
+            // 2. Дальше по главе только скачиваем, по три за раз: сначала вперёд, потом назад.
+            var rest = Array((first + 4)..<max(first + 4, list.count))
+            rest += Array((0..<max(first - 1, 0)).reversed())
             var i = 0
-            while i < order.count {
+            while i < rest.count {
                 if Task.isCancelled { return }
-                let n = i == 0 ? 1 : 3
-                let chunk = Array(order[i..<min(i + n, order.count)])
-                i += n
+                let chunk = Array(rest[i..<min(i + 3, rest.count)])
+                i += 3
                 await withTaskGroup(of: Void.self) { group in
-                    for id in chunk {
-                        group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) }
-                    }
+                    for id in chunk { group.addTask { await MangaImageStore.shared.warm(list[id]) } }
                 }
             }
         }
