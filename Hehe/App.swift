@@ -3320,7 +3320,10 @@ struct AnimeRow: View {
                                          ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent2],
                                                                         startPoint: .top, endPoint: .bottom))
                                          : AnyShapeStyle(Color.secondary.opacity(0.55)))
-                        .frame(width: 40)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(width: 46)
                 } else {
                     Text("\(rank)")
                         .font(.headline.bold())
