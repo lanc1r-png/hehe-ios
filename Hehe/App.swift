@@ -3215,7 +3215,17 @@ final class HomeViewModel: ObservableObject {
                 case .top: top = list
                 }
                 // Обложки тех же размеров, что берут карточки, иначе подгрузка уходит впустую.
-                ImageLoader.prefetch(list.prefix(14).compactMap { $0.posterURL }, maxPixel: 720)
+                switch part {
+                case .fresh:
+                    ImageLoader.prefetch(list.prefix(14).compactMap { $0.posterURL }, maxPixel: 720)
+                case .newest:
+                    ImageLoader.prefetch(list.prefix(10).compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 420)
+                case .popular:
+                    ImageLoader.prefetch(list.prefix(1).compactMap { $0.posterURL }, maxPixel: 720)
+                    ImageLoader.prefetch(list.dropFirst().prefix(14).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
+                case .top:
+                    ImageLoader.prefetch(list.prefix(6).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
+                }
             }
         }
         error = gotAny ? nil : "Не удалось загрузить данные. Проверьте соединение."
@@ -3365,6 +3375,8 @@ struct PosterCard: View {
 }
 
 struct AnimeRow: View {
+    /// Миниатюра 62×93 pt — это 279 пикселей экрана по длинной стороне; 300 хватает без потери резкости.
+    static let thumbPixels: CGFloat = 300
     let anime: Anime
     var rank: Int? = nil
     /// Лёгкий вид без плашки: обложка, название, рейтинг.
@@ -3391,7 +3403,7 @@ struct AnimeRow: View {
                         .frame(width: 22)
                 }
             }
-            RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: light ? 720 : 480)
+            RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: AnimeRow.thumbPixels)
                 .frame(width: light ? 62 : 52, height: light ? 93 : 78)
                 .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
             VStack(alignment: .leading, spacing: 4) {
@@ -4123,7 +4135,7 @@ final class CatalogViewModel: ObservableObject {
             let known = Set(items.map(\.id))
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
-            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
+            ImageLoader.prefetch(fresh.compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 520)
             hasNext = r.hasNext
             page = r.next
         } catch {
@@ -4509,7 +4521,7 @@ final class AuthorViewModel: ObservableObject {
             let known = Set(items.map { $0.id })
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
-            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
+            ImageLoader.prefetch(fresh.compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 520)
             page += 1
             if fresh.isEmpty || !r.hasNext { finished = true }
             error = nil
@@ -12720,8 +12732,7 @@ final class SimilarViewModel: ObservableObject {
         adapt = r.adapt
         note = r.note
         loaded = true
-        ImageLoader.prefetch((r.similar + r.related).compactMap { $0.imageURL })
-        ImageLoader.prefetch(r.adapt.compactMap { $0.imageURL })
+        ImageLoader.prefetch((r.similar + r.related + r.adapt).compactMap { $0.imageURL }, maxPixel: 320)
     }
 }
 
