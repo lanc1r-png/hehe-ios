@@ -10229,24 +10229,38 @@ struct SolidSheetBackground: ViewModifier {
     }
 }
 
-/// Находит UIScrollView, внутри которого лежит SwiftUI-лента.
+/// Находит UIScrollView, внутри которого лежит SwiftUI-лента. Ищет, как только вид попал в окно и при каждой раскладке.
 struct ScrollFinder: UIViewRepresentable {
     let onFound: (UIScrollView) -> Void
 
-    func makeUIView(context: Context) -> UIView {
-        let v = UIView()
-        v.isUserInteractionEnabled = false
-        return v
-    }
+    final class Finder: UIView {
+        var onFound: (UIScrollView) -> Void = { _ in }
+        private weak var last: UIScrollView?
 
-    func updateUIView(_ v: UIView, context: Context) {
-        DispatchQueue.main.async {
-            var p: UIView? = v
+        private func find() {
+            var p: UIView? = superview
             while let x = p {
-                if let sv = x as? UIScrollView { onFound(sv); return }
+                if let sv = x as? UIScrollView {
+                    if sv !== last { last = sv; onFound(sv) }
+                    return
+                }
                 p = x.superview
             }
         }
+
+        override func didMoveToWindow() { super.didMoveToWindow(); find() }
+        override func layoutSubviews() { super.layoutSubviews(); find() }
+    }
+
+    func makeUIView(context: Context) -> Finder {
+        let v = Finder()
+        v.isUserInteractionEnabled = false
+        v.onFound = onFound
+        return v
+    }
+
+    func updateUIView(_ v: Finder, context: Context) {
+        v.onFound = onFound
     }
 }
 
@@ -10291,8 +10305,8 @@ final class AutoScroller {
     private func locate() {
         var best: UIScrollView?
         func walk(_ v: UIView) {
-            if let sv = v as? UIScrollView, !sv.isHidden, sv.alpha > 0.01, sv.bounds.width > 200,
-               sv.contentSize.height > sv.bounds.height * 1.2 {
+            if let sv = v as? UIScrollView, !sv.isHidden, sv.alpha > 0.01, sv.bounds.width > 200, sv.bounds.height > 300,
+               sv.contentSize.height > sv.bounds.height * 1.05 {
                 if best == nil || sv.contentSize.height > best!.contentSize.height { best = sv }
             }
             for c in v.subviews { walk(c) }
@@ -10309,7 +10323,8 @@ final class AutoScroller {
         let dt = last == 0 ? 0 : min(now - last, 0.1)
         last = now
         ticks += 1
-        if scrollView == nil, ticks % 30 == 0 { locate() }
+        if let cur = scrollView, cur.window == nil { scrollView = nil }
+        if scrollView == nil, ticks % 20 == 0 { locate() }
         guard dt > 0, let sv = scrollView else { return }
         if sv.isTracking || sv.isDragging || sv.isDecelerating {
             pos = sv.contentOffset.y
@@ -10773,6 +10788,18 @@ struct MangaReaderView: View {
                 if !chromeHidden { topBar.transition(.move(edge: .top).combined(with: .opacity)) }
                 Spacer()
                 if !chromeHidden { bottomBar.transition(.move(edge: .bottom).combined(with: .opacity)) }
+            }
+            if chromeHidden, autoOn, !autoNote.isEmpty {
+                VStack {
+                    Spacer()
+                    Text(autoNote)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(Color.black.opacity(0.5), in: Capsule())
+                        .padding(.bottom, 44)
+                }
+                .allowsHitTesting(false)
             }
             // маленький счётчик страниц, пока меню скрыто
             if chromeHidden, !vertical, !pages.isEmpty, !loading {
