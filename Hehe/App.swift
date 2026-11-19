@@ -7960,6 +7960,27 @@ enum NovelService {
 }
 
 // MARK: - Ранобэ: что уже прочитано
+/// Отправка прочитанных глав на сайт (как делает сайт: POST .../chapters/{id}/view). Только для вошедших в аккаунт.
+enum SiteSync {
+    private static var sent = Set<String>()
+
+    static func view(novelID: Int, chapterID: Int) {
+        guard let token = Keychain.get("lib.token"), !token.isEmpty else { return }
+        let site = LibSite.current
+        guard site.isBook else { return }
+        let key = "\(site.key):\(novelID):\(chapterID)"
+        guard sent.insert(key).inserted else { return }
+        let path = "\(site.apiPath)/\(novelID)/chapters/\(chapterID)/view"
+        Task.detached(priority: .utility) {
+            do {
+                _ = try await AnimelibAPI.shared.rawData(path, token: token, method: "POST", json: [:])
+            } catch {
+                await MainActor.run { _ = SiteSync.sent.remove(key) }
+            }
+        }
+    }
+}
+
 @MainActor
 final class ReadStore: ObservableObject {
     static let shared = ReadStore()
@@ -10532,6 +10553,7 @@ struct MangaReaderView: View {
             pendingPage = pos.p
         }
         ReadStore.shared.mark(novel.readKey, ch.id)
+        SiteSync.view(novelID: novel.id, chapterID: ch.id)
         scheduleHistory(ch)
         do {
             let result = try await MangaService.pages(slug: slug, chapter: ch, novelID: novel.id)
@@ -11845,6 +11867,7 @@ struct NovelReaderView: View {
             else if pos.b > 0 { restoreBlock = pos.b }
         }
         ReadStore.shared.mark(novel.readKey, ch.id)
+        SiteSync.view(novelID: novel.id, chapterID: ch.id)
         scheduleHistory(ch)
         if let local = store.blocks(novel: novel.id, chapter: ch.id) {
             blocks = local
