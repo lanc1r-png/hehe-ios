@@ -10805,6 +10805,7 @@ struct MangaReaderView: View {
             BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: false,
                            onBookmark: { openBookmark($0) }, onHighlight: { _ in })
         }
+        .modifier(ReadingTimeTracker())
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             persistPos()
@@ -12159,6 +12160,7 @@ struct NovelReaderView: View {
         } message: { sel in
             Text(String(sel.text.prefix(120)))
         }
+        .modifier(ReadingTimeTracker())
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             persistPos()
@@ -12829,6 +12831,31 @@ struct DayActivity: Codable {
     var episodes = 0
     var novels = 0
     var manga = 0
+    /// Время чтения (манга, хентай, ранобэ) в секундах
+    var read: Double = 0
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        watch = (try? c.decode(Double.self, forKey: .watch)) ?? 0
+        episodes = (try? c.decode(Int.self, forKey: .episodes)) ?? 0
+        novels = (try? c.decode(Int.self, forKey: .novels)) ?? 0
+        manga = (try? c.decode(Int.self, forKey: .manga)) ?? 0
+        read = (try? c.decode(Double.self, forKey: .read)) ?? 0
+    }
+}
+
+/// Считает время, проведённое в читалке: раз в 5 секунд, пока приложение на экране.
+struct ReadingTimeTracker: ViewModifier {
+    @Environment(\.scenePhase) private var phase
+    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    func body(content: Content) -> some View {
+        content.onReceive(tick) { _ in
+            if phase == .active { ActivityStore.shared.addRead(5) }
+        }
+    }
 }
 
 @MainActor
@@ -12863,6 +12890,7 @@ final class ActivityStore: ObservableObject {
     }
 
     func addWatch(_ seconds: Double) { mutate { $0.watch += seconds } }
+    func addRead(_ seconds: Double) { mutate { $0.read += seconds } }
     func addEpisode() { mutate { $0.episodes += 1 } }
     func addChapter(manga: Bool) {
         mutate { if manga { $0.manga += 1 } else { $0.novels += 1 } }
@@ -12907,7 +12935,7 @@ struct StatsView: View {
         let cal = Calendar.current
         func active(_ d: Date) -> Bool {
             guard let a = act.days[ActivityStore.dayKey(d)] else { return false }
-            return a.watch > 0 || a.episodes > 0 || a.novels > 0 || a.manga > 0
+            return a.watch > 0 || a.read > 0 || a.episodes > 0 || a.novels > 0 || a.manga > 0
         }
         var day = Date()
         if !active(day) { day = cal.date(byAdding: .day, value: -1, to: day) ?? day }
@@ -12928,6 +12956,7 @@ struct StatsView: View {
         reads.read.filter { (Int($0.key) ?? 0) >= 0 }.values.reduce(0) { $0 + $1.count }
     }
     private var totalHours: Double { act.days.values.reduce(0.0) { $0 + $1.watch } / 3600 }
+    private var totalReadHours: Double { act.days.values.reduce(0.0) { $0 + $1.read } / 3600 }
 
     private func minutes(_ s: Double) -> String {
         s >= 3600 ? String(format: "%.1f ч", s / 3600) : "\(Int(s / 60)) мин"
@@ -12943,7 +12972,7 @@ struct StatsView: View {
         var out: [Bar] = []
         for (k, d) in lastDays(14) {
             let a = act.days[k] ?? DayActivity()
-            let v = chart == 0 ? a.watch / 60 : Double(a.novels + a.manga)
+            let v = chart == 0 ? a.watch / 60 : (chart == 1 ? a.read / 60 : Double(a.novels + a.manga))
             out.append(Bar(id: k, label: f.string(from: d), value: v))
         }
         return out
@@ -12970,10 +12999,14 @@ struct StatsView: View {
                     tile("Просмотр сегодня", minutes(total(1) { $0.watch }), "play.circle.fill")
                     tile("Просмотр за неделю", minutes(total(7) { $0.watch }), "calendar")
                     tile("Просмотр за месяц", minutes(total(30) { $0.watch }), "calendar.badge.clock")
+                    tile("Чтение сегодня", minutes(total(1) { $0.read }), "book.circle.fill")
+                    tile("Чтение за неделю", minutes(total(7) { $0.read }), "book.closed.fill")
+                    tile("Чтение за месяц", minutes(total(30) { $0.read }), "calendar.badge.clock")
+                    tile("Всего часов чтения", String(format: "%.1f", totalReadHours), "clock.badge.checkmark.fill")
                     tile("Глав за неделю", "\(chaptersIn(7))", "book.fill")
                     tile("Глав за месяц", "\(chaptersIn(30))", "books.vertical.fill")
                     tile("Серий досмотрено", "\(episodesFinished)", "checkmark.circle.fill")
-                    tile("Всего часов", String(format: "%.1f", totalHours), "clock.fill")
+                    tile("Всего часов просмотра", String(format: "%.1f", totalHours), "clock.fill")
                     tile("Глав манги прочитано", "\(mangaChapters)", "photo.on.rectangle")
                     tile("Глав ранобэ прочитано", "\(novelChapters)", "text.book.closed.fill")
                 }
@@ -12981,7 +13014,8 @@ struct StatsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("", selection: $chart) {
                         Text("Просмотр, мин").tag(0)
-                        Text("Чтение, глав").tag(1)
+                        Text("Чтение, мин").tag(1)
+                        Text("Глав").tag(2)
                     }
                     .pickerStyle(.segmented)
                     HStack(alignment: .bottom, spacing: 5) {
@@ -13001,7 +13035,7 @@ struct StatsView: View {
                 .padding(14)
                 .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
 
-                Text("Статистика ведётся с момента обновления до этой версии. Время просмотра считается в родном плеере, веб-плеер Kodik в нём не учитывается.")
+                Text("Статистика ведётся с момента обновления до этой версии. Время просмотра считается в родном плеере, веб-плеер Kodik в нём не учитывается. Время чтения считается, пока открыта читалка манги или ранобэ и приложение на экране.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(14)
