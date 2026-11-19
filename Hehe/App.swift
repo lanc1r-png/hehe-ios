@@ -1428,12 +1428,13 @@ struct RemoteImage: View {
         Rectangle().fill(.quaternary)
             .overlay {
                 if let image {
-                    Image(uiImage: image).resizable().scaledToFill().transition(.opacity)
+                    Image(uiImage: image).resizable().scaledToFill().transition(.opacity).allowsHitTesting(false)
                 } else if failed {
                     Image(systemName: "photo").foregroundStyle(.secondary)
                 }
             }
             .clipped()
+            .contentShape(Rectangle())
             .task(id: url) { await load() }
     }
 
@@ -3301,6 +3302,7 @@ struct PosterCard: View {
                 .multilineTextAlignment(.leading)
                 .frame(width: width, alignment: .leading)
         }
+        .contentShape(Rectangle())
     }
 }
 
@@ -3356,6 +3358,7 @@ struct AnimeRow: View {
         .overlay(alignment: .bottom) {
             if light { Divider().opacity(0.5).padding(.leading, 34) }
         }
+        .contentShape(Rectangle())
     }
 }
 
@@ -3509,6 +3512,7 @@ struct TodayHero: View {
         }
         .frame(maxWidth: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
         .shadow(color: .black.opacity(0.3), radius: 14, y: 8)
         .padding(.horizontal, 14)
