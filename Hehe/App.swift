@@ -3413,8 +3413,8 @@ struct ContinueCard: View {
         let p = LibSite.current.isBook ? nil : progress.get(item.episodeID)
         HStack(spacing: 12) {
             RemoteImage(url: item.anime.imageURL)
-                .frame(width: 56, height: 84)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .frame(width: 44, height: 66)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.anime.displayTitle)
                     .font(.subheadline.weight(.semibold))
@@ -3441,8 +3441,8 @@ struct ContinueCard: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(10)
-        .frame(width: 290)
+        .padding(8)
+        .frame(width: 240)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .background {
             CoverTintLayer(url: item.anime.imageURL, strength: 0.4, horizontal: true)
@@ -3473,42 +3473,44 @@ struct TodayHero: View {
         ZStack(alignment: .bottomLeading) {
             RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 900)
                 .frame(maxWidth: .infinity)
-                .frame(height: 420)
+                .frame(height: 300)
                 .clipped()
             LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.88)], startPoint: .center, endPoint: .bottom)
-            VStack(alignment: .leading, spacing: 10) {
-                Label("Выбор дня", systemImage: "sparkles")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Color.black.opacity(0.35), in: Capsule())
-                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.5))
-                Text(anime.displayTitle)
-                    .font(.title.weight(.bold))
-                    .foregroundStyle(.white)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
-                HStack(spacing: 8) {
-                    if let r = anime.rateAvg { RatingBadge(text: r) }
-                    if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
+            HStack(alignment: .bottom, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "sparkles")
+                        Text("ВЫБОР ДНЯ").tracking(1.2)
+                    }
+                    .font(.caption2.weight(.heavy))
+                    .foregroundStyle(LinearGradient(colors: [Color(red: 1, green: 0.85, blue: 0.5), Color(red: 1, green: 0.62, blue: 0.75)], startPoint: .leading, endPoint: .trailing))
+                    Text(anime.displayTitle)
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
+                    HStack(spacing: 8) {
+                        if let r = anime.rateAvg { RatingBadge(text: r) }
+                        if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
+                    }
+                    .font(.footnote.weight(.semibold))
                 }
-                .font(.subheadline.weight(.semibold))
-                HStack(spacing: 8) {
-                    Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
-                    Text(verb)
-                }
-                .font(.headline)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 26).padding(.vertical, 13)
-                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
-                .shadow(color: Theme.accent.opacity(0.5), radius: 12, y: 5)
+                Spacer(minLength: 0)
+                Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 54, height: 54)
+                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
+                    .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 0.8))
+                    .shadow(color: Theme.accent.opacity(0.55), radius: 12, y: 5)
             }
-            .padding(20)
+            .padding(16)
         }
         .frame(maxWidth: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 32, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
-        .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
+        .shadow(color: .black.opacity(0.3), radius: 14, y: 8)
         .padding(.horizontal, 14)
     }
 }
@@ -3529,8 +3531,8 @@ struct ContinueHero: View {
         }()
         HStack(spacing: 14) {
             RemoteImage(url: item.anime.posterURL ?? item.anime.imageURL, maxPixel: 480)
-                .frame(width: 96, height: 144)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .frame(width: 76, height: 114)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
             VStack(alignment: .leading, spacing: 8) {
                 Text(item.anime.displayTitle)
@@ -3538,28 +3540,27 @@ struct ContinueHero: View {
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Text(item.episodeTitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(Color.white.opacity(0.12), in: Capsule())
                     .lineLimit(1)
                 if let frac {
                     ProgressView(value: frac).tint(Theme.accent)
                     Text("\(Int(frac * 100))%").font(.caption2.weight(.semibold)).foregroundStyle(Theme.accent)
                 }
-                Spacer(minLength: 0)
-                HStack(spacing: 6) {
-                    Image(systemName: book ? "book.fill" : "play.fill")
-                    Text("Продолжить")
-                }
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 18).padding(.vertical, 9)
-                .background(Theme.accent, in: Capsule())
             }
             Spacer(minLength: 0)
+            Image(systemName: book ? "book.fill" : "play.fill")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 46, height: 46)
+                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.28), lineWidth: 0.8))
         }
-        .padding(14)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 176)
+        .frame(height: 138)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .background {
             CoverTintLayer(url: item.anime.imageURL, strength: 0.45, horizontal: true)
@@ -3673,8 +3674,21 @@ struct HomeView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
                                               action: { confirmClear = true }, actionTitle: "Очистить")
-                                TitleLink(anime: first.anime) { ContinueHero(item: first) }
-                                    .buttonStyle(.pressable)
+                                ZStack(alignment: .topTrailing) {
+                                    TitleLink(anime: first.anime) { ContinueHero(item: first) }
+                                        .buttonStyle(.pressable)
+                                    Button {
+                                        Haptics.tap()
+                                        withAnimation(.easeInOut(duration: 0.25)) { history.remove(first.anime.id) }
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.title3)
+                                            .symbolRenderingMode(.palette)
+                                            .foregroundStyle(.white, Color.black.opacity(0.55))
+                                            .padding(8)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                                     .padding(.horizontal, 14)
                                     .contextMenu {
                                         Button(role: .destructive) { history.remove(first.anime.id) } label: {
@@ -3710,13 +3724,13 @@ struct HomeView: View {
                                     }
                                     .padding(.horizontal, 14)
                                 }
-                                .confirmationDialog("Очистить список?", isPresented: $confirmClear, titleVisibility: .visible) {
-                                    Button("Очистить всё", role: .destructive) {
-                                        withAnimation { history.clear() }
-                                    }
-                                    Button("Отмена", role: .cancel) {}
                                 }
+                            }
+                            .confirmationDialog("Очистить список?", isPresented: $confirmClear, titleVisibility: .visible) {
+                                Button("Очистить всё", role: .destructive) {
+                                    withAnimation { history.clear() }
                                 }
+                                Button("Отмена", role: .cancel) {}
                             }
                         }
 
