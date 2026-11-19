@@ -5865,25 +5865,30 @@ final class CommentsViewModel: ObservableObject {
             line.isEmpty ? ["type": "paragraph"] : ["type": "paragraph", "content": [["type": "text", "text": line]]]
         }
         let doc: [String: Any] = ["type": "doc", "content": paragraphs]
-        var variants: [[String: Any]] = []
+        let docString: String = {
+            guard let d = try? JSONSerialization.data(withJSONObject: doc), let t = String(data: d, encoding: .utf8) else { return text }
+            return t
+        }()
+        let bodies: [(String, Any)] = [("doc", doc), ("blocks", paragraphs), ("json", docString), ("text", text)]
+        var variants: [(String, [String: Any])] = []
         for level in (parent == nil ? [1, 0] : [2, 1]) {
-            for body in [doc as Any, text as Any] {
+            for (name, body) in bodies {
                 var b: [String: Any] = ["comment": body, "comment_level": level, "post_id": animeID, "post_type": type]
                 if let p = parent { b["parent_comment"] = p }
                 if let pp = postPage { b["post_page"] = pp }
-                variants.append(b)
+                variants.append(("\(name)/\(level)", b))
             }
         }
-        var last = ""
-        for b in variants {
+        var errors: [String] = []
+        for (name, b) in variants {
             do {
                 _ = try await AnimelibAPI.shared.rawData("/comments", token: t, method: "POST", json: b)
                 return nil
             } catch {
-                last = error.localizedDescription
+                errors.append("\(name): \(error.localizedDescription)")
             }
         }
-        return last
+        return errors.joined(separator: "\n")
     }
 
     func like(_ id: Int) async -> String? {
