@@ -13158,8 +13158,9 @@ struct StatsView: View {
 struct HeheApp: App {
     init() {
         BackupManager.restoreOnLaunch()
+        // Только выбираем режим «воспроизведение видео». Саму аудиосессию iOS включит при старте плеера:
+        // музыка из других приложений не обрывается, пока ты просто листаешь каталог или читаешь.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
     }
 
     var body: some Scene {
