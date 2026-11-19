@@ -10743,7 +10743,7 @@ struct MangaReaderView: View {
                 if !chromeHidden { bottomBar.transition(.move(edge: .bottom).combined(with: .opacity)) }
             }
             // маленький счётчик страниц, пока меню скрыто
-            if chromeHidden, !pages.isEmpty, !loading {
+            if chromeHidden, !vertical, !pages.isEmpty, !loading {
                 VStack {
                     Spacer()
                     Text("\(min(shown + 1, pages.count)) / \(pages.count)")
