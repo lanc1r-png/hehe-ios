@@ -2194,7 +2194,12 @@ enum BackupManager {
     }
 
     // Копия живёт только в папке приложения (Файлы → На iPhone → Yume).
-    private static let mineKey = "backup.mine"   // дата последней копии, записанной самим приложением
+    private static let mineKey = "backup.mine"
+    /// Время изменения файла копии, записанной самим приложением: позволяет не читать файл при каждом запуске.
+    private static let mineMTimeKey = "backup.mine.mtime"
+    private static func fileMTime() -> Double? {
+        (try? FileManager.default.attributesOfItem(atPath: autoURL.path)[.modificationDate] as? Date)?.timeIntervalSince1970
+    }   // дата последней копии, записанной самим приложением
     /// После восстановления в работающем приложении копии не пишутся, чтобы старые данные в памяти не затёрли файл.
     private static var frozen = false
 
@@ -2206,6 +2211,9 @@ enum BackupManager {
 
     /// Дата копии в папке приложения, если её положил пользователь (а не записало само приложение).
     static func externalCopyDate() -> Date? {
+        // Быстрая проверка без чтения файла: если файла нет или он ровно тот, что записали мы сами, читать нечего.
+        guard let m = fileMTime() else { return nil }
+        if let mine = UserDefaults.standard.object(forKey: mineMTimeKey) as? Double, abs(m - mine) < 0.001 { return nil }
         guard let d = try? Data(contentsOf: autoURL), !d.isEmpty, let fd = fileDate(d) else { return nil }
         if let m = UserDefaults.standard.object(forKey: mineKey) as? Date, abs(m.timeIntervalSince(fd)) < 1.5 { return nil }
         return fd
@@ -2215,6 +2223,7 @@ enum BackupManager {
     static func acceptExternal() {
         if let d = try? Data(contentsOf: autoURL), let fd = fileDate(d) {
             UserDefaults.standard.set(fd, forKey: mineKey)
+            if let m = fileMTime() { UserDefaults.standard.set(m, forKey: mineMTimeKey) }
         }
     }
 
@@ -2237,6 +2246,7 @@ enum BackupManager {
         do {
             try d.write(to: autoURL, options: .atomic)
             UserDefaults.standard.set(stamp, forKey: mineKey)
+            if let m = fileMTime() { UserDefaults.standard.set(m, forKey: mineMTimeKey) }
             return autoURL
         } catch {
             return nil
@@ -3991,7 +4001,8 @@ struct RootView: View {
             }
         }
         .task {
-            BackupManager.writeAuto()
+            // Копия при запуске пишется в фоне: сборка и запись всего хранилища не задерживают первый экран.
+            Task.detached(priority: .utility) { BackupManager.writeAuto() }
             newBadge = FavMetaStore.shared.totalNew(FavoritesStore.current.items)
             await FavUpdater.refreshIfDue()
         }
