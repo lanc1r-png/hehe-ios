@@ -10598,7 +10598,7 @@ struct MangaReaderView: View {
             .liquidGlass(Capsule())
             HStack(spacing: 0) {
                 Button { showSettings = true } label: {
-                    Image(systemName: vertical ? "arrow.up.and.down.text.horizontal" : "book")
+                    Image(systemName: "slider.horizontal.3")
                         .frame(width: 42, height: 46)
                 }
                 Button { showChapters = true } label: {
