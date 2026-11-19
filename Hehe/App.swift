@@ -8373,6 +8373,11 @@ final class BackgroundBox {
 }
 
 @MainActor
+final class DownloadProgress: ObservableObject {
+    @Published var status = ""
+}
+
+@MainActor
 final class DownloadManager: ObservableObject {
     static let shared = DownloadManager()
 
@@ -8388,7 +8393,12 @@ final class DownloadManager: ObservableObject {
     @Published private(set) var failed: [Int: String] = [:]
     @Published private(set) var total = 0
     @Published private(set) var done = 0
-    @Published private(set) var status = ""
+    /// Текст состояния живёт в отдельном объекте: его частые обновления не должны перерисовывать список глав.
+    let progress = DownloadProgress()
+    var status: String {
+        get { progress.status }
+        set { progress.status = newValue }
+    }
     @Published var notice: String?
 
     private var jobs: [Job] = []
@@ -8480,7 +8490,7 @@ final class DownloadManager: ObservableObject {
         }
         if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
         if Task.isCancelled { return }
-        if done > 0 { Haptics.success() }
+        if done >= 3 { Haptics.success() }
         active = []
         status = ""
         total = 0
@@ -8821,6 +8831,28 @@ struct ReaderStart: Identifiable {
     let id: Int
 }
 
+/// Плашка загрузки: закреплена внизу экрана, поэтому не двигает список глав при появлении и исчезновении.
+struct DownloadBannerView: View {
+    @ObservedObject var dl: DownloadManager
+    @ObservedObject var progress: DownloadProgress
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+            Text("Загрузка: \(dl.done) из \(dl.total)" + (progress.status.isEmpty ? "" : " · " + progress.status))
+                .font(.caption)
+                .lineLimit(1)
+            Spacer()
+            Button("Стоп") { dl.cancelAll() }
+                .font(.caption.bold())
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+        .padding(.horizontal, 16).padding(.bottom, 8)
+    }
+}
+
 struct NovelDetailView: View {
     @StateObject private var vm: NovelDetailViewModel
     @ObservedObject private var read = ReadStore.shared
@@ -8943,20 +8975,6 @@ struct NovelDetailView: View {
         }
     }
 
-    private var downloadBanner: some View {
-        HStack(spacing: 10) {
-            ProgressView()
-            Text("Загрузка: \(dl.done) из \(dl.total)" + (dl.status.isEmpty ? "" : " · " + dl.status))
-                .font(.caption)
-                .lineLimit(1)
-            Spacer()
-            Button("Стоп") { dl.cancelAll() }
-                .font(.caption.bold())
-        }
-        .padding(12)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
-    }
-
     private var novelPills: [(String, String)] {
         var p: [(String, String)] = []
         if let r = vm.anime.rateAvg { p.append(("star.fill", r)) }
@@ -9056,7 +9074,6 @@ struct NovelDetailView: View {
                         .padding(.leading, 6)
                     }
                 }
-                if dl.total > 0 { downloadBanner }
                 if let n = dl.notice {
                     Text(n).font(.footnote).foregroundStyle(Color.orange)
                 }
@@ -9090,6 +9107,9 @@ struct NovelDetailView: View {
             .padding(16)
         }
         .background(backdrop)
+        .safeAreaInset(edge: .bottom) {
+            if dl.total > 0 { DownloadBannerView(dl: dl, progress: dl.progress) }
+        }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
