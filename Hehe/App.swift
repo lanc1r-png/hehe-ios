@@ -2965,7 +2965,7 @@ struct SettingsView: View {
                 HStack(spacing: 12) {
                     Image(systemName: "exclamationmark.icloud.fill").font(.title3).foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(days == nil ? "Копия ещё не отправлялась" : "Копия не отправлялась \(days!) дн.")
+                        Text(days.map { "Копия не отправлялась \($0) дн." } ?? "Копия ещё не отправлялась")
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
                         Text("Отправь файл в Telegram или Файлы: при переустановке данные не пропадут.")
                             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
@@ -4981,9 +4981,9 @@ enum Kodik {
             for c in s.unicodeScalars {
                 let v = c.value
                 if v >= 65 && v <= 90 {
-                    out.unicodeScalars.append(UnicodeScalar((v - 65 + UInt32(shift)) % 26 + 65)!)
+                    if let u = UnicodeScalar((v - 65 + UInt32(shift)) % 26 + 65) { out.unicodeScalars.append(u) }
                 } else if v >= 97 && v <= 122 {
-                    out.unicodeScalars.append(UnicodeScalar((v - 97 + UInt32(shift)) % 26 + 97)!)
+                    if let u = UnicodeScalar((v - 97 + UInt32(shift)) % 26 + 97) { out.unicodeScalars.append(u) }
                 } else {
                     out.unicodeScalars.append(c)
                 }
@@ -5486,7 +5486,7 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func stop() {
-        savePosition(); stopped = true; detachObserver(); player?.pause(); player = nil
+        savePosition(); stopped = true; detachObserver(); statusObs = nil; player?.pause(); player = nil
         ProgressStore.shared.flush()
     }
 }
@@ -5799,7 +5799,12 @@ enum J {
 
 // MARK: - Keychain (токен входа хранится в защищённом хранилище)
 enum Keychain {
+    /// Значения держим в памяти: токен читается на каждый сетевой запрос, а Keychain — сравнительно медленный вызов.
+    private static let lock = NSLock()
+    private static var cache: [String: String] = [:]
+
     static func set(_ value: String, key: String) {
+        lock.lock(); cache[key] = value; lock.unlock()
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                    kSecAttrAccount as String: key]
         SecItemDelete(base as CFDictionary)
@@ -5809,17 +5814,22 @@ enum Keychain {
     }
 
     static func get(_ key: String) -> String? {
+        lock.lock()
+        if let v = cache[key] { lock.unlock(); return v }
+        lock.unlock()
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrAccount as String: key,
                                 kSecReturnData as String: true,
                                 kSecMatchLimit as String: kSecMatchLimitOne]
         var out: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+              let d = out as? Data, let v = String(data: d, encoding: .utf8) else { return nil }
+        lock.lock(); cache[key] = v; lock.unlock()
+        return v
     }
 
     static func delete(_ key: String) {
+        lock.lock(); cache[key] = nil; lock.unlock()
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrAccount as String: key]
         SecItemDelete(q as CFDictionary)
@@ -6045,10 +6055,10 @@ final class CommentsViewModel: ObservableObject {
         if parent == nil {
             variants.append(("A", body(level: 0, root: NSNull())))
             variants.append(("B", body(level: 0, root: NSNull(), pp: false)))
-        } else {
-            variants.append(("A", body(level: 1, root: parent!)))
+        } else if let pid = parent {
+            variants.append(("A", body(level: 1, root: pid)))
             variants.append(("B", body(level: 1, root: NSNull())))
-            variants.append(("C", body(level: 2, root: parent!)))
+            variants.append(("C", body(level: 2, root: pid)))
         }
         var errors: [String] = []
         for (name, b) in variants {
@@ -6468,7 +6478,7 @@ struct LoginWebView: UIViewRepresentable {
         v.customUserAgent = Kodik.ua
         v.isOpaque = false
         v.backgroundColor = .black
-        v.load(URLRequest(url: URL(string: "https://animelib.org/ru/")!))
+        if let home = URL(string: "https://animelib.org/ru/") { v.load(URLRequest(url: home)) }
         let c = context.coordinator
         c.web = v
         c.onToken = onToken
@@ -6645,7 +6655,7 @@ final class ProfileViewModel: ObservableObject {
             guard score >= 3,
                   let data = try? JSONSerialization.data(withJSONObject: c),
                   let a = try? JSONDecoder().decode(Anime.self, from: data) else { continue }
-            if best == nil || score > best!.0 { best = (score, a) }
+            if score > (best?.0 ?? Int.min) { best = (score, a) }
         }
         return best?.1
     }
@@ -9362,7 +9372,6 @@ actor MangaImageStore {
         let id = key as String
         if let t = inflight[id] { return await t.value.0 }
         let urls = page.urls
-        let px = page.maxPixel
         let t = Task.detached(priority: .userInitiated) { () -> (UIImage?, String) in
             var note = ""
             for round in 0..<2 {
@@ -10393,7 +10402,7 @@ final class AutoScroller {
         func walk(_ v: UIView) {
             if let sv = v as? UIScrollView, !sv.isHidden, sv.alpha > 0.01, sv.bounds.width > 200, sv.bounds.height > 300,
                sv.contentSize.height > sv.bounds.height * 1.05 {
-                if best == nil || sv.contentSize.height > best!.contentSize.height { best = sv }
+                if sv.contentSize.height > (best?.contentSize.height ?? -1) { best = sv }
             }
             for c in v.subviews { walk(c) }
         }
@@ -10447,11 +10456,9 @@ struct MangaReaderView: View {
     @State private var current = 0
     @State private var scrollPage = 0
     @State private var historyTask: Task<Void, Never>?
-    @State private var showBookmarks = false
     @State private var showChapters = false
     @State private var pendingPage: Int?
     @State private var jumpTick = 0
-    @ObservedObject private var bms = BookmarkStore.shared
     @State private var showComments = false
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
@@ -10566,7 +10573,7 @@ struct MangaReaderView: View {
         autoOn = on
         if on {
             scroller.speed = CGFloat(effSpeed)
-            scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && !showChapters && pagesReady() }
+            scroller.canAdvance = { !showSettings && !showComments && !showChapters && pagesReady() }
             scroller.onEnd = {
                 guard reachedEnd else { return false }
                 Task { @MainActor in
@@ -10953,10 +10960,6 @@ struct MangaReaderView: View {
                                     page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count)
             }
         }
-        .sheet(isPresented: $showBookmarks) {
-            BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: false,
-                           onBookmark: { openBookmark($0) }, onHighlight: { _ in })
-        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             persistPos()
@@ -10964,46 +10967,6 @@ struct MangaReaderView: View {
             preloadTask?.cancel()
             historyTask?.cancel()
             scroller.stop()
-        }
-    }
-
-    private var chapterLabel: String {
-        chapter.map { "Том \($0.volume) · \($0.title)" } ?? ""
-    }
-
-    private var pageBookmark: Bookmark? {
-        guard let c = chapter, !pages.isEmpty else { return nil }
-        let p = min(shown, pages.count - 1)
-        return bms.find(titleKey: novel.readKey, chapterID: c.id, from: p, to: p + 1)
-    }
-
-    private func toggleBookmark() {
-        guard let c = chapter, !pages.isEmpty else { return }
-        if let b = pageBookmark {
-            bms.remove(b.id)
-            Haptics.tap()
-            return
-        }
-        let p = min(shown, pages.count - 1)
-        bms.add(Bookmark(titleKey: novel.readKey, chapterID: c.id, chapterLabel: chapterLabel,
-                         position: p, isText: false, snippet: "", note: "", created: Date()))
-        Haptics.success()
-    }
-
-    private func openBookmark(_ b: Bookmark) {
-        guard let ci = chapters.firstIndex(where: { $0.id == b.chapterID }) else { return }
-        if ci == index {
-            let p = min(max(b.position, 0), max(pages.count - 1, 0))
-            if vertical {
-                current = p
-                scrollPage = p
-                jumpTick += 1
-            } else {
-                withAnimation { current = p }
-            }
-        } else {
-            pendingPage = b.position
-            index = ci
         }
     }
 
