@@ -3482,16 +3482,23 @@ struct RatingBadge: View {
 
 struct TodayHero: View {
     let anime: Anime
-    private var verb: String { LibSite.current.isBook ? "Читать" : "Смотреть" }
 
     var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 900)
-                .frame(maxWidth: .infinity)
-                .frame(height: 300)
-                .clipped()
-            LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.88)], startPoint: .center, endPoint: .bottom)
-            HStack(alignment: .bottom, spacing: 12) {
+        ZStack {
+            // размытый фон из той же обложки
+            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 300)
+                .scaleEffect(1.5)
+                .blur(radius: 30)
+                .allowsHitTesting(false)
+            LinearGradient(colors: [.black.opacity(0.25), .black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
+                .allowsHitTesting(false)
+            HStack(spacing: 16) {
+                // обложка целиком, без обрезки
+                RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 600)
+                    .frame(width: 128, height: 192)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.18), lineWidth: 0.6))
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 5) {
                         Image(systemName: "sparkles")
@@ -3500,29 +3507,34 @@ struct TodayHero: View {
                     .font(.caption2.weight(.heavy))
                     .foregroundStyle(LinearGradient(colors: [Color(red: 1, green: 0.85, blue: 0.5), Color(red: 1, green: 0.62, blue: 0.75)], startPoint: .leading, endPoint: .trailing))
                     Text(anime.displayTitle)
-                        .font(.title2.weight(.bold))
+                        .font(.title3.weight(.bold))
                         .foregroundStyle(.white)
-                        .lineLimit(2)
+                        .lineLimit(4)
+                        .minimumScaleFactor(0.8)
                         .multilineTextAlignment(.leading)
-                        .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
                     HStack(spacing: 8) {
                         if let r = anime.rateAvg { RatingBadge(text: r) }
                         if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
                     }
                     .font(.footnote.weight(.semibold))
-                }
-                Spacer(minLength: 0)
-                Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
-                    .font(.title3.weight(.bold))
+                    Spacer(minLength: 0)
+                    HStack(spacing: 8) {
+                        Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
+                        Text(LibSite.current.isBook ? "Читать" : "Смотреть")
+                    }
+                    .font(.subheadline.weight(.bold))
                     .foregroundStyle(.white)
-                    .frame(width: 54, height: 54)
-                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
-                    .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 0.8))
-                    .shadow(color: Theme.accent.opacity(0.55), radius: 12, y: 5)
+                    .padding(.horizontal, 18).padding(.vertical, 9)
+                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
+                    .shadow(color: Theme.accent.opacity(0.5), radius: 8, y: 3)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 192)
             }
-            .padding(16)
+            .padding(14)
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 220)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
