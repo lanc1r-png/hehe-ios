@@ -3176,18 +3176,31 @@ final class HomeViewModel: ObservableObject {
         if !force && !fresh.isEmpty { return }
         isLoading = true
         defer { isLoading = false }
-        async let a = fetch(.lastEpisode)
-        async let b = fetch(.views)
-        async let c = fetch(.newest)
-        async let d = fetch(.rating)
-        let (ra, rb, rc, rd) = await (a, b, c, d)
         func uniq(_ l: [Anime]) -> [Anime] { var seen = Set<Int>(); return l.filter { seen.insert($0.id).inserted } }
-        if let r = ra { fresh = uniq(r.items) }
-        if let r = rb { popular = uniq(r.items); popularPage = 1; popularHasNext = r.hasNext }
-        if let r = rc { newest = uniq(r.items) }
-        if let r = rd { top = uniq(r.items) }
-        ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.posterURL }, maxPixel: 720)
-        error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
+        // Каждая лента показывается, как только пришла: «Лучшее по рейтингу» перебирает много страниц
+        // и раньше задерживало весь экран.
+        enum Part { case fresh, popular, newest, top }
+        var gotAny = false
+        await withTaskGroup(of: (Part, (items: [Anime], hasNext: Bool)?).self) { group in
+            group.addTask { (.fresh, await self.fetch(.lastEpisode)) }
+            group.addTask { (.popular, await self.fetch(.views)) }
+            group.addTask { (.newest, await self.fetch(.newest)) }
+            group.addTask { (.top, await self.fetch(.rating)) }
+            for await (part, res) in group {
+                guard let r = res else { continue }
+                gotAny = true
+                let list = uniq(r.items)
+                switch part {
+                case .fresh: fresh = list
+                case .popular: popular = list; popularPage = 1; popularHasNext = r.hasNext
+                case .newest: newest = list
+                case .top: top = list
+                }
+                // Обложки тех же размеров, что берут карточки, иначе подгрузка уходит впустую.
+                ImageLoader.prefetch(list.prefix(14).compactMap { $0.posterURL }, maxPixel: 720)
+            }
+        }
+        error = gotAny ? nil : "Не удалось загрузить данные. Проверьте соединение."
     }
 
     func morePopular() async {
