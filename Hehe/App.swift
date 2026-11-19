@@ -1441,7 +1441,15 @@ struct RemoteImage: View {
     private func load() async {
         guard let url else { failed = true; return }
         if url.isFileURL {
-            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            // Скачанная обложка: читаем и уменьшаем в фоне, а не целиком на главном потоке.
+            let key = ImageCache.key(url, maxPixel)
+            if let cached = ImageCache.shared.object(forKey: key) { image = cached; return }
+            let px = maxPixel
+            let img = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard let d = try? Data(contentsOf: url) else { return nil }
+                return ImageLoader.downsample(d, maxPixel: px)
+            }.value
+            if let img { ImageCache.store(img, key); image = img } else { failed = true }
             return
         }
         let key = ImageCache.key(url, maxPixel)
@@ -8208,7 +8216,13 @@ struct FitImage: View {
 
     private func load() async {
         if url.isFileURL {
-            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            let key = ImageCache.key(url, 1600)
+            if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+            let img = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard let d = try? Data(contentsOf: url) else { return nil }
+                return ImageLoader.downsample(d, maxPixel: 1600)
+            }.value
+            if let img { ImageCache.store(img, key); image = img } else { failed = true }
             return
         }
         let key = ImageCache.key(url, 1600)
@@ -9383,7 +9397,7 @@ struct MangaPageView: View {
     @State private var bg: Color?
 
     /// Белое или чёрное поле по краям самой страницы.
-    static func edgeColor(_ img: UIImage) -> Color? {
+    nonisolated static func edgeColor(_ img: UIImage) -> Color? {
         guard let cg = img.cgImage else { return nil }
         let n = 24
         var px = [UInt8](repeating: 0, count: n * n * 4)
@@ -9493,8 +9507,9 @@ struct MangaPageView: View {
 
     private func load() async {
         if let img = await MangaImageStore.shared.image(for: page) {
-            bg = MangaPageView.edgeColor(img)
             withAnimation(.easeOut(duration: 0.15)) { image = img }
+            // Цвет полей считается в фоне: для длинной страницы это заметная работа.
+            bg = await Task.detached(priority: .utility) { MangaPageView.edgeColor(img) }.value
             return
         }
         if Task.isCancelled { return }
