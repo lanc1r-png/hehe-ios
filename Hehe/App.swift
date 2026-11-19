@@ -5882,36 +5882,23 @@ final class CommentsViewModel: ObservableObject {
         let paragraphs: [[String: Any]] = text.components(separatedBy: "\n").map { line in
             line.isEmpty ? ["type": "paragraph"] : ["type": "paragraph", "content": [["type": "text", "text": line]]]
         }
-        func docBody(attrs: Bool, marks: Bool) -> [String: Any] {
-            let ps: [[String: Any]] = text.components(separatedBy: "\n").map { line in
-                var p: [String: Any] = ["type": "paragraph"]
-                if attrs { p["attrs"] = ["textAlign": "left"] }
-                if !line.isEmpty {
-                    var tn: [String: Any] = ["type": "text", "text": line]
-                    if marks { tn["marks"] = [] }
-                    p["content"] = [tn]
-                }
-                return p
-            }
-            return ["type": "doc", "content": ps]
+        // формат точно как у сайта (по журналу запросов): документ, attachments, root_id, уровень 0
+        let doc: [String: Any] = ["type": "doc", "content": paragraphs]
+        func body(level: Int, root: Any, pp: Bool = true) -> [String: Any] {
+            var b: [String: Any] = ["comment": doc, "attachments": [Any](), "post_type": type, "post_id": animeID,
+                                    "parent_comment": parent ?? NSNull(), "root_id": root, "comment_level": level]
+            if pp, let page = postPage { b["post_page"] = page }
+            return b
         }
-        // сайт отвечает 500 на «обычный» документ — пробуем разные его варианты
-        let level = parent == nil ? 1 : 2
         var variants: [(String, [String: Any])] = []
-        func add(_ name: String, _ body: Any, level lv: Int? = level, page: Bool = true, nullParent: Bool = false) {
-            var b: [String: Any] = ["comment": body, "post_id": animeID, "post_type": type]
-            if let lv { b["comment_level"] = lv }
-            if let p = parent { b["parent_comment"] = p } else if nullParent { b["parent_comment"] = NSNull() }
-            if page { if let pp = postPage { b["post_page"] = pp } }
-            variants.append((name, b))
+        if parent == nil {
+            variants.append(("A", body(level: 0, root: NSNull())))
+            variants.append(("B", body(level: 0, root: NSNull(), pp: false)))
+        } else {
+            variants.append(("A", body(level: 1, root: parent!)))
+            variants.append(("B", body(level: 1, root: NSNull())))
+            variants.append(("C", body(level: 2, root: parent!)))
         }
-        add("A", docBody(attrs: true, marks: false))
-        add("B", docBody(attrs: true, marks: true))
-        add("C", docBody(attrs: false, marks: true))
-        add("D", docBody(attrs: true, marks: true), level: nil)
-        add("E", docBody(attrs: true, marks: true), nullParent: true)
-        add("F", docBody(attrs: false, marks: false), level: nil)
-        add("G", docBody(attrs: false, marks: false), level: 0)
         var errors: [String] = []
         for (name, b) in variants {
             do {
