@@ -5882,21 +5882,36 @@ final class CommentsViewModel: ObservableObject {
         let paragraphs: [[String: Any]] = text.components(separatedBy: "\n").map { line in
             line.isEmpty ? ["type": "paragraph"] : ["type": "paragraph", "content": [["type": "text", "text": line]]]
         }
-        let doc: [String: Any] = ["type": "doc", "content": paragraphs]
-        let docString: String = {
-            guard let d = try? JSONSerialization.data(withJSONObject: doc), let t = String(data: d, encoding: .utf8) else { return text }
-            return t
-        }()
-        let bodies: [(String, Any)] = [("doc", doc), ("blocks", paragraphs), ("json", docString), ("text", text)]
-        var variants: [(String, [String: Any])] = []
-        for level in (parent == nil ? [1, 0] : [2, 1]) {
-            for (name, body) in bodies {
-                var b: [String: Any] = ["comment": body, "comment_level": level, "post_id": animeID, "post_type": type]
-                if let p = parent { b["parent_comment"] = p }
-                if let pp = postPage { b["post_page"] = pp }
-                variants.append(("\(name)/\(level)", b))
+        func docBody(attrs: Bool, marks: Bool) -> [String: Any] {
+            let ps: [[String: Any]] = text.components(separatedBy: "\n").map { line in
+                var p: [String: Any] = ["type": "paragraph"]
+                if attrs { p["attrs"] = ["textAlign": "left"] }
+                if !line.isEmpty {
+                    var tn: [String: Any] = ["type": "text", "text": line]
+                    if marks { tn["marks"] = [] }
+                    p["content"] = [tn]
+                }
+                return p
             }
+            return ["type": "doc", "content": ps]
         }
+        // сайт отвечает 500 на «обычный» документ — пробуем разные его варианты
+        let level = parent == nil ? 1 : 2
+        var variants: [(String, [String: Any])] = []
+        func add(_ name: String, _ body: Any, level lv: Int? = level, page: Bool = true, nullParent: Bool = false) {
+            var b: [String: Any] = ["comment": body, "post_id": animeID, "post_type": type]
+            if let lv { b["comment_level"] = lv }
+            if let p = parent { b["parent_comment"] = p } else if nullParent { b["parent_comment"] = NSNull() }
+            if page { if let pp = postPage { b["post_page"] = pp } }
+            variants.append((name, b))
+        }
+        add("A", docBody(attrs: true, marks: false))
+        add("B", docBody(attrs: true, marks: true))
+        add("C", docBody(attrs: false, marks: true))
+        add("D", docBody(attrs: true, marks: true), level: nil)
+        add("E", docBody(attrs: true, marks: true), nullParent: true)
+        add("F", docBody(attrs: false, marks: false), level: nil)
+        add("G", docBody(attrs: false, marks: false), level: 0)
         var errors: [String] = []
         for (name, b) in variants {
             do {
