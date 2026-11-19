@@ -617,7 +617,19 @@ enum APIError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .badURL: return "Некорректный адрес запроса"
-        case .http(let c, let body): return "Сервер вернул ошибку \(c): \(body)"
+        case .http(let c, let body):
+            // ответ сайта — JSON с \u-кодами: достаём из него читаемые сообщения
+            if let d = body.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) {
+                var msgs: [String] = []
+                func walk(_ v: Any) {
+                    if let s = v as? String { msgs.append(s) }
+                    else if let a = v as? [Any] { a.forEach(walk) }
+                    else if let o = v as? [String: Any] { o.keys.sorted().forEach { walk(o[$0]!) } }
+                }
+                walk(obj)
+                if !msgs.isEmpty { return "Ошибка \(c): " + msgs.joined(separator: "; ") }
+            }
+            return "Сервер вернул ошибку \(c): \(body.prefix(200))"
         case .noVideo: return "Для этой серии нет доступного видео"
         }
     }
@@ -709,7 +721,7 @@ actor AnimelibAPI {
             (data, resp) = try await session.data(for: req)
         }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            let body = String(data: data.prefix(300), encoding: .utf8) ?? ""
+            let body = String(data: data.prefix(1500), encoding: .utf8) ?? ""
             throw APIError.http(http.statusCode, body)
         }
         return try decoder.decode(T.self, from: data)
@@ -987,7 +999,7 @@ actor AnimelibAPI {
             (data, resp) = try await session.data(for: req)
         }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw APIError.http(http.statusCode, String(data: data.prefix(300), encoding: .utf8) ?? "")
+            throw APIError.http(http.statusCode, String(data: data.prefix(1500), encoding: .utf8) ?? "")
         }
         return data
     }
@@ -3443,6 +3455,148 @@ struct ContinueCard: View {
     }
 }
 
+struct TodayHero: View {
+    let anime: Anime
+    private var verb: String { LibSite.current.isBook ? "Читать" : "Смотреть" }
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 900)
+                .frame(maxWidth: .infinity)
+                .frame(height: 420)
+                .clipped()
+            LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.88)], startPoint: .center, endPoint: .bottom)
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Выбор дня", systemImage: "sparkles")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Color.black.opacity(0.35), in: Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.5))
+                Text(anime.displayTitle)
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                HStack(spacing: 8) {
+                    if let r = anime.rateAvg { Label(r, systemImage: "star.fill").foregroundStyle(.yellow) }
+                    if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
+                }
+                .font(.subheadline.weight(.semibold))
+                HStack(spacing: 8) {
+                    Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
+                    Text(verb)
+                }
+                .font(.headline)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 26).padding(.vertical, 13)
+                .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
+                .shadow(color: Theme.accent.opacity(0.5), radius: 12, y: 5)
+            }
+            .padding(20)
+        }
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 32, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
+        .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
+        .padding(.horizontal, 14)
+    }
+}
+
+/// Последний тайтл крупно: прогресс и кнопка «Продолжить».
+struct ContinueHero: View {
+    let item: HistoryItem
+    @ObservedObject private var progress = ProgressStore.shared
+
+    var body: some View {
+        let book = LibSite.current.isBook
+        let p = book ? nil : progress.get(item.episodeID)
+        let rp = book ? ReadPosStore.shared.get(item.anime.readKey) : nil
+        let frac: Double? = {
+            if let p, p.duration > 0, p.position > 5 { return min(p.position / p.duration, 1) }
+            if let rp, rp.c == item.episodeID, rp.pct > 0 { return Double(rp.pct) / 100 }
+            return nil
+        }()
+        HStack(spacing: 14) {
+            RemoteImage(url: item.anime.posterURL ?? item.anime.imageURL, maxPixel: 480)
+                .frame(width: 96, height: 144)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(item.anime.displayTitle)
+                    .font(.headline)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Text(item.episodeTitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let frac {
+                    ProgressView(value: frac).tint(Theme.accent)
+                    Text("\(Int(frac * 100))%").font(.caption2.weight(.semibold)).foregroundStyle(Theme.accent)
+                }
+                Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    Image(systemName: book ? "book.fill" : "play.fill")
+                    Text("Продолжить")
+                }
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 18).padding(.vertical, 9)
+                .background(Theme.accent, in: Capsule())
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 176)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .background {
+            CoverTintLayer(url: item.anime.imageURL, strength: 0.45, horizontal: true)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        }
+        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 0.5))
+    }
+}
+
+/// Широкая карточка: обложка слева, данные справа.
+struct WideCard: View {
+    let anime: Anime
+    var body: some View {
+        HStack(spacing: 12) {
+            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 420)
+                .frame(width: 92, height: 138)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(anime.displayTitle)
+                    .font(.subheadline.weight(.bold))
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                if let t = anime.type?.title {
+                    Text(t).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if let r = anime.rateAvg {
+                    Label(r, systemImage: "star.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(.yellow)
+                        .padding(.horizontal, 9).padding(.vertical, 4)
+                        .background(Theme.chip, in: Capsule())
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(width: 290, height: 162)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background {
+            CoverTintLayer(url: anime.imageURL, strength: 0.35, horizontal: true)
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        }
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
+    }
+}
+
 struct HomeView: View {
     @StateObject private var vm = HomeViewModel()
     @ObservedObject private var history: HistoryStore = HistoryStore.current
@@ -3450,6 +3604,29 @@ struct HomeView: View {
     @State private var query = ""
     @State private var confirmClear = false
     private let ranobe = LibSite.current.isBook
+
+    /// «Выбор дня»: из лучших и популярных, один и тот же в течение суток.
+    private var todayPick: Anime? {
+        var seen = Set<Int>()
+        let pool = (vm.top.prefix(12) + vm.popular.prefix(10)).filter { seen.insert($0.id).inserted }
+        guard !pool.isEmpty else { return nil }
+        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
+        return pool[day % pool.count]
+    }
+
+    private func wideRail(_ list: [Anime]) -> some View {
+        var seen = Set<Int>()
+        let unique = list.filter { seen.insert($0.id).inserted }
+        return ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 12) {
+                ForEach(unique) { a in
+                    TitleLink(anime: a) { WideCard(anime: a) }
+                        .buttonStyle(.pressable)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+    }
 
     private func poster(_ list: [Anime]) -> some View {
         // повторяющиеся id ломают ленивую ленту: карточки перестают нажиматься и листаться
@@ -3481,13 +3658,27 @@ struct HomeView: View {
                             .padding(.top, 40)
                         }
 
-                        if !history.items.isEmpty {
+                        if let pick = todayPick {
+                            TitleLink(anime: pick) { TodayHero(anime: pick) }
+                                .buttonStyle(.pressable)
+                        }
+
+                        if let first = history.items.first {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
                                               action: { confirmClear = true }, actionTitle: "Очистить")
+                                TitleLink(anime: first.anime) { ContinueHero(item: first) }
+                                    .buttonStyle(.pressable)
+                                    .padding(.horizontal, 14)
+                                    .contextMenu {
+                                        Button(role: .destructive) { history.remove(first.anime.id) } label: {
+                                            Label("Убрать из списка", systemImage: "trash")
+                                        }
+                                    }
+                                if history.items.count > 1 {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 12) {
-                                        ForEach(history.items) { h in
+                                        ForEach(Array(history.items.dropFirst())) { h in
                                             ZStack(alignment: .topTrailing) {
                                                 TitleLink(anime: h.anime) { ContinueCard(item: h) }
                                                     .buttonStyle(.pressable)
@@ -3518,6 +3709,7 @@ struct HomeView: View {
                                         withAnimation { history.clear() }
                                     }
                                     Button("Отмена", role: .cancel) {}
+                                }
                                 }
                             }
                         }
@@ -3562,14 +3754,20 @@ struct HomeView: View {
                         if !vm.newest.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
-                                poster(vm.newest)
+                                wideRail(vm.newest)
                             }
                         }
 
                         if !vm.top.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: "Лучшее по рейтингу") { router.openCatalog(sort: .rating) }
-                                poster(vm.top)
+                                VStack(spacing: 0) {
+                                    ForEach(Array(vm.top.prefix(6).enumerated()), id: \.element.id) { i, a in
+                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true) }
+                                            .buttonStyle(.pressable)
+                                    }
+                                }
+                                .padding(.horizontal, 14)
                             }
                         }
 
@@ -3581,7 +3779,16 @@ struct HomeView: View {
                 .scrollDismissesKeyboard(.immediately)
                 .refreshable { await vm.load(force: true) }
             }
-            .background(AppBackground())
+            .background {
+                ZStack(alignment: .top) {
+                    AppBackground()
+                    if let pick = todayPick {
+                        CoverTintLayer(url: pick.posterURL ?? pick.imageURL, strength: 0.5)
+                            .frame(height: 560)
+                            .ignoresSafeArea()
+                    }
+                }
+            }
             .navigationTitle(LibSite.current.title)
             .navigationBarTitleDisplayMode(.large)
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск по названию")
@@ -5647,14 +5854,22 @@ final class CommentsViewModel: ObservableObject {
     /// Возвращает текст ошибки или nil при успехе.
     func send(_ text: String, parent: Int?) async -> String? {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
-        var base: [String: Any] = ["comment": text, "post_id": animeID, "post_type": type]
-        if let p = parent { base["parent_comment"] = p }
-        if let pp = postPage { base["post_page"] = pp }
-        var alt = base
-        alt["is_spoiler"] = false
-        alt["attachments"] = [Any]()
+        // сайт ждёт текст как документ (абзацы) и уровень вложенности
+        let paragraphs: [[String: Any]] = text.components(separatedBy: "\n").map { line in
+            line.isEmpty ? ["type": "paragraph"] : ["type": "paragraph", "content": [["type": "text", "text": line]]]
+        }
+        let doc: [String: Any] = ["type": "doc", "content": paragraphs]
+        var variants: [[String: Any]] = []
+        for level in (parent == nil ? [1, 0] : [2, 1]) {
+            for body in [doc as Any, text as Any] {
+                var b: [String: Any] = ["comment": body, "comment_level": level, "post_id": animeID, "post_type": type]
+                if let p = parent { b["parent_comment"] = p }
+                if let pp = postPage { b["post_page"] = pp }
+                variants.append(b)
+            }
+        }
         var last = ""
-        for b in [base, alt] {
+        for b in variants {
             do {
                 _ = try await AnimelibAPI.shared.rawData("/comments", token: t, method: "POST", json: b)
                 return nil
