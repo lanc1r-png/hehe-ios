@@ -11726,6 +11726,13 @@ struct NovelReaderSettings: View {
     }
 }
 
+/// Номер видимого абзаца в ленте ранобэ (ссылочный тип, чтобы не вызывать перерисовку).
+final class BlockTracker {
+    var value = -1
+    var pending: DispatchWorkItem?
+    func reset() { pending?.cancel(); pending = nil; value = -1 }
+}
+
 struct NovelReaderView: View {
     let novel: Anime
     let chapters: [NovelChapter]
@@ -11755,7 +11762,9 @@ struct NovelReaderView: View {
     @State private var lastLongPress = Date.distantPast
     @State private var pendingOffset: Int?
     @State private var restoreBlock: Int?
-    @State private var visibleBlock = -1
+    /// Видимый абзац хранится вне состояния экрана: его смена не пересчитывает всю читалку.
+    @State private var blockTracker = BlockTracker()
+    private var visibleBlock: Int { blockTracker.value }
     @State private var hlRev = 0
     @ObservedObject private var bms = BookmarkStore.shared
     @ObservedObject private var hls = HighlightStore.shared
@@ -11843,6 +11852,16 @@ struct NovelReaderView: View {
     }
 
     private var chapterID: Int { chapters.indices.contains(index) ? chapters[index].id : 0 }
+
+    /// Абзац показался на экране: запоминаем его и сохраняем позицию с небольшой паузой.
+    private func blockSeen(_ id: Int) {
+        guard blockTracker.value != id else { return }
+        blockTracker.value = id
+        blockTracker.pending?.cancel()
+        let work = DispatchWorkItem { persistPos() }
+        blockTracker.pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
 
     /// Запоминает место в главе: страницы (смещение в тексте) или прокрутка (номер блока).
     private func persistPos() {
@@ -12093,7 +12112,7 @@ struct NovelReaderView: View {
                                 .opacity(0.55)
                         }
                         if loading { ProgressView().frame(maxWidth: .infinity).padding(.top, 40) }
-                        ForEach(blocks) { b in blockView(b).id(b.id).onAppear { visibleBlock = b.id } }
+                        ForEach(blocks) { b in blockView(b).id(b.id).onAppear { blockSeen(b.id) } }
                         if let e = error {
                             Text(e).font(.footnote).foregroundStyle(.orange)
                         }
@@ -12173,7 +12192,6 @@ struct NovelReaderView: View {
             }
             .toolbar(chromeHidden ? .hidden : .visible, for: .navigationBar)
             .onChange(of: pageIndex) { _ in persistPos() }
-            .onChange(of: visibleBlock) { _ in persistPos() }
             .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
@@ -12275,7 +12293,7 @@ struct NovelReaderView: View {
         blocks = []
         pages = []
         pageIndex = 0
-        visibleBlock = -1
+        blockTracker.reset()
         if pendingOffset == nil, restoreBlock == nil, let pos = ReadPosStore.shared.get(novel.readKey), pos.c == ch.id {
             if mode == "pages" { if pos.p > 0 { pendingOffset = pos.p } }
             else if pos.b > 0 { restoreBlock = pos.b }
