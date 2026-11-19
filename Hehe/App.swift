@@ -3168,10 +3168,11 @@ final class HomeViewModel: ObservableObject {
         async let c = fetch(.newest)
         async let d = fetch(.rating)
         let (ra, rb, rc, rd) = await (a, b, c, d)
-        if let r = ra { fresh = r.items }
-        if let r = rb { popular = r.items; popularPage = 1; popularHasNext = r.hasNext }
-        if let r = rc { newest = r.items }
-        if let r = rd { top = r.items }
+        func uniq(_ l: [Anime]) -> [Anime] { var seen = Set<Int>(); return l.filter { seen.insert($0.id).inserted } }
+        if let r = ra { fresh = uniq(r.items) }
+        if let r = rb { popular = uniq(r.items); popularPage = 1; popularHasNext = r.hasNext }
+        if let r = rc { newest = uniq(r.items) }
+        if let r = rd { top = uniq(r.items) }
         ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.posterURL }, maxPixel: 720)
         error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
     }
@@ -3451,9 +3452,12 @@ struct HomeView: View {
     private let ranobe = LibSite.current.isBook
 
     private func poster(_ list: [Anime]) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        // повторяющиеся id ломают ленивую ленту: карточки перестают нажиматься и листаться
+        var seen = Set<Int>()
+        let unique = list.filter { seen.insert($0.id).inserted }
+        return ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
-                ForEach(list) { a in
+                ForEach(unique) { a in
                     TitleLink(anime: a) { PosterCard(anime: a, width: 154) }
                         .buttonStyle(.pressable)
                 }
