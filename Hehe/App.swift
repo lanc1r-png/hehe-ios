@@ -8473,7 +8473,8 @@ final class DownloadManager: ObservableObject {
             if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
         }
         // Несколько глав качаются одновременно: на мобильной сети две, на Wi‑Fi три.
-        let lanes = expensive ? 2 : 3
+        // Манга: главы по одной, иначе сервер картинок рвёт десятки одновременных соединений и всё встаёт.
+        let lanes = (jobs.first?.store === OfflineStore.manga) ? 1 : (expensive ? 2 : 3)
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<lanes { group.addTask { await self.lane() } }
         }
@@ -8611,8 +8612,15 @@ final class DownloadManager: ObservableObject {
         var bytes = 0
         var failedPages = 0
         let targets: [([URL], URL)] = pages.map { ($0.urls, store.mangaPageFile(nid, c.id, $0.id)) }
-        let sizes = await DownloadManager.pool(targets, width: 8) { t in
-            await DownloadManager.fetchMangaPage(t.0, to: t.1)
+        let titleText = c.title
+        let totalPages = targets.count
+        let counter = PageCounter()
+        status = "\(titleText) · 0/\(totalPages)"
+        let sizes = await DownloadManager.pool(targets, width: expensive ? 4 : 6) { t in
+            let n = await DownloadManager.fetchMangaPage(t.0, to: t.1)
+            let k = await counter.bump()
+            await MainActor.run { DownloadManager.shared.status = "\(titleText) · \(k)/\(totalPages)" }
+            return n
         }
         if Task.isCancelled { throw CancellationError() }
         for n in sizes { if n == 0 { failedPages += 1 } else { bytes += n } }
@@ -8626,13 +8634,18 @@ final class DownloadManager: ObservableObject {
         store.record(novel: job.novel, chapters: job.chapters, chapter: c, raw: raw, extraBytes: bytes)
     }
 
+    actor PageCounter {
+        private var n = 0
+        func bump() -> Int { n += 1; return n }
+    }
+
     nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL) async -> Int {
         if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 { return size }
         let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         for round in 0..<2 {
             for u in urls {
                 var req = URLRequest(url: u)
-                req.timeoutInterval = 30
+                req.timeoutInterval = 20
                 req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
                 req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 req.setValue(agent, forHTTPHeaderField: "User-Agent")
