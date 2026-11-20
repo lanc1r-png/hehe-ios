@@ -4896,6 +4896,18 @@ final class ProgressStore: ObservableObject {
            let v = try? JSONDecoder().decode([String: WatchProgress].self, from: d) {
             items = v
         }
+        prune()
+    }
+
+    /// Убирает брошенный прогресс: недосмотренные серии, которые не открывались больше года.
+    /// Досмотренные остаются — по ним рисуются галочки «Просмотрено» и считается статистика.
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-365 * 24 * 3600)
+        let before = items.count
+        items = items.filter { $0.value.finished || $0.value.updated > cutoff }
+        if items.count != before, let d = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(d, forKey: key)
+        }
     }
 
     func clear() {
