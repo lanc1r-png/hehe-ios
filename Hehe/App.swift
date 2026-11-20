@@ -6144,6 +6144,8 @@ final class CommentsViewModel: ObservableObject {
                 return nil
             } catch {
                 errors.append("\(name): \(error.localizedDescription)")
+                // Ошибка сервера (5xx): комментарий мог уже создаться — не шлём другой вариант, чтобы не было дубля.
+                if case APIError.http(let code, _) = error, code >= 500 { break }
             }
         }
         return errors.joined(separator: "\n")
@@ -6152,8 +6154,8 @@ final class CommentsViewModel: ObservableObject {
     func like(_ id: Int) async -> String? {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
         let attempts: [(String, [String: Any])] = [
+            ("/comments/\(id)/vote", ["vote": 1]),      // формат сайта (по журналу запросов)
             ("/comments/\(id)/vote", ["type": "up"]),
-            ("/comments/\(id)/vote", ["vote": 1]),
             ("/comments/\(id)/like", [:])
         ]
         var last = ""
