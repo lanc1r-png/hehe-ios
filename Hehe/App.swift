@@ -3556,6 +3556,11 @@ struct RatingBadge: View {
 
 /// Размытая обложка для фона. Размытие делается один раз в фоне по маленькой картинке и кэшируется,
 /// а не пересчитывается видеочипом в каждом кадре прокрутки (как `.blur`). На вид то же, заряда тратит меньше.
+/// Общий контекст Core Image для размытия обложек (вне View, чтобы использовать из фоновых задач).
+enum BlurContext {
+    static let ci = CIContext(options: [.cacheIntermediates: false])
+}
+
 struct BlurredCover: View {
     let url: URL?
     /// Радиус в точках экрана, как у `.blur(radius:)`
@@ -3563,7 +3568,6 @@ struct BlurredCover: View {
     var scale: CGFloat = 1
     @State private var image: UIImage?
 
-    private static let ci = CIContext(options: [.cacheIntermediates: false])
     private static let source: CGFloat = 160
 
     var body: some View {
@@ -3600,7 +3604,7 @@ struct BlurredCover: View {
         f.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
         f.setValue(max(r, 1), forKey: kCIInputRadiusKey)
         guard let o = f.outputImage?.cropped(to: input.extent),
-              let res = ci.createCGImage(o, from: input.extent) else { return nil }
+              let res = BlurContext.ci.createCGImage(o, from: input.extent) else { return nil }
         return UIImage(cgImage: res)
     }
 }
