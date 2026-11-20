@@ -10433,6 +10433,8 @@ final class AutoScroller {
         blockedSince = 0
         pos = scrollView?.contentOffset.y ?? 0
         let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        // 60 кадров достаточно для плавного движения; 120 только тратят заряд. Скорость считается по времени, не по кадрам.
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         l.add(to: .main, forMode: .common)
         link = l
     }
