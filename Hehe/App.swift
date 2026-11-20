@@ -5267,6 +5267,9 @@ final class PlayerViewModel: ObservableObject {
     var fsPlayer: AVPlayer?
     /// Наблюдатель прерываний звука (звонок, будильник): после них видео продолжается само, если iOS это разрешает.
     private var interruptObs: NSObjectProtocol?
+    private var rateObs: NSObjectProtocol?
+    /// Видео поставила на паузу сама система из-за прерывания (а не ты): только тогда продолжаем.
+    private var pausedByInterruption = false
     private var lastWebStream: URL?
     private var attempts: [(URL, [String: String])] = []
     private var attemptIndex = 0
@@ -5514,8 +5517,20 @@ final class PlayerViewModel: ObservableObject {
                       let o = info[AVAudioSessionInterruptionOptionKey] as? UInt,
                       AVAudioSession.InterruptionOptions(rawValue: o).contains(.shouldResume) else { return }
                 Task { @MainActor [weak self] in
-                    guard let self, !self.stopped else { return }
+                    guard let self, !self.stopped, self.pausedByInterruption else { return }
+                    self.pausedByInterruption = false
                     (self.fsPlayer ?? self.player)?.play()
+                }
+            }
+            rateObs = NotificationCenter.default.addObserver(
+                forName: AVPlayer.rateDidChangeNotification, object: nil, queue: .main) { [weak self] n in
+                let reason = n.userInfo?[AVPlayer.rateDidChangeReasonKey] as? AVPlayer.RateDidChangeReason
+                let rate = (n.object as? AVPlayer)?.rate ?? 0
+                let obj = n.object as AnyObject?
+                Task { @MainActor [weak self] in
+                    guard let self, obj === self.player || obj === self.fsPlayer else { return }
+                    if reason == .audioSessionInterrupted, rate == 0 { self.pausedByInterruption = true }
+                    else if rate > 0 { self.pausedByInterruption = false }
                 }
             }
         }
@@ -5581,6 +5596,8 @@ final class PlayerViewModel: ObservableObject {
     func stop() {
         savePosition(); stopped = true; detachObserver(); statusObs = nil; player?.pause(); player = nil
         if let o = interruptObs { NotificationCenter.default.removeObserver(o); interruptObs = nil }
+        if let o = rateObs { NotificationCenter.default.removeObserver(o); rateObs = nil }
+        pausedByInterruption = false
         // Замыкания держат экран серии, а экран держит этот объект: разрываем кольцо, иначе он не освобождается.
         onEnd = nil
         onWatched = nil
