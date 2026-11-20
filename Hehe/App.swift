@@ -7,6 +7,7 @@ import Security
 import Network
 import Combine
 import ImageIO
+import CoreImage
 import UniformTypeIdentifiers
 
 // MARK: - Тема и общие элементы дизайна
@@ -3455,10 +3456,8 @@ struct PopularHero: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            RemoteImage(url: anime.posterURL, maxPixel: 720)
+            BlurredCover(url: anime.posterURL, radius: 28, scale: 1.4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .scaleEffect(1.4)
-                .blur(radius: 28)
                 .overlay(LinearGradient(colors: [.black.opacity(0.30), .black.opacity(0.72)],
                                         startPoint: .top, endPoint: .bottom))
             HStack(alignment: .bottom, spacing: 16) {
@@ -3555,16 +3554,64 @@ struct RatingBadge: View {
     }
 }
 
+/// Размытая обложка для фона. Размытие делается один раз в фоне по маленькой картинке и кэшируется,
+/// а не пересчитывается видеочипом в каждом кадре прокрутки (как `.blur`). На вид то же, заряда тратит меньше.
+struct BlurredCover: View {
+    let url: URL?
+    /// Радиус в точках экрана, как у `.blur(radius:)`
+    var radius: CGFloat
+    var scale: CGFloat = 1
+    @State private var image: UIImage?
+
+    private static let ci = CIContext(options: [.cacheIntermediates: false])
+    private static let source: CGFloat = 160
+
+    var body: some View {
+        Color.clear
+            .overlay {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                        .scaleEffect(scale)
+                        .transition(.opacity)
+                }
+            }
+            .clipped()
+            .allowsHitTesting(false)
+            .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        guard let url else { image = nil; return }
+        let key = "\(url.absoluteString)#blur\(Int(radius))" as NSString
+        if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+        guard let src = await ImageLoader.shared.image(url, referer: LibSite.current.referer, maxPixel: Self.source) else { return }
+        // Радиус в пикселях маленькой картинки: экран ~390 pt по ширине.
+        let r = radius * Self.source / 390
+        let out = await Task.detached(priority: .utility) { BlurredCover.blur(src, r) }.value
+        guard let out else { return }
+        ImageCache.store(out, key)
+        withAnimation(.easeOut(duration: 0.2)) { image = out }
+    }
+
+    nonisolated private static func blur(_ img: UIImage, _ r: CGFloat) -> UIImage? {
+        guard let cg = img.cgImage else { return nil }
+        let input = CIImage(cgImage: cg)
+        guard let f = CIFilter(name: "CIGaussianBlur") else { return nil }
+        f.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+        f.setValue(max(r, 1), forKey: kCIInputRadiusKey)
+        guard let o = f.outputImage?.cropped(to: input.extent),
+              let res = ci.createCGImage(o, from: input.extent) else { return nil }
+        return UIImage(cgImage: res)
+    }
+}
+
 struct TodayHero: View {
     let anime: Anime
 
     var body: some View {
         ZStack {
             // размытый фон из той же обложки
-            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 300)
-                .scaleEffect(1.5)
-                .blur(radius: 30)
-                .allowsHitTesting(false)
+            BlurredCover(url: anime.posterURL ?? anime.imageURL, radius: 30, scale: 1.5)
             LinearGradient(colors: [.black.opacity(0.25), .black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
                 .allowsHitTesting(false)
             HStack(spacing: 16) {
@@ -4687,8 +4734,7 @@ struct DetailView: View {
     private var backdrop: some View {
         ZStack {
             Theme.base
-            RemoteImage(url: vm.anime.imageURL, maxPixel: 96)
-                .blur(radius: 16)
+            BlurredCover(url: vm.anime.imageURL, radius: 16)
                 .opacity(0.55)
             CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
@@ -8957,7 +9003,7 @@ struct NovelDetailView: View {
     private var backdrop: some View {
         ZStack {
             Theme.base
-            RemoteImage(url: vm.anime.imageURL, maxPixel: 96).blur(radius: 16).opacity(0.55)
+            BlurredCover(url: vm.anime.imageURL, radius: 16).opacity(0.55)
             CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
