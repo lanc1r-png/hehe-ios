@@ -3801,6 +3801,9 @@ struct HomeView: View {
     @ObservedObject private var router = AppRouter.shared
     @State private var query = ""
     @State private var confirmClear = false
+    /// «Продолжить»: открываем тайтл и сразу читалку/плеер на нужной главе или серии
+    @State private var continueAnime: Anime?
+    @State private var pushContinue = false
     private let ranobe = LibSite.current.isBook
 
     /// «Выбор дня»: из лучших и популярных, один и тот же в течение суток.
@@ -3824,6 +3827,13 @@ struct HomeView: View {
             }
             .padding(.horizontal, 14)
         }
+    }
+
+    /// Открывает тайтл и сразу читалку (или плеер) на главе/серии, где ты остановился.
+    private func openContinue(_ a: Anime) {
+        Haptics.tap()
+        continueAnime = a
+        pushContinue = true
     }
 
     private func poster(_ list: [Anime], newIDs: Set<Int> = []) -> some View {
@@ -3866,7 +3876,7 @@ struct HomeView: View {
                                 SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
                                               action: { confirmClear = true }, actionTitle: "Очистить")
                                 ZStack(alignment: .topTrailing) {
-                                    TitleLink(anime: first.anime) { ContinueHero(item: first) }
+                                    Button { openContinue(first.anime) } label: { ContinueHero(item: first) }
                                         .buttonStyle(.pressable)
                                     Button {
                                         Haptics.tap()
@@ -3891,7 +3901,7 @@ struct HomeView: View {
                                     LazyHStack(spacing: 12) {
                                         ForEach(Array(history.items.dropFirst())) { h in
                                             ZStack(alignment: .topTrailing) {
-                                                TitleLink(anime: h.anime) { ContinueCard(item: h) }
+                                                Button { openContinue(h.anime) } label: { ContinueCard(item: h) }
                                                     .buttonStyle(.pressable)
                                                 Button {
                                                     Haptics.tap()
@@ -4031,6 +4041,15 @@ struct HomeView: View {
             }
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
+            .navigationDestination(isPresented: $pushContinue) {
+                if let a = continueAnime {
+                    if ranobe {
+                        NovelDetailView(novel: Novel(a), autoContinue: true)
+                    } else {
+                        DetailView(anime: a, autoContinue: true)
+                    }
+                }
+            }
             .task { await vm.load() }
         }
     }
