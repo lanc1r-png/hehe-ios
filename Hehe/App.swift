@@ -5265,6 +5265,8 @@ final class PlayerViewModel: ObservableObject {
     @Published var playbackError: String?
     @Published var showNative = false
     var fsPlayer: AVPlayer?
+    /// Наблюдатель прерываний звука (звонок, будильник): после них видео продолжается само, если iOS это разрешает.
+    private var interruptObs: NSObjectProtocol?
     private var lastWebStream: URL?
     private var attempts: [(URL, [String: String])] = []
     private var attemptIndex = 0
@@ -5503,6 +5505,20 @@ final class PlayerViewModel: ObservableObject {
 
     private func startAV(_ url: URL, headers: [String: String]) {
         guard !stopped else { return }
+        if interruptObs == nil {
+            interruptObs = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+                guard let info = n.userInfo,
+                      let t = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: t) == .ended,
+                      let o = info[AVAudioSessionInterruptionOptionKey] as? UInt,
+                      AVAudioSession.InterruptionOptions(rawValue: o).contains(.shouldResume) else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, !self.stopped else { return }
+                    (self.fsPlayer ?? self.player)?.play()
+                }
+            }
+        }
         savePosition()
         if let t = player?.currentTime(), t.isValid, t.seconds > 1 { lastPosition = t.seconds }
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
@@ -5564,6 +5580,10 @@ final class PlayerViewModel: ObservableObject {
 
     func stop() {
         savePosition(); stopped = true; detachObserver(); statusObs = nil; player?.pause(); player = nil
+        if let o = interruptObs { NotificationCenter.default.removeObserver(o); interruptObs = nil }
+        // Замыкания держат экран серии, а экран держит этот объект: разрываем кольцо, иначе он не освобождается.
+        onEnd = nil
+        onWatched = nil
         ProgressStore.shared.flush()
     }
 }
