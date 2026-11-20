@@ -7,6 +7,7 @@ import Security
 import Network
 import Combine
 import ImageIO
+import CoreImage
 import UniformTypeIdentifiers
 
 // MARK: - Тема и общие элементы дизайна
@@ -696,9 +697,10 @@ actor AnimelibAPI {
         session = URLSession(configuration: cfg)
     }
 
-    nonisolated var siteHeaders: [String: String] {
-        let site = LibSite.current
-        return ["Referer": site.referer, "Origin": site.origin, "Site-Id": site.id]
+    nonisolated var siteHeaders: [String: String] { headers(for: LibSite.current) }
+
+    nonisolated func headers(for site: LibSite) -> [String: String] {
+        ["Referer": site.referer, "Origin": site.origin, "Site-Id": site.id]
     }
 
     nonisolated var playbackHeaders: [String: String] {
@@ -977,13 +979,14 @@ actor AnimelibAPI {
         return list.filter { $0.id != nil && !$0.title.isEmpty }
     }
 
+    /// `site` — для фоновых задач (загрузки): запрос идёт к сайту задачи, даже если ты переключил вкладку.
     func rawData(_ path: String, query: [URLQueryItem] = [], token: String? = nil,
-                 method: String = "GET", json: [String: Any]? = nil) async throws -> Data {
+                 method: String = "GET", json: [String: Any]? = nil, site: LibSite? = nil) async throws -> Data {
         guard var comps = URLComponents(string: apiURL + path) else { throw APIError.badURL }
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { throw APIError.badURL }
         var req = URLRequest(url: url)
-        for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        for (k, v) in headers(for: site ?? LibSite.current) { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         // у HentaiLib контент закрыт для гостей: отправляем токен вошедшего пользователя
         let auth = token ?? Keychain.get("lib.token")
@@ -1208,7 +1211,7 @@ actor ImageLoader {
 
     init() {
         let cfg = URLSessionConfiguration.default
-        cfg.urlCache = URLCache(memoryCapacity: 24 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024, diskPath: "hehe-images")
+        cfg.urlCache = ImageLoader.diskCache
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         cfg.httpMaximumConnectionsPerHost = 8
         cfg.timeoutIntervalForRequest = 20
@@ -1216,6 +1219,19 @@ actor ImageLoader {
     }
 
     func clearDisk() { session.configuration.urlCache?.removeAllCachedResponses() }
+
+    /// Дисковый кэш обложек (до 500 МБ).
+    nonisolated static let diskCache = URLCache(memoryCapacity: 24 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024, diskPath: "hehe-images")
+
+    /// Сколько занимают оба временных кэша картинок: обложки и просмотренные страницы манги (не скачанные главы).
+    nonisolated static var cachesBytes: Int { diskCache.currentDiskUsage + MangaImageStore.diskCache.currentDiskUsage }
+
+    /// Очищает оба кэша картинок: в памяти и на диске. Скачанные главы не трогаются.
+    nonisolated static func clearAllCaches() {
+        ImageCache.shared.removeAllObjects()
+        diskCache.removeAllCachedResponses()
+        MangaImageStore.diskCache.removeAllCachedResponses()
+    }
 
     func image(_ url: URL, referer: String, maxPixel: CGFloat) async -> UIImage? {
         let key = "\(url.absoluteString)#\(Int(maxPixel))"
@@ -1441,7 +1457,15 @@ struct RemoteImage: View {
     private func load() async {
         guard let url else { failed = true; return }
         if url.isFileURL {
-            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            // Скачанная обложка: читаем и уменьшаем в фоне, а не целиком на главном потоке.
+            let key = ImageCache.key(url, maxPixel)
+            if let cached = ImageCache.shared.object(forKey: key) { image = cached; return }
+            let px = maxPixel
+            let img = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard let d = try? Data(contentsOf: url) else { return nil }
+                return ImageLoader.downsample(d, maxPixel: px)
+            }.value
+            if let img { ImageCache.store(img, key); image = img } else { failed = true }
             return
         }
         let key = ImageCache.key(url, maxPixel)
@@ -1742,13 +1766,23 @@ final class FavMetaStore: ObservableObject {
     }
 
     func apply(_ a: Anime, count: Int?, date: String?) {
-        var m = items[Self.key(a)] ?? FavMeta()
-        if m.seen == nil, let n = count { m.seen = m.count ?? n }
-        if let old = m.count, let n = count, n > old { m.changed = Date() }
-        if let n = count { m.count = n }
-        if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
-        m.checked = Date()
-        items[Self.key(a)] = m
+        applyBatch([(a, count, date)])
+    }
+
+    /// Применяет сразу пачку результатов: одна запись на диск и одна перерисовка вместо десятков.
+    func applyBatch(_ results: [(Anime, Int?, String?)]) {
+        guard !results.isEmpty else { return }
+        var all = items
+        for (a, count, date) in results {
+            var m = all[Self.key(a)] ?? FavMeta()
+            if m.seen == nil, let n = count { m.seen = m.count ?? n }
+            if let old = m.count, let n = count, n > old { m.changed = Date() }
+            if let n = count { m.count = n }
+            if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
+            m.checked = Date()
+            all[Self.key(a)] = m
+        }
+        items = all
         save()
     }
 
@@ -1764,6 +1798,7 @@ enum FavUpdater {
         let meta = FavMetaStore.shared
         let site = LibSite.current.key
         let todo = Array(list.prefix(80)).filter { force || meta.needsCheck($0) }
+        var results: [(Anime, Int?, String?)] = []
         var i = 0
         while i < todo.count {
             let chunk = Array(todo[i..<min(i + 4, todo.count)])
@@ -1774,9 +1809,16 @@ enum FavUpdater {
                         return (a, r.count, r.date)
                     }
                 }
-                for await (a, c, d) in group where LibSite.current.key == site { meta.apply(a, count: c, date: d) }
+                var got: [(Anime, Int?, String?)] = []
+                for await r in group { got.append(r) }
+                if LibSite.current.key == site { results += got }
             }
             i += 4
+            // Записываем пачками по 20 тайтлов: прогресс не теряется, а экран перерисовывается редко.
+            if results.count >= 20 || i >= todo.count {
+                if LibSite.current.key == site { meta.applyBatch(results) }
+                results.removeAll()
+            }
         }
     }
 
@@ -2186,7 +2228,12 @@ enum BackupManager {
     }
 
     // Копия живёт только в папке приложения (Файлы → На iPhone → Yume).
-    private static let mineKey = "backup.mine"   // дата последней копии, записанной самим приложением
+    private static let mineKey = "backup.mine"
+    /// Время изменения файла копии, записанной самим приложением: позволяет не читать файл при каждом запуске.
+    private static let mineMTimeKey = "backup.mine.mtime"
+    private static func fileMTime() -> Double? {
+        (try? FileManager.default.attributesOfItem(atPath: autoURL.path)[.modificationDate] as? Date)?.timeIntervalSince1970
+    }   // дата последней копии, записанной самим приложением
     /// После восстановления в работающем приложении копии не пишутся, чтобы старые данные в памяти не затёрли файл.
     private static var frozen = false
 
@@ -2198,6 +2245,9 @@ enum BackupManager {
 
     /// Дата копии в папке приложения, если её положил пользователь (а не записало само приложение).
     static func externalCopyDate() -> Date? {
+        // Быстрая проверка без чтения файла: если файла нет или он ровно тот, что записали мы сами, читать нечего.
+        guard let m = fileMTime() else { return nil }
+        if let mine = UserDefaults.standard.object(forKey: mineMTimeKey) as? Double, abs(m - mine) < 0.001 { return nil }
         guard let d = try? Data(contentsOf: autoURL), !d.isEmpty, let fd = fileDate(d) else { return nil }
         if let m = UserDefaults.standard.object(forKey: mineKey) as? Date, abs(m.timeIntervalSince(fd)) < 1.5 { return nil }
         return fd
@@ -2207,6 +2257,7 @@ enum BackupManager {
     static func acceptExternal() {
         if let d = try? Data(contentsOf: autoURL), let fd = fileDate(d) {
             UserDefaults.standard.set(fd, forKey: mineKey)
+            if let m = fileMTime() { UserDefaults.standard.set(m, forKey: mineMTimeKey) }
         }
     }
 
@@ -2229,6 +2280,7 @@ enum BackupManager {
         do {
             try d.write(to: autoURL, options: .atomic)
             UserDefaults.standard.set(stamp, forKey: mineKey)
+            if let m = fileMTime() { UserDefaults.standard.set(m, forKey: mineMTimeKey) }
             return autoURL
         } catch {
             return nil
@@ -2373,12 +2425,19 @@ struct SiteWebView: UIViewRepresentable {
                   let d = t.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
             let line = "\(o["m"] as? String ?? "?") \(o["u"] as? String ?? "") [\(o["s"] as? Int ?? 0)]"
-                + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + $0 } ?? "")
+                + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + SiteWebView.mask($0) } ?? "")
             Task { @MainActor in self.log.add(line) }
         }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(log) }
+
+    /// Прячет секреты входа в теле запроса, чтобы журнал можно было спокойно пересылать.
+    nonisolated static func mask(_ s: String) -> String {
+        let pattern = #"("(?:code|code_verifier|access_token|refresh_token|token|password)"\s*:\s*")[^"]*"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "$1•••")
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
@@ -2396,6 +2455,8 @@ struct SiteWebView: UIViewRepresentable {
 
     static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
         v.configuration.userContentController.removeScriptMessageHandler(forName: "hlog")
+        v.stopLoading()
+        v.loadHTMLString("", baseURL: nil)
     }
 }
 
@@ -2456,6 +2517,7 @@ struct SiteLogView: View {
 }
 
 struct SettingsView: View {
+    @State private var imageCacheBytes = 0
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
     @AppStorage("set.autoNative") private var autoNative = true
     @AppStorage("set.resume") private var resume = true
@@ -2891,9 +2953,12 @@ struct SettingsView: View {
 
     private var dataBlock: some View {
         section("Данные", footer: info) {
-            actionRow("photo.stack.fill", "Очистить кэш обложек") {
-                ImageCache.shared.removeAllObjects(); Task { await ImageLoader.shared.clearDisk() }; info = "Кэш обложек очищен"
+            actionRow("photo.stack.fill", "Очистить кэш картинок" + (imageCacheBytes > 0 ? " · " + fmtBytes(imageCacheBytes) : "")) {
+                ImageLoader.clearAllCaches()
+                imageCacheBytes = ImageLoader.cachesBytes
+                info = "Кэш обложек и просмотренных страниц очищен. Скачанные главы на месте."
             }
+            .onAppear { imageCacheBytes = ImageLoader.cachesBytes }
             rowDivider
             actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
                 ProgressStore.shared.clear(); HistoryStore.shared.clear()
@@ -2930,7 +2995,7 @@ struct SettingsView: View {
                 HStack(spacing: 12) {
                     Image(systemName: "exclamationmark.icloud.fill").font(.title3).foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(days == nil ? "Копия ещё не отправлялась" : "Копия не отправлялась \(days!) дн.")
+                        Text(days.map { "Копия не отправлялась \($0) дн." } ?? "Копия ещё не отправлялась")
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
                         Text("Отправь файл в Telegram или Файлы: при переустановке данные не пропадут.")
                             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
@@ -3176,18 +3241,41 @@ final class HomeViewModel: ObservableObject {
         if !force && !fresh.isEmpty { return }
         isLoading = true
         defer { isLoading = false }
-        async let a = fetch(.lastEpisode)
-        async let b = fetch(.views)
-        async let c = fetch(.newest)
-        async let d = fetch(.rating)
-        let (ra, rb, rc, rd) = await (a, b, c, d)
         func uniq(_ l: [Anime]) -> [Anime] { var seen = Set<Int>(); return l.filter { seen.insert($0.id).inserted } }
-        if let r = ra { fresh = uniq(r.items) }
-        if let r = rb { popular = uniq(r.items); popularPage = 1; popularHasNext = r.hasNext }
-        if let r = rc { newest = uniq(r.items) }
-        if let r = rd { top = uniq(r.items) }
-        ImageLoader.prefetch((fresh + newest + top + popular).compactMap { $0.posterURL }, maxPixel: 720)
-        error = (ra == nil && rb == nil && rc == nil && rd == nil) ? "Не удалось загрузить данные. Проверьте соединение." : nil
+        // Каждая лента показывается, как только пришла: «Лучшее по рейтингу» перебирает много страниц
+        // и раньше задерживало весь экран.
+        enum Part { case fresh, popular, newest, top }
+        var gotAny = false
+        await withTaskGroup(of: (Part, (items: [Anime], hasNext: Bool)?).self) { group in
+            group.addTask { (.fresh, await self.fetch(.lastEpisode)) }
+            group.addTask { (.popular, await self.fetch(.views)) }
+            group.addTask { (.newest, await self.fetch(.newest)) }
+            group.addTask { (.top, await self.fetch(.rating)) }
+            for await (part, res) in group {
+                guard let r = res else { continue }
+                gotAny = true
+                let list = uniq(r.items)
+                switch part {
+                case .fresh: fresh = list
+                case .popular: popular = list; popularPage = 1; popularHasNext = r.hasNext
+                case .newest: newest = list
+                case .top: top = list
+                }
+                // Обложки тех же размеров, что берут карточки, иначе подгрузка уходит впустую.
+                switch part {
+                case .fresh:
+                    ImageLoader.prefetch(list.prefix(14).compactMap { $0.posterURL }, maxPixel: 720)
+                case .newest:
+                    ImageLoader.prefetch(list.prefix(10).compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 420)
+                case .popular:
+                    ImageLoader.prefetch(list.prefix(1).compactMap { $0.posterURL }, maxPixel: 720)
+                    ImageLoader.prefetch(list.dropFirst().prefix(14).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
+                case .top:
+                    ImageLoader.prefetch(list.prefix(6).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
+                }
+            }
+        }
+        error = gotAny ? nil : "Не удалось загрузить данные. Проверьте соединение."
     }
 
     func morePopular() async {
@@ -3334,6 +3422,8 @@ struct PosterCard: View {
 }
 
 struct AnimeRow: View {
+    /// Миниатюра 62×93 pt — это 279 пикселей экрана по длинной стороне; 300 хватает без потери резкости.
+    static let thumbPixels: CGFloat = 300
     let anime: Anime
     var rank: Int? = nil
     /// Лёгкий вид без плашки: обложка, название, рейтинг.
@@ -3360,7 +3450,7 @@ struct AnimeRow: View {
                         .frame(width: 22)
                 }
             }
-            RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: light ? 720 : 480)
+            RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: AnimeRow.thumbPixels)
                 .frame(width: light ? 62 : 52, height: light ? 93 : 78)
                 .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
             VStack(alignment: .leading, spacing: 4) {
@@ -3395,10 +3485,8 @@ struct PopularHero: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            RemoteImage(url: anime.posterURL, maxPixel: 720)
+            BlurredCover(url: anime.posterURL, radius: 28, scale: 1.4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .scaleEffect(1.4)
-                .blur(radius: 28)
                 .overlay(LinearGradient(colors: [.black.opacity(0.30), .black.opacity(0.72)],
                                         startPoint: .top, endPoint: .bottom))
             HStack(alignment: .bottom, spacing: 16) {
@@ -3495,16 +3583,68 @@ struct RatingBadge: View {
     }
 }
 
+/// Размытая обложка для фона. Размытие делается один раз в фоне по маленькой картинке и кэшируется,
+/// а не пересчитывается видеочипом в каждом кадре прокрутки (как `.blur`). На вид то же, заряда тратит меньше.
+/// Общий контекст Core Image для размытия обложек (вне View, чтобы использовать из фоновых задач).
+enum BlurContext {
+    static let ci = CIContext(options: [.cacheIntermediates: false])
+}
+
+struct BlurredCover: View {
+    let url: URL?
+    /// Радиус в точках экрана, как у `.blur(radius:)`
+    var radius: CGFloat
+    var scale: CGFloat = 1
+    @State private var image: UIImage?
+
+    private static let source: CGFloat = 160
+
+    var body: some View {
+        Color.clear
+            .overlay {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                        .scaleEffect(scale)
+                        .transition(.opacity)
+                }
+            }
+            .clipped()
+            .allowsHitTesting(false)
+            .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        guard let url else { image = nil; return }
+        let key = "\(url.absoluteString)#blur\(Int(radius))" as NSString
+        if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+        guard let src = await ImageLoader.shared.image(url, referer: LibSite.current.referer, maxPixel: Self.source) else { return }
+        // Радиус в пикселях маленькой картинки: экран ~390 pt по ширине.
+        let r = radius * Self.source / 390
+        let out = await Task.detached(priority: .utility) { BlurredCover.blur(src, r) }.value
+        guard let out else { return }
+        ImageCache.store(out, key)
+        withAnimation(.easeOut(duration: 0.2)) { image = out }
+    }
+
+    nonisolated private static func blur(_ img: UIImage, _ r: CGFloat) -> UIImage? {
+        guard let cg = img.cgImage else { return nil }
+        let input = CIImage(cgImage: cg)
+        guard let f = CIFilter(name: "CIGaussianBlur") else { return nil }
+        f.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+        f.setValue(max(r, 1), forKey: kCIInputRadiusKey)
+        guard let o = f.outputImage?.cropped(to: input.extent),
+              let res = BlurContext.ci.createCGImage(o, from: input.extent) else { return nil }
+        return UIImage(cgImage: res)
+    }
+}
+
 struct TodayHero: View {
     let anime: Anime
 
     var body: some View {
         ZStack {
             // размытый фон из той же обложки
-            RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 300)
-                .scaleEffect(1.5)
-                .blur(radius: 30)
-                .allowsHitTesting(false)
+            BlurredCover(url: anime.posterURL ?? anime.imageURL, radius: 30, scale: 1.5)
             LinearGradient(colors: [.black.opacity(0.25), .black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
                 .allowsHitTesting(false)
             HStack(spacing: 16) {
@@ -3970,7 +4110,8 @@ struct RootView: View {
             }
         }
         .task {
-            BackupManager.writeAuto()
+            // Копия при запуске пишется в фоне: сборка и запись всего хранилища не задерживают первый экран.
+            Task.detached(priority: .utility) { BackupManager.writeAuto() }
             newBadge = FavMetaStore.shared.totalNew(FavoritesStore.current.items)
             await FavUpdater.refreshIfDue()
         }
@@ -4091,7 +4232,7 @@ final class CatalogViewModel: ObservableObject {
             let known = Set(items.map(\.id))
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
-            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
+            ImageLoader.prefetch(fresh.compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 520)
             hasNext = r.hasNext
             page = r.next
         } catch {
@@ -4477,7 +4618,7 @@ final class AuthorViewModel: ObservableObject {
             let known = Set(items.map { $0.id })
             let fresh = r.items.filter { !known.contains($0.id) }
             items += fresh
-            ImageLoader.prefetch(fresh.compactMap { $0.imageURL })
+            ImageLoader.prefetch(fresh.compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 520)
             page += 1
             if fresh.isEmpty || !r.hasNext { finished = true }
             error = nil
@@ -4626,8 +4767,7 @@ struct DetailView: View {
     private var backdrop: some View {
         ZStack {
             Theme.base
-            RemoteImage(url: vm.anime.imageURL, maxPixel: 96)
-                .blur(radius: 16)
+            BlurredCover(url: vm.anime.imageURL, radius: 16)
                 .opacity(0.55)
             CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
@@ -4755,6 +4895,18 @@ final class ProgressStore: ObservableObject {
         if let d = UserDefaults.standard.data(forKey: key),
            let v = try? JSONDecoder().decode([String: WatchProgress].self, from: d) {
             items = v
+        }
+        prune()
+    }
+
+    /// Убирает брошенный прогресс: недосмотренные серии, которые не открывались больше года.
+    /// Досмотренные остаются — по ним рисуются галочки «Просмотрено» и считается статистика.
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-365 * 24 * 3600)
+        let before = items.count
+        items = items.filter { $0.value.finished || $0.value.updated > cutoff }
+        if items.count != before, let d = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(d, forKey: key)
         }
     }
 
@@ -4920,9 +5072,9 @@ enum Kodik {
             for c in s.unicodeScalars {
                 let v = c.value
                 if v >= 65 && v <= 90 {
-                    out.unicodeScalars.append(UnicodeScalar((v - 65 + UInt32(shift)) % 26 + 65)!)
+                    if let u = UnicodeScalar((v - 65 + UInt32(shift)) % 26 + 65) { out.unicodeScalars.append(u) }
                 } else if v >= 97 && v <= 122 {
-                    out.unicodeScalars.append(UnicodeScalar((v - 97 + UInt32(shift)) % 26 + 97)!)
+                    if let u = UnicodeScalar((v - 97 + UInt32(shift)) % 26 + 97) { out.unicodeScalars.append(u) }
                 } else {
                     out.unicodeScalars.append(c)
                 }
@@ -5127,6 +5279,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var playbackError: String?
     @Published var showNative = false
     var fsPlayer: AVPlayer?
+    /// Наблюдатель прерываний звука (звонок, будильник): после них видео продолжается само, если iOS это разрешает.
+    private var interruptObs: NSObjectProtocol?
+    private var rateObs: NSObjectProtocol?
+    /// Видео поставила на паузу сама система из-за прерывания (а не ты): только тогда продолжаем.
+    private var pausedByInterruption = false
     private var lastWebStream: URL?
     private var attempts: [(URL, [String: String])] = []
     private var attemptIndex = 0
@@ -5160,6 +5317,7 @@ final class PlayerViewModel: ObservableObject {
         watchedFired = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
+        ActivityStore.shared.episodeOpened()
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
@@ -5365,6 +5523,32 @@ final class PlayerViewModel: ObservableObject {
 
     private func startAV(_ url: URL, headers: [String: String]) {
         guard !stopped else { return }
+        if interruptObs == nil {
+            interruptObs = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+                guard let info = n.userInfo,
+                      let t = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: t) == .ended,
+                      let o = info[AVAudioSessionInterruptionOptionKey] as? UInt,
+                      AVAudioSession.InterruptionOptions(rawValue: o).contains(.shouldResume) else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, !self.stopped, self.pausedByInterruption else { return }
+                    self.pausedByInterruption = false
+                    (self.fsPlayer ?? self.player)?.play()
+                }
+            }
+            rateObs = NotificationCenter.default.addObserver(
+                forName: AVPlayer.rateDidChangeNotification, object: nil, queue: .main) { [weak self] n in
+                let reason = n.userInfo?[AVPlayer.rateDidChangeReasonKey] as? AVPlayer.RateDidChangeReason
+                let rate = (n.object as? AVPlayer)?.rate ?? 0
+                let obj = n.object as AnyObject?
+                Task { @MainActor [weak self] in
+                    guard let self, obj === self.player || obj === self.fsPlayer else { return }
+                    if reason == .audioSessionInterrupted, rate == 0 { self.pausedByInterruption = true }
+                    else if rate > 0 { self.pausedByInterruption = false }
+                }
+            }
+        }
         savePosition()
         if let t = player?.currentTime(), t.isValid, t.seconds > 1 { lastPosition = t.seconds }
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
@@ -5425,7 +5609,13 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func stop() {
-        savePosition(); stopped = true; detachObserver(); player?.pause(); player = nil
+        savePosition(); stopped = true; detachObserver(); statusObs = nil; player?.pause(); player = nil
+        if let o = interruptObs { NotificationCenter.default.removeObserver(o); interruptObs = nil }
+        if let o = rateObs { NotificationCenter.default.removeObserver(o); rateObs = nil }
+        pausedByInterruption = false
+        // Замыкания держат экран серии, а экран держит этот объект: разрываем кольцо, иначе он не освобождается.
+        onEnd = nil
+        onWatched = nil
         ProgressStore.shared.flush()
     }
 }
@@ -5738,7 +5928,12 @@ enum J {
 
 // MARK: - Keychain (токен входа хранится в защищённом хранилище)
 enum Keychain {
+    /// Значения держим в памяти: токен читается на каждый сетевой запрос, а Keychain — сравнительно медленный вызов.
+    private static let lock = NSLock()
+    private static var cache: [String: String] = [:]
+
     static func set(_ value: String, key: String) {
+        lock.lock(); cache[key] = value; lock.unlock()
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                    kSecAttrAccount as String: key]
         SecItemDelete(base as CFDictionary)
@@ -5748,17 +5943,22 @@ enum Keychain {
     }
 
     static func get(_ key: String) -> String? {
+        lock.lock()
+        if let v = cache[key] { lock.unlock(); return v }
+        lock.unlock()
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrAccount as String: key,
                                 kSecReturnData as String: true,
                                 kSecMatchLimit as String: kSecMatchLimitOne]
         var out: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+              let d = out as? Data, let v = String(data: d, encoding: .utf8) else { return nil }
+        lock.lock(); cache[key] = v; lock.unlock()
+        return v
     }
 
     static func delete(_ key: String) {
+        lock.lock(); cache[key] = nil; lock.unlock()
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrAccount as String: key]
         SecItemDelete(q as CFDictionary)
@@ -5984,10 +6184,10 @@ final class CommentsViewModel: ObservableObject {
         if parent == nil {
             variants.append(("A", body(level: 0, root: NSNull())))
             variants.append(("B", body(level: 0, root: NSNull(), pp: false)))
-        } else {
-            variants.append(("A", body(level: 1, root: parent!)))
+        } else if let pid = parent {
+            variants.append(("A", body(level: 1, root: pid)))
             variants.append(("B", body(level: 1, root: NSNull())))
-            variants.append(("C", body(level: 2, root: parent!)))
+            variants.append(("C", body(level: 2, root: pid)))
         }
         var errors: [String] = []
         for (name, b) in variants {
@@ -5996,6 +6196,8 @@ final class CommentsViewModel: ObservableObject {
                 return nil
             } catch {
                 errors.append("\(name): \(error.localizedDescription)")
+                // Ошибка сервера (5xx): комментарий мог уже создаться — не шлём другой вариант, чтобы не было дубля.
+                if case APIError.http(let code, _) = error, code >= 500 { break }
             }
         }
         return errors.joined(separator: "\n")
@@ -6004,8 +6206,8 @@ final class CommentsViewModel: ObservableObject {
     func like(_ id: Int) async -> String? {
         guard let t = AuthStore.shared.token else { return "Сначала войдите во вкладке «Профиль»" }
         let attempts: [(String, [String: Any])] = [
+            ("/comments/\(id)/vote", ["vote": 1]),      // формат сайта (по журналу запросов)
             ("/comments/\(id)/vote", ["type": "up"]),
-            ("/comments/\(id)/vote", ["vote": 1]),
             ("/comments/\(id)/like", [:])
         ]
         var last = ""
@@ -6407,7 +6609,7 @@ struct LoginWebView: UIViewRepresentable {
         v.customUserAgent = Kodik.ua
         v.isOpaque = false
         v.backgroundColor = .black
-        v.load(URLRequest(url: URL(string: "https://animelib.org/ru/")!))
+        if let home = URL(string: "https://animelib.org/ru/") { v.load(URLRequest(url: home)) }
         let c = context.coordinator
         c.web = v
         c.onToken = onToken
@@ -6584,7 +6786,7 @@ final class ProfileViewModel: ObservableObject {
             guard score >= 3,
                   let data = try? JSONSerialization.data(withJSONObject: c),
                   let a = try? JSONDecoder().decode(Anime.self, from: data) else { continue }
-            if best == nil || score > best!.0 { best = (score, a) }
+            if score > (best?.0 ?? Int.min) { best = (score, a) }
         }
         return best?.1
     }
@@ -8195,7 +8397,13 @@ struct FitImage: View {
 
     private func load() async {
         if url.isFileURL {
-            if let img = UIImage(contentsOfFile: url.path) { image = img } else { failed = true }
+            let key = ImageCache.key(url, 1600)
+            if let c = ImageCache.shared.object(forKey: key) { image = c; return }
+            let img = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard let d = try? Data(contentsOf: url) else { return nil }
+                return ImageLoader.downsample(d, maxPixel: 1600)
+            }.value
+            if let img { ImageCache.store(img, key); image = img } else { failed = true }
             return
         }
         let key = ImageCache.key(url, 1600)
@@ -8386,6 +8594,8 @@ final class DownloadManager: ObservableObject {
         let chapters: [NovelChapter]
         let chapter: NovelChapter
         let store: OfflineStore
+        /// Сайт, с которого поставили загрузку: запоминаем, чтобы переключение вкладки её не ломало.
+        var site = LibSite.current
     }
 
     @Published private(set) var pending: Set<Int> = []
@@ -8404,7 +8614,8 @@ final class DownloadManager: ObservableObject {
     private var jobs: [Job] = []
     private var worker: Task<Void, Never>?
     private let monitor = NWPathMonitor()
-    private var expensive = false
+    /// Мобильная сеть (или режим экономии трафика): тогда тратим меньше трафика и заряда.
+    private(set) var expensive = false
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
@@ -8570,7 +8781,7 @@ final class DownloadManager: ObservableObject {
         for attempt in 0..<3 {
             do {
                 raw = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
-                                                           query: NovelService.chapterQuery(c))
+                                                           query: NovelService.chapterQuery(c), site: job.site)
                 break
             } catch APIError.http(let code, let body) where code == 429 || code >= 500 {
                 lastError = APIError.http(code, body)
@@ -8610,7 +8821,7 @@ final class DownloadManager: ObservableObject {
     /// Манга: все страницы главы кладём в файлы 〈глава〉_〈номер〉.img. Глава сохраняется, только если скачались все.
     private func downloadManga(_ job: Job, raw: Data, data d: [String: Any]) async throws {
         let c = job.chapter
-        let bases = await MangaImageServers.shared.bases()
+        let bases = await MangaImageServers.shared.bases(site: job.site)
         let pages = MangaService.parse(d, bases: bases)
         if pages.isEmpty {
             throw NSError(domain: "offline", code: 2,
@@ -8624,10 +8835,11 @@ final class DownloadManager: ObservableObject {
         let targets: [([URL], URL)] = pages.map { ($0.urls, store.mangaPageFile(nid, c.id, $0.id)) }
         let titleText = c.title
         let totalPages = targets.count
+        let referer = job.site.isManga ? job.site.referer : LibSite.manga.referer
         let counter = PageCounter()
         status = "\(titleText) · 0/\(totalPages)"
         let sizes = await DownloadManager.pool(targets, width: expensive ? 4 : 6) { t in
-            let n = await DownloadManager.fetchMangaPage(t.0, to: t.1)
+            let n = await DownloadManager.fetchMangaPage(t.0, to: t.1, referer: referer)
             let k = await counter.bump()
             await MainActor.run { DownloadManager.shared.status = "\(titleText) · \(k)/\(totalPages)" }
             return n
@@ -8649,14 +8861,14 @@ final class DownloadManager: ObservableObject {
         func bump() -> Int { n += 1; return n }
     }
 
-    nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL) async -> Int {
+    nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL, referer: String) async -> Int {
         if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 { return size }
         let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         for round in 0..<2 {
             for u in urls {
                 var req = URLRequest(url: u)
                 req.timeoutInterval = 20
-                req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                req.setValue(referer, forHTTPHeaderField: "Referer")
                 req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 req.setValue(agent, forHTTPHeaderField: "User-Agent")
                 if let (data, resp) = try? await DownloadManager.session.data(for: req),
@@ -8880,7 +9092,7 @@ struct NovelDetailView: View {
     private var backdrop: some View {
         ZStack {
             Theme.base
-            RemoteImage(url: vm.anime.imageURL, maxPixel: 96).blur(radius: 16).opacity(0.55)
+            BlurredCover(url: vm.anime.imageURL, radius: 16).opacity(0.55)
             CoverTintLayer(url: vm.anime.imageURL, strength: 0.6)
             LinearGradient(colors: [.clear, Theme.base.opacity(0.85), Theme.base], startPoint: .top, endPoint: .bottom)
         }
@@ -9176,12 +9388,12 @@ actor MangaImageServers {
     private var cachedBy: [String: [String]] = [:]
     private let fallback = "https://img3.cdnlibs.org"
 
-    func bases() async -> [String] {
-        let siteID = LibSite.current.id
+    func bases(site: LibSite? = nil) async -> [String] {
+        let siteID = (site ?? LibSite.current).id
         if let c = cachedBy[siteID] { return c }
         var list: [String] = []
         let q = [URLQueryItem(name: "fields[]", value: "imageServers")]
-        if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q),
+        if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q, site: site),
            let root = J.obj(data) as? [String: Any],
            let d = root["data"] as? [String: Any],
            let arr = d["imageServers"] as? [[String: Any]] {
@@ -9279,12 +9491,15 @@ actor MangaImageStore {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 25
         cfg.httpMaximumConnectionsPerHost = 4
-        cfg.urlCache = URLCache(memoryCapacity: 30_000_000, diskCapacity: 400_000_000)
+        cfg.urlCache = MangaImageStore.diskCache
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         return URLSession(configuration: cfg)
     }()
 
     private static let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    /// Временный кэш просмотренных страниц манги (до 400 МБ). Скачанные главы лежат отдельно.
+    nonisolated static let diskCache = URLCache(memoryCapacity: 30_000_000, diskCapacity: 400_000_000)
 
     func image(for page: MangaPage) async -> UIImage? {
         let key = ImageCache.key(page.url, page.maxPixel)
@@ -9292,7 +9507,6 @@ actor MangaImageStore {
         let id = key as String
         if let t = inflight[id] { return await t.value.0 }
         let urls = page.urls
-        let px = page.maxPixel
         let t = Task.detached(priority: .userInitiated) { () -> (UIImage?, String) in
             var note = ""
             for round in 0..<2 {
@@ -9336,6 +9550,21 @@ actor MangaImageStore {
         if r.0 == nil { lastNote = r.1 }
         return r.0
     }
+
+    /// Только скачивает страницу в дисковый кэш, не декодируя её: память не занимается,
+    /// а когда до страницы дойдёт очередь, она откроется из кэша без сети.
+    nonisolated func warm(_ page: MangaPage) async {
+        if ImageCache.shared.object(forKey: ImageCache.key(page.url, page.maxPixel)) != nil { return }
+        for u in page.urls {
+            if Task.isCancelled || u.isFileURL { return }
+            var req = URLRequest(url: u)
+            req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
+            req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue(MangaImageStore.agent, forHTTPHeaderField: "User-Agent")
+            if let (_, resp) = try? await MangaImageStore.session.data(for: req),
+               let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) { return }
+        }
+    }
 }
 
 struct MangaPageView: View {
@@ -9355,7 +9584,7 @@ struct MangaPageView: View {
     @State private var bg: Color?
 
     /// Белое или чёрное поле по краям самой страницы.
-    static func edgeColor(_ img: UIImage) -> Color? {
+    nonisolated static func edgeColor(_ img: UIImage) -> Color? {
         guard let cg = img.cgImage else { return nil }
         let n = 24
         var px = [UInt8](repeating: 0, count: n * n * 4)
@@ -9465,8 +9694,9 @@ struct MangaPageView: View {
 
     private func load() async {
         if let img = await MangaImageStore.shared.image(for: page) {
-            bg = MangaPageView.edgeColor(img)
             withAnimation(.easeOut(duration: 0.15)) { image = img }
+            // Цвет полей считается в фоне: для длинной страницы это заметная работа.
+            bg = await Task.detached(priority: .utility) { MangaPageView.edgeColor(img) }.value
             return
         }
         if Task.isCancelled { return }
@@ -10292,6 +10522,8 @@ final class AutoScroller {
         blockedSince = 0
         pos = scrollView?.contentOffset.y ?? 0
         let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        // 60 кадров достаточно для плавного движения; 120 только тратят заряд. Скорость считается по времени, не по кадрам.
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         l.add(to: .main, forMode: .common)
         link = l
     }
@@ -10301,13 +10533,20 @@ final class AutoScroller {
         link = nil
     }
 
+    /// Читалка закрыта: отпускаем замыкания, которые держат её экран (иначе экран не освобождается).
+    func detach() {
+        canAdvance = { false }
+        onEnd = { true }
+        onBlocked = { _ in }
+    }
+
     /// Запасной поиск ленты по всем окнам, если привязка через SwiftUI не сработала.
     private func locate() {
         var best: UIScrollView?
         func walk(_ v: UIView) {
             if let sv = v as? UIScrollView, !sv.isHidden, sv.alpha > 0.01, sv.bounds.width > 200, sv.bounds.height > 300,
                sv.contentSize.height > sv.bounds.height * 1.05 {
-                if best == nil || sv.contentSize.height > best!.contentSize.height { best = sv }
+                if sv.contentSize.height > (best?.contentSize.height ?? -1) { best = sv }
             }
             for c in v.subviews { walk(c) }
         }
@@ -10361,11 +10600,9 @@ struct MangaReaderView: View {
     @State private var current = 0
     @State private var scrollPage = 0
     @State private var historyTask: Task<Void, Never>?
-    @State private var showBookmarks = false
     @State private var showChapters = false
     @State private var pendingPage: Int?
     @State private var jumpTick = 0
-    @ObservedObject private var bms = BookmarkStore.shared
     @State private var showComments = false
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
@@ -10480,7 +10717,7 @@ struct MangaReaderView: View {
         autoOn = on
         if on {
             scroller.speed = CGFloat(effSpeed)
-            scroller.canAdvance = { !showSettings && !showComments && !showBookmarks && !showChapters && pagesReady() }
+            scroller.canAdvance = { !showSettings && !showComments && !showChapters && pagesReady() }
             scroller.onEnd = {
                 guard reachedEnd else { return false }
                 Task { @MainActor in
@@ -10524,25 +10761,36 @@ struct MangaReaderView: View {
         else { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } }
     }
 
-    /// Фоновая подгрузка: сначала открытая страница, потом остальные по порядку, по две за раз.
+    /// Фоновая подгрузка. Декодируются (занимают память) только страницы рядом с текущей:
+    /// одна назад и три вперёд. Остальные страницы главы лишь скачиваются в дисковый кэш.
     private func preload(from start: Int) {
         preloadTask?.cancel()
         let list = pages
         guard !list.isEmpty else { return }
         let first = min(max(start, 0), list.count - 1)
+        let cellular = DownloadManager.shared.expensive
         preloadTask = Task {
-            var order = Array(first..<list.count)
-            order += Array((0..<first).reversed())
+            // 1. Текущая страница, затем соседние: готовые картинки в памяти.
+            _ = await MangaImageStore.shared.image(for: list[first])
+            var near: [Int] = []
+            for k in 1...3 where first + k < list.count { near.append(first + k) }
+            if first > 0 { near.append(first - 1) }
+            await withTaskGroup(of: Void.self) { group in
+                for id in near { group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) } }
+            }
+            // 2. Дальше по главе только скачиваем, по три за раз: сначала вперёд, потом назад.
+            //    По мобильной сети — только ~10 страниц вперёд: модем чаще отдыхает, заряд и трафик экономятся.
+            //    Окно сдвигается вместе с чтением, поэтому следующие страницы всё равно успевают подгрузиться.
+            let aheadEnd = cellular ? min(first + 12, list.count) : list.count
+            var rest = Array((first + 4)..<max(first + 4, aheadEnd))
+            if !cellular { rest += Array((0..<max(first - 1, 0)).reversed()) }
             var i = 0
-            while i < order.count {
+            while i < rest.count {
                 if Task.isCancelled { return }
-                let n = i == 0 ? 1 : 3
-                let chunk = Array(order[i..<min(i + n, order.count)])
-                i += n
+                let chunk = Array(rest[i..<min(i + 3, rest.count)])
+                i += 3
                 await withTaskGroup(of: Void.self) { group in
-                    for id in chunk {
-                        group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) }
-                    }
+                    for id in chunk { group.addTask { await MangaImageStore.shared.warm(list[id]) } }
                 }
             }
         }
@@ -10860,10 +11108,6 @@ struct MangaReaderView: View {
                                     page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count)
             }
         }
-        .sheet(isPresented: $showBookmarks) {
-            BookmarksSheet(titleKey: novel.readKey, titleName: novel.displayTitle, showHighlights: false,
-                           onBookmark: { openBookmark($0) }, onHighlight: { _ in })
-        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
             persistPos()
@@ -10871,46 +11115,7 @@ struct MangaReaderView: View {
             preloadTask?.cancel()
             historyTask?.cancel()
             scroller.stop()
-        }
-    }
-
-    private var chapterLabel: String {
-        chapter.map { "Том \($0.volume) · \($0.title)" } ?? ""
-    }
-
-    private var pageBookmark: Bookmark? {
-        guard let c = chapter, !pages.isEmpty else { return nil }
-        let p = min(shown, pages.count - 1)
-        return bms.find(titleKey: novel.readKey, chapterID: c.id, from: p, to: p + 1)
-    }
-
-    private func toggleBookmark() {
-        guard let c = chapter, !pages.isEmpty else { return }
-        if let b = pageBookmark {
-            bms.remove(b.id)
-            Haptics.tap()
-            return
-        }
-        let p = min(shown, pages.count - 1)
-        bms.add(Bookmark(titleKey: novel.readKey, chapterID: c.id, chapterLabel: chapterLabel,
-                         position: p, isText: false, snippet: "", note: "", created: Date()))
-        Haptics.success()
-    }
-
-    private func openBookmark(_ b: Bookmark) {
-        guard let ci = chapters.firstIndex(where: { $0.id == b.chapterID }) else { return }
-        if ci == index {
-            let p = min(max(b.position, 0), max(pages.count - 1, 0))
-            if vertical {
-                current = p
-                scrollPage = p
-                jumpTick += 1
-            } else {
-                withAnimation { current = p }
-            }
-        } else {
-            pendingPage = b.position
-            index = ci
+            scroller.detach()
         }
     }
 
@@ -11691,6 +11896,13 @@ struct NovelReaderSettings: View {
     }
 }
 
+/// Номер видимого абзаца в ленте ранобэ (ссылочный тип, чтобы не вызывать перерисовку).
+final class BlockTracker {
+    var value = -1
+    var pending: DispatchWorkItem?
+    func reset() { pending?.cancel(); pending = nil; value = -1 }
+}
+
 struct NovelReaderView: View {
     let novel: Anime
     let chapters: [NovelChapter]
@@ -11720,7 +11932,9 @@ struct NovelReaderView: View {
     @State private var lastLongPress = Date.distantPast
     @State private var pendingOffset: Int?
     @State private var restoreBlock: Int?
-    @State private var visibleBlock = -1
+    /// Видимый абзац хранится вне состояния экрана: его смена не пересчитывает всю читалку.
+    @State private var blockTracker = BlockTracker()
+    private var visibleBlock: Int { blockTracker.value }
     @State private var hlRev = 0
     @ObservedObject private var bms = BookmarkStore.shared
     @ObservedObject private var hls = HighlightStore.shared
@@ -11808,6 +12022,16 @@ struct NovelReaderView: View {
     }
 
     private var chapterID: Int { chapters.indices.contains(index) ? chapters[index].id : 0 }
+
+    /// Абзац показался на экране: запоминаем его и сохраняем позицию с небольшой паузой.
+    private func blockSeen(_ id: Int) {
+        guard blockTracker.value != id else { return }
+        blockTracker.value = id
+        blockTracker.pending?.cancel()
+        let work = DispatchWorkItem { persistPos() }
+        blockTracker.pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
 
     /// Запоминает место в главе: страницы (смещение в тексте) или прокрутка (номер блока).
     private func persistPos() {
@@ -12058,7 +12282,7 @@ struct NovelReaderView: View {
                                 .opacity(0.55)
                         }
                         if loading { ProgressView().frame(maxWidth: .infinity).padding(.top, 40) }
-                        ForEach(blocks) { b in blockView(b).id(b.id).onAppear { visibleBlock = b.id } }
+                        ForEach(blocks) { b in blockView(b).id(b.id).onAppear { blockSeen(b.id) } }
                         if let e = error {
                             Text(e).font(.footnote).foregroundStyle(.orange)
                         }
@@ -12138,7 +12362,6 @@ struct NovelReaderView: View {
             }
             .toolbar(chromeHidden ? .hidden : .visible, for: .navigationBar)
             .onChange(of: pageIndex) { _ in persistPos() }
-            .onChange(of: visibleBlock) { _ in persistPos() }
             .statusBarHidden(chromeHidden)
             .navigationTitle(novel.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
@@ -12240,7 +12463,7 @@ struct NovelReaderView: View {
         blocks = []
         pages = []
         pageIndex = 0
-        visibleBlock = -1
+        blockTracker.reset()
         if pendingOffset == nil, restoreBlock == nil, let pos = ReadPosStore.shared.get(novel.readKey), pos.c == ch.id {
             if mode == "pages" { if pos.p > 0 { pendingOffset = pos.p } }
             else if pos.b > 0 { restoreBlock = pos.b }
@@ -12641,8 +12864,7 @@ final class SimilarViewModel: ObservableObject {
         adapt = r.adapt
         note = r.note
         loaded = true
-        ImageLoader.prefetch((r.similar + r.related).compactMap { $0.imageURL })
-        ImageLoader.prefetch(r.adapt.compactMap { $0.imageURL })
+        ImageLoader.prefetch((r.similar + r.related + r.adapt).compactMap { $0.imageURL }, maxPixel: 320)
     }
 }
 
@@ -12888,8 +13110,10 @@ struct DayActivity: Codable {
     var episodes = 0
     var novels = 0
     var manga = 0
-    /// Время чтения (манга, хентай, ранобэ) в секундах
+    /// Время чтения (манга, хентай, ранобэ) в секундах — старые данные, больше не пополняется
     var read: Double = 0
+    /// Сколько раз за день открывалась серия (даже недосмотренная) — для «дней подряд»
+    var opened = 0
 
     init() {}
 
@@ -12900,6 +13124,7 @@ struct DayActivity: Codable {
         novels = (try? c.decode(Int.self, forKey: .novels)) ?? 0
         manga = (try? c.decode(Int.self, forKey: .manga)) ?? 0
         read = (try? c.decode(Double.self, forKey: .read)) ?? 0
+        opened = (try? c.decode(Int.self, forKey: .opened)) ?? 0
     }
 }
 
@@ -12935,6 +13160,7 @@ final class ActivityStore: ObservableObject {
     }
 
     func addEpisode() { mutate { $0.episodes += 1 } }
+    func episodeOpened() { mutate { $0.opened += 1 } }
     func addChapter(manga: Bool) {
         mutate { if manga { $0.manga += 1 } else { $0.novels += 1 } }
     }
@@ -12978,7 +13204,9 @@ struct StatsView: View {
         let cal = Calendar.current
         func active(_ d: Date) -> Bool {
             guard let a = act.days[ActivityStore.dayKey(d)] else { return false }
-            return a.episodes > 0 || a.novels > 0 || a.manga > 0
+            // день считается, если читал, досмотрел серию или хотя бы открывал её
+            // (watch и read — минуты из старых версий, чтобы прошлые дни тоже засчитывались)
+            return a.episodes > 0 || a.novels > 0 || a.manga > 0 || a.opened > 0 || a.watch > 0 || a.read > 0
         }
         var day = Date()
         if !active(day) { day = cal.date(byAdding: .day, value: -1, to: day) ?? day }
@@ -13079,8 +13307,9 @@ struct StatsView: View {
 struct HeheApp: App {
     init() {
         BackupManager.restoreOnLaunch()
+        // Только выбираем режим «воспроизведение видео». Саму аудиосессию iOS включит при старте плеера:
+        // музыка из других приложений не обрывается, пока ты просто листаешь каталог или читаешь.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
     }
 
     var body: some Scene {
