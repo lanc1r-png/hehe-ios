@@ -10515,6 +10515,13 @@ final class AutoScroller {
         link = nil
     }
 
+    /// Читалка закрыта: отпускаем замыкания, которые держат её экран (иначе экран не освобождается).
+    func detach() {
+        canAdvance = { false }
+        onEnd = { true }
+        onBlocked = { _ in }
+    }
+
     /// Запасной поиск ленты по всем окнам, если привязка через SwiftUI не сработала.
     private func locate() {
         var best: UIScrollView?
@@ -11090,6 +11097,7 @@ struct MangaReaderView: View {
             preloadTask?.cancel()
             historyTask?.cancel()
             scroller.stop()
+            scroller.detach()
         }
     }
 
