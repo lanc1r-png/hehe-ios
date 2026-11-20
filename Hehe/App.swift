@@ -5305,6 +5305,7 @@ final class PlayerViewModel: ObservableObject {
         watchedFired = false
         self.episodeID = episodeID
         ProgressStore.shared.opened(episodeID)
+        ActivityStore.shared.episodeOpened()
         lastPosition = Settings.bool("set.resume", true) ? ProgressStore.shared.position(episodeID) : 0
         do {
             variants = try await AnimelibAPI.shared.variants(episodeID: episodeID)
@@ -13097,8 +13098,10 @@ struct DayActivity: Codable {
     var episodes = 0
     var novels = 0
     var manga = 0
-    /// Время чтения (манга, хентай, ранобэ) в секундах
+    /// Время чтения (манга, хентай, ранобэ) в секундах — старые данные, больше не пополняется
     var read: Double = 0
+    /// Сколько раз за день открывалась серия (даже недосмотренная) — для «дней подряд»
+    var opened = 0
 
     init() {}
 
@@ -13109,6 +13112,7 @@ struct DayActivity: Codable {
         novels = (try? c.decode(Int.self, forKey: .novels)) ?? 0
         manga = (try? c.decode(Int.self, forKey: .manga)) ?? 0
         read = (try? c.decode(Double.self, forKey: .read)) ?? 0
+        opened = (try? c.decode(Int.self, forKey: .opened)) ?? 0
     }
 }
 
@@ -13144,6 +13148,7 @@ final class ActivityStore: ObservableObject {
     }
 
     func addEpisode() { mutate { $0.episodes += 1 } }
+    func episodeOpened() { mutate { $0.opened += 1 } }
     func addChapter(manga: Bool) {
         mutate { if manga { $0.manga += 1 } else { $0.novels += 1 } }
     }
@@ -13187,7 +13192,9 @@ struct StatsView: View {
         let cal = Calendar.current
         func active(_ d: Date) -> Bool {
             guard let a = act.days[ActivityStore.dayKey(d)] else { return false }
-            return a.episodes > 0 || a.novels > 0 || a.manga > 0
+            // день считается, если читал, досмотрел серию или хотя бы открывал её
+            // (watch и read — минуты из старых версий, чтобы прошлые дни тоже засчитывались)
+            return a.episodes > 0 || a.novels > 0 || a.manga > 0 || a.opened > 0 || a.watch > 0 || a.read > 0
         }
         var day = Date()
         if !active(day) { day = cal.date(byAdding: .day, value: -1, to: day) ?? day }
