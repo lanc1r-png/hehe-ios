@@ -697,9 +697,10 @@ actor AnimelibAPI {
         session = URLSession(configuration: cfg)
     }
 
-    nonisolated var siteHeaders: [String: String] {
-        let site = LibSite.current
-        return ["Referer": site.referer, "Origin": site.origin, "Site-Id": site.id]
+    nonisolated var siteHeaders: [String: String] { headers(for: LibSite.current) }
+
+    nonisolated func headers(for site: LibSite) -> [String: String] {
+        ["Referer": site.referer, "Origin": site.origin, "Site-Id": site.id]
     }
 
     nonisolated var playbackHeaders: [String: String] {
@@ -978,13 +979,14 @@ actor AnimelibAPI {
         return list.filter { $0.id != nil && !$0.title.isEmpty }
     }
 
+    /// `site` — для фоновых задач (загрузки): запрос идёт к сайту задачи, даже если ты переключил вкладку.
     func rawData(_ path: String, query: [URLQueryItem] = [], token: String? = nil,
-                 method: String = "GET", json: [String: Any]? = nil) async throws -> Data {
+                 method: String = "GET", json: [String: Any]? = nil, site: LibSite? = nil) async throws -> Data {
         guard var comps = URLComponents(string: apiURL + path) else { throw APIError.badURL }
         if !query.isEmpty { comps.queryItems = query }
         guard let url = comps.url else { throw APIError.badURL }
         var req = URLRequest(url: url)
-        for (k, v) in siteHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        for (k, v) in headers(for: site ?? LibSite.current) { req.setValue(v, forHTTPHeaderField: k) }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         // у HentaiLib контент закрыт для гостей: отправляем токен вошедшего пользователя
         let auth = token ?? Keychain.get("lib.token")
@@ -8579,6 +8581,8 @@ final class DownloadManager: ObservableObject {
         let chapters: [NovelChapter]
         let chapter: NovelChapter
         let store: OfflineStore
+        /// Сайт, с которого поставили загрузку: запоминаем, чтобы переключение вкладки её не ломало.
+        var site = LibSite.current
     }
 
     @Published private(set) var pending: Set<Int> = []
@@ -8764,7 +8768,7 @@ final class DownloadManager: ObservableObject {
         for attempt in 0..<3 {
             do {
                 raw = try await AnimelibAPI.shared.rawData(NovelService.chapterPath(slug: slug),
-                                                           query: NovelService.chapterQuery(c))
+                                                           query: NovelService.chapterQuery(c), site: job.site)
                 break
             } catch APIError.http(let code, let body) where code == 429 || code >= 500 {
                 lastError = APIError.http(code, body)
@@ -8804,7 +8808,7 @@ final class DownloadManager: ObservableObject {
     /// Манга: все страницы главы кладём в файлы 〈глава〉_〈номер〉.img. Глава сохраняется, только если скачались все.
     private func downloadManga(_ job: Job, raw: Data, data d: [String: Any]) async throws {
         let c = job.chapter
-        let bases = await MangaImageServers.shared.bases()
+        let bases = await MangaImageServers.shared.bases(site: job.site)
         let pages = MangaService.parse(d, bases: bases)
         if pages.isEmpty {
             throw NSError(domain: "offline", code: 2,
@@ -8818,10 +8822,11 @@ final class DownloadManager: ObservableObject {
         let targets: [([URL], URL)] = pages.map { ($0.urls, store.mangaPageFile(nid, c.id, $0.id)) }
         let titleText = c.title
         let totalPages = targets.count
+        let referer = job.site.isManga ? job.site.referer : LibSite.manga.referer
         let counter = PageCounter()
         status = "\(titleText) · 0/\(totalPages)"
         let sizes = await DownloadManager.pool(targets, width: expensive ? 4 : 6) { t in
-            let n = await DownloadManager.fetchMangaPage(t.0, to: t.1)
+            let n = await DownloadManager.fetchMangaPage(t.0, to: t.1, referer: referer)
             let k = await counter.bump()
             await MainActor.run { DownloadManager.shared.status = "\(titleText) · \(k)/\(totalPages)" }
             return n
@@ -8843,14 +8848,14 @@ final class DownloadManager: ObservableObject {
         func bump() -> Int { n += 1; return n }
     }
 
-    nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL) async -> Int {
+    nonisolated static func fetchMangaPage(_ urls: [URL], to file: URL, referer: String) async -> Int {
         if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 { return size }
         let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         for round in 0..<2 {
             for u in urls {
                 var req = URLRequest(url: u)
                 req.timeoutInterval = 20
-                req.setValue(LibSite.current.isManga ? LibSite.current.referer : LibSite.manga.referer, forHTTPHeaderField: "Referer")
+                req.setValue(referer, forHTTPHeaderField: "Referer")
                 req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
                 req.setValue(agent, forHTTPHeaderField: "User-Agent")
                 if let (data, resp) = try? await DownloadManager.session.data(for: req),
@@ -9370,12 +9375,12 @@ actor MangaImageServers {
     private var cachedBy: [String: [String]] = [:]
     private let fallback = "https://img3.cdnlibs.org"
 
-    func bases() async -> [String] {
-        let siteID = LibSite.current.id
+    func bases(site: LibSite? = nil) async -> [String] {
+        let siteID = (site ?? LibSite.current).id
         if let c = cachedBy[siteID] { return c }
         var list: [String] = []
         let q = [URLQueryItem(name: "fields[]", value: "imageServers")]
-        if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q),
+        if let data = try? await AnimelibAPI.shared.rawData("/constants", query: q, site: site),
            let root = J.obj(data) as? [String: Any],
            let d = root["data"] as? [String: Any],
            let arr = d["imageServers"] as? [[String: Any]] {
