@@ -2423,12 +2423,19 @@ struct SiteWebView: UIViewRepresentable {
                   let d = t.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
             let line = "\(o["m"] as? String ?? "?") \(o["u"] as? String ?? "") [\(o["s"] as? Int ?? 0)]"
-                + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + $0 } ?? "")
+                + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + SiteWebView.mask($0) } ?? "")
             Task { @MainActor in self.log.add(line) }
         }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(log) }
+
+    /// Прячет секреты входа в теле запроса, чтобы журнал можно было спокойно пересылать.
+    nonisolated static func mask(_ s: String) -> String {
+        let pattern = #"("(?:code|code_verifier|access_token|refresh_token|token|password)"\s*:\s*")[^"]*"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "$1•••")
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
@@ -2446,6 +2453,8 @@ struct SiteWebView: UIViewRepresentable {
 
     static func dismantleUIView(_ v: WKWebView, coordinator: Coordinator) {
         v.configuration.userContentController.removeScriptMessageHandler(forName: "hlog")
+        v.stopLoading()
+        v.loadHTMLString("", baseURL: nil)
     }
 }
 
