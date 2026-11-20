@@ -1764,13 +1764,23 @@ final class FavMetaStore: ObservableObject {
     }
 
     func apply(_ a: Anime, count: Int?, date: String?) {
-        var m = items[Self.key(a)] ?? FavMeta()
-        if m.seen == nil, let n = count { m.seen = m.count ?? n }
-        if let old = m.count, let n = count, n > old { m.changed = Date() }
-        if let n = count { m.count = n }
-        if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
-        m.checked = Date()
-        items[Self.key(a)] = m
+        applyBatch([(a, count, date)])
+    }
+
+    /// Применяет сразу пачку результатов: одна запись на диск и одна перерисовка вместо десятков.
+    func applyBatch(_ results: [(Anime, Int?, String?)]) {
+        guard !results.isEmpty else { return }
+        var all = items
+        for (a, count, date) in results {
+            var m = all[Self.key(a)] ?? FavMeta()
+            if m.seen == nil, let n = count { m.seen = m.count ?? n }
+            if let old = m.count, let n = count, n > old { m.changed = Date() }
+            if let n = count { m.count = n }
+            if let d = date, let parsed = parseLibDate(d) { m.release = parsed }
+            m.checked = Date()
+            all[Self.key(a)] = m
+        }
+        items = all
         save()
     }
 
@@ -1786,6 +1796,7 @@ enum FavUpdater {
         let meta = FavMetaStore.shared
         let site = LibSite.current.key
         let todo = Array(list.prefix(80)).filter { force || meta.needsCheck($0) }
+        var results: [(Anime, Int?, String?)] = []
         var i = 0
         while i < todo.count {
             let chunk = Array(todo[i..<min(i + 4, todo.count)])
@@ -1796,9 +1807,16 @@ enum FavUpdater {
                         return (a, r.count, r.date)
                     }
                 }
-                for await (a, c, d) in group where LibSite.current.key == site { meta.apply(a, count: c, date: d) }
+                var got: [(Anime, Int?, String?)] = []
+                for await r in group { got.append(r) }
+                if LibSite.current.key == site { results += got }
             }
             i += 4
+            // Записываем пачками по 20 тайтлов: прогресс не теряется, а экран перерисовывается редко.
+            if results.count >= 20 || i >= todo.count {
+                if LibSite.current.key == site { meta.applyBatch(results) }
+                results.removeAll()
+            }
         }
     }
 
