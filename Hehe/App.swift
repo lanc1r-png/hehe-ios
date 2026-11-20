@@ -8527,7 +8527,8 @@ final class DownloadManager: ObservableObject {
     private var jobs: [Job] = []
     private var worker: Task<Void, Never>?
     private let monitor = NWPathMonitor()
-    private var expensive = false
+    /// Мобильная сеть (или режим экономии трафика): тогда тратим меньше трафика и заряда.
+    private(set) var expensive = false
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
@@ -10672,6 +10673,7 @@ struct MangaReaderView: View {
         let list = pages
         guard !list.isEmpty else { return }
         let first = min(max(start, 0), list.count - 1)
+        let cellular = DownloadManager.shared.expensive
         preloadTask = Task {
             // 1. Текущая страница, затем соседние: готовые картинки в памяти.
             _ = await MangaImageStore.shared.image(for: list[first])
@@ -10682,8 +10684,11 @@ struct MangaReaderView: View {
                 for id in near { group.addTask { _ = await MangaImageStore.shared.image(for: list[id]) } }
             }
             // 2. Дальше по главе только скачиваем, по три за раз: сначала вперёд, потом назад.
-            var rest = Array((first + 4)..<max(first + 4, list.count))
-            rest += Array((0..<max(first - 1, 0)).reversed())
+            //    По мобильной сети — только ~10 страниц вперёд: модем чаще отдыхает, заряд и трафик экономятся.
+            //    Окно сдвигается вместе с чтением, поэтому следующие страницы всё равно успевают подгрузиться.
+            let aheadEnd = cellular ? min(first + 12, list.count) : list.count
+            var rest = Array((first + 4)..<max(first + 4, aheadEnd))
+            if !cellular { rest += Array((0..<max(first - 1, 0)).reversed()) }
             var i = 0
             while i < rest.count {
                 if Task.isCancelled { return }
