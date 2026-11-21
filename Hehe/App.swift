@@ -1938,6 +1938,85 @@ final class FavMetaStore: ObservableObject {
     }
 }
 
+/// Статистика по жанрам из профиля на сайте (`/user/{id}/stats`) — отдельно для каждой платформы.
+@MainActor
+final class UserGenreStats: ObservableObject {
+    static let shared = UserGenreStats()
+    struct Genre: Codable, Hashable {
+        let name: String
+        let count: Int
+        var id: Int?
+    }
+    @Published private(set) var version = 0
+    /// Сырой ответ, если разобрать не получилось (покажем, чтобы прислать разработчику)
+    @Published private(set) var debug: [String: String] = [:]
+    private var cache: [String: [Genre]] = [:]
+    private var loadedAt: [String: Date] = [:]
+
+    private func key(_ s: String) -> String { "userstats.genres.\(s)" }
+
+    func genres(_ site: String = LibSite.current.key) -> [Genre] {
+        if let c = cache[site] { return c }
+        var v: [Genre] = []
+        if let d = UserDefaults.standard.data(forKey: key(site)),
+           let dec = try? JSONDecoder().decode([Genre].self, from: d) { v = dec }
+        cache[site] = v
+        return v
+    }
+
+    func load(userID: Int, token: String) async {
+        let site = LibSite.current.key
+        if let t = loadedAt[site], Date().timeIntervalSince(t) < 1800 { return }
+        loadedAt[site] = Date()
+        guard let data = try? await AnimelibAPI.shared.rawData("/user/\(userID)/stats", token: token),
+              let root = J.obj(data) else { return }
+        guard LibSite.current.key == site else { return }
+        let list = Self.parse(root)
+        if list.isEmpty {
+            debug[site] = String((String(data: data, encoding: .utf8) ?? "").prefix(700))
+        } else {
+            debug[site] = nil
+            cache[site] = list
+            if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: key(site)) }
+        }
+        version += 1
+    }
+
+    /// Ищем в ответе список «название — число»; список под ключом с «genre» важнее остальных.
+    static func parse(_ root: Any) -> [Genre] {
+        let nameKeys = ["rus_name", "name", "title", "label"]
+        let countKeys = ["count", "value", "total", "cnt", "items_count", "chapters_count", "titles_count", "amount"]
+        func item(_ d: [String: Any]) -> Genre? {
+            var src = d
+            for k in ["genre", "item", "model"] { if let sub = d[k] as? [String: Any] { src.merge(sub) { a, _ in a } } }
+            guard let name = nameKeys.lazy.compactMap({ J.str(src[$0]) }).first(where: { !$0.isEmpty }),
+                  let n = countKeys.lazy.compactMap({ J.int(d[$0]) ?? J.int(src[$0]) }).first else { return nil }
+            return Genre(name: name, count: n, id: J.int(src["id"]))
+        }
+        var best: (score: Int, list: [Genre]) = (0, [])
+        func walk(_ v: Any, _ path: String, _ depth: Int) {
+            guard depth < 6 else { return }
+            if let arr = v as? [[String: Any]], !arr.isEmpty {
+                let got = arr.compactMap(item)
+                if got.count >= max(2, arr.count / 2) {
+                    let score = got.count + (path.contains("genre") ? 1000 : 0) - (path.contains("tag") ? 500 : 0)
+                    if score > best.score { best = (score, got) }
+                }
+                for x in arr.prefix(3) { walk(x, path, depth + 1) }
+            } else if let o = v as? [String: Any] {
+                // вид «{"Романтика": 383, …}» под ключом с genre
+                if path.contains("genre") {
+                    let pairs = o.compactMap { k, x -> Genre? in J.int(x).map { Genre(name: k, count: $0) } }
+                    if pairs.count >= 2, pairs.count + 900 > best.score { best = (pairs.count + 900, pairs) }
+                }
+                for (k, x) in o { walk(x, path + "/" + k.lowercased(), depth + 1) }
+            }
+        }
+        walk(root, "", 0)
+        return best.list.filter { $0.count > 0 }.sorted { $0.count > $1.count }
+    }
+}
+
 /// Свои папки на сайте («Любимые», «Геншин»…) и какие тайтлы в них лежат — для чипов в «Избранном» и подборок в профиле.
 @MainActor
 final class SiteFolders: ObservableObject {
@@ -9115,6 +9194,9 @@ struct ProfileView: View {
     @ObservedObject private var activity = ActivityStore.shared
     /// Насколько прокручена страница — размытие под часами появляется, когда шапка уехала
     @State private var scrollY: CGFloat = 0
+    @ObservedObject private var genreStats = UserGenreStats.shared
+    @ObservedObject private var readStore = ReadStore.shared
+    @ObservedObject private var favMeta = FavMetaStore.shared
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     /// Папка «Прочитано/Просмотрено», если она есть
@@ -9556,53 +9638,224 @@ struct ProfileView: View {
 
     private var showcaseCard: AnyShapeStyle { cardFill }
 
-    @ViewBuilder
-    private var showcase: some View {
-        let favs = favoriteTitles
-        if !favs.isEmpty {
-            showcaseHeader("Любимые") { AppRouter.shared.openFavorites(folder: siteFolders.favorite?.id) }
-                .padding(.top, 6)
-            coverRail(Array(favs.prefix(15)))
-        }
+    private func cardBox<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 14) { c() }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(showcaseCard, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay {
+                if scheme != .dark {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
+                }
+            }
+    }
 
-        let recent = Array(history.items.prefix(10)).map { $0.anime }
-        if !recent.isEmpty {
-            showcaseHeader(book ? "Сейчас читаю" : "Сейчас смотрю")
-                .padding(.top, 6)
-            coverRail(recent)
+    /// Полоса из цветных кусков по доле (статусы, жанры)
+    private func shareBar(_ parts: [(Color, Int)]) -> some View {
+        let total = max(parts.map { $0.1 }.reduce(0, +), 1)
+        return GeometryReader { g in
+            let gaps = CGFloat(max(parts.count - 1, 0)) * 3
+            HStack(spacing: 3) {
+                ForEach(Array(parts.enumerated()), id: \.offset) { _, p in
+                    Capsule().fill(p.0.gradient)
+                        .frame(width: max(6, (g.size.width - gaps) * CGFloat(p.1) / CGFloat(total)))
+                }
+            }
         }
+        .frame(height: 12)
+    }
 
-        let genres = topGenres
-        if genres.count >= 3, let maxN = genres.first?.1 {
-            showcaseHeader("Мои жанры").padding(.top, 6)
-            VStack(spacing: 10) {
-                ForEach(genres, id: \.0) { g in
-                    HStack(spacing: 10) {
-                        Text(g.0).font(.subheadline.weight(.medium)).lineLimit(1)
-                            .frame(width: 110, alignment: .leading)
-                        GeometryReader { geo in
-                            Capsule()
-                                .fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
-                                .frame(width: max(8, geo.size.width * CGFloat(g.1) / CGFloat(maxN)))
+    // MARK: Библиотека — вместо плиток списков
+
+    private var libraryCard: some View {
+        let book = LibSite.current.isBook
+        let statusFolders: [(BookmarkFolder, ListStatus)] = ListStatus.allCases.compactMap { st in
+            vm.folders.first { ListStatus.fromFolderName($0.name) == st }.map { ($0, st) }
+        }
+        let custom = vm.folders.filter { ListStatus.fromFolderName($0.name) == nil }
+        let total = statusFolders.map { $0.0.count ?? 0 }.reduce(0, +)
+        return cardBox {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Библиотека").font(.title3.bold())
+                Spacer()
+                Text("\(total) в статусах").font(.subheadline).foregroundStyle(.secondary)
+            }
+            if total > 0 {
+                shareBar(statusFolders.filter { ($0.0.count ?? 0) > 0 }.map { ($0.1.color, $0.0.count ?? 0) })
+            }
+            // легенда: нажатие — «Избранное» с этим статусом
+            FlowLayout(spacing: 8) {
+                ForEach(statusFolders, id: \.0.id) { f, st in
+                    Button {
+                        Haptics.select()
+                        AppRouter.shared.openFavorites(status: st)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: st.badgeIcon(book: book))
+                                .font(.system(size: 9, weight: .heavy))
+                                .foregroundStyle(.white)
+                                .frame(width: 18, height: 18)
+                                .background(st.color, in: Circle())
+                            Text(f.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                            Text("\(f.count ?? 0)").font(.subheadline.weight(.bold).monospacedDigit()).foregroundStyle(.primary)
                         }
-                        .frame(height: 10)
-                        Text("\(g.1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            .frame(width: 28, alignment: .trailing)
+                        .padding(.leading, 5).padding(.trailing, 11).padding(.vertical, 5)
+                        .background(st.color.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.pressable)
+                }
+            }
+            if !custom.isEmpty {
+                Divider().opacity(0.5)
+                FlowLayout(spacing: 8) {
+                    ForEach(custom) { f in
+                        Button {
+                            Haptics.select()
+                            AppRouter.shared.openFavorites(folder: f.id)
+                        } label: {
+                            HStack(spacing: 6) {
+                                if let e = folderStyles.style(f.id)?.emoji, !e.isEmpty {
+                                    Text(e).font(.system(size: 14))
+                                } else {
+                                    Image(systemName: folderIcon(f.name)).font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(folderColor(f))
+                                }
+                                Text(f.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(1)
+                                Text("\(f.count ?? 0)").font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 11).padding(.vertical, 6)
+                            .background(Color.primary.opacity(0.07), in: Capsule())
+                        }
+                        .buttonStyle(.pressable)
+                        .contextMenu {
+                            Button { styleFolder = f } label: { Label("Цвет и эмодзи списка", systemImage: "paintpalette") }
+                        }
                     }
                 }
             }
-            .padding(16)
-            .background(showcaseCard, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         }
+    }
 
+    // MARK: Сейчас читаю — обложка, полоска прогресса, где остановился
+
+    private func progress(_ a: Anime) -> Double? {
+        if LibSite.current.isBook {
+            guard let total = favMeta.items[FavMetaStore.key(a)]?.count, total > 0 else { return nil }
+            let done = readStore.read[String(a.readKey)]?.count ?? 0
+            return done > 0 ? min(1, Double(done) / Double(total)) : nil
+        }
+        return nil
+    }
+
+    private func recentRail(_ items: [HistoryItem]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(items) { h in
+                    TitleLink(anime: h.anime) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            RemoteImage(url: h.anime.imageURL, maxPixel: 420)
+                                .frame(width: 112, height: 168)
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .overlay(alignment: .bottom) {
+                                    if let p = progress(h.anime) {
+                                        GeometryReader { g in
+                                            ZStack(alignment: .leading) {
+                                                Capsule().fill(Color.black.opacity(0.45))
+                                                Capsule().fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
+                                                    .frame(width: max(5, g.size.width * p))
+                                            }
+                                        }
+                                        .frame(height: 5)
+                                        .padding(8)
+                                    }
+                                }
+                            Text(h.anime.cardTitle).font(.footnote.weight(.semibold)).lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                            Text(h.episodeTitle).font(.caption2.weight(.medium)).foregroundStyle(Theme.accent).lineLimit(1)
+                        }
+                        .frame(width: 112, alignment: .leading)
+                    }
+                    .buttonStyle(.pressable)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+        .padding(.horizontal, -14)
+    }
+
+    // MARK: Жанры — как на сайте: полоса долей и цветные плашки
+
+    private static let genrePalette: [Color] = [
+        Color(hex: "E5615E"), Color(hex: "F07A6A"), Color(hex: "F2956A"), Color(hex: "F4B489"), Color(hex: "EFC75E"),
+        Color(hex: "BFD465"), Color(hex: "9ED6D2"), Color(hex: "8EC5E5"), Color(hex: "6C9BD8"), Color(hex: "7B5EA8")
+    ]
+
+    /// С сайта, а если он ничего не отдал — по своим тайтлам
+    private var genreList: [(String, Int, Int?)] {
+        _ = genreStats.version
+        let site = genreStats.genres()
+        if !site.isEmpty { return site.map { ($0.name, $0.count, $0.id) } }
+        return topGenres.map { ($0.0, $0.1, nil) }
+    }
+
+    private var genresCard: some View {
+        let list = genreList
+        let shown = Array(list.prefix(10))
+        let rest = list.dropFirst(10).map { $0.1 }.reduce(0, +)
+        let total = max(list.map { $0.1 }.reduce(0, +), 1)
+        var parts: [(Color, Int)] = shown.enumerated().map { (Self.genrePalette[$0.offset % Self.genrePalette.count], $0.element.1) }
+        if rest > 0 { parts.append((Color.gray.opacity(0.5), rest)) }
+        return cardBox {
+            shareBar(parts)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 10) {
+                    ForEach(Array(shown.enumerated()), id: \.offset) { i, g in
+                        Button {
+                            if let id = g.2 { AppRouter.shared.openCatalog(genre: id) }
+                        } label: {
+                            VStack(spacing: 6) {
+                                Text(g.0)
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 12).padding(.vertical, 7)
+                                    .background(Self.genrePalette[i % Self.genrePalette.count].gradient,
+                                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                HStack(spacing: 4) {
+                                    Text("\(g.1)").font(.subheadline.weight(.semibold).monospacedDigit())
+                                    Text("· \(Int((Double(g.1) / Double(total) * 100).rounded()))%")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.pressable)
+                        .disabled(g.2 == nil)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.horizontal, -16)
+            if let d = genreStats.debug[LibSite.current.key], genreStats.genres().isEmpty {
+                Text("Сайт отдал статистику в незнакомом виде, жанры посчитаны по твоим тайтлам. Пришли этот текст разработчику:")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text(d).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
+    }
+
+    // MARK: За неделю
+
+    private var weekCard: some View {
         let days = week
         let total = days.map { $0.1 }.reduce(0, +)
         let top = max(days.map { $0.1 }.max() ?? 0, 1)
-        showcaseHeader("За неделю").padding(.top, 6)
-        VStack(alignment: .leading, spacing: 12) {
-            Text(total == 0 ? "Пока ни одной \(book ? "главы" : "серии")"
-                 : "\(total) \(book ? "гл." : "эп.") за 7 дней")
-                .font(.subheadline.weight(.semibold))
+        return cardBox {
+            HStack(alignment: .firstTextBaseline) {
+                Text(total == 0 ? "Пока ни одной \(book ? "главы" : "серии")" : "\(total) \(book ? "гл." : "эп.")")
+                    .font(.title3.bold().monospacedDigit())
+                Spacer()
+                Text("за 7 дней").font(.subheadline).foregroundStyle(.secondary)
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 ForEach(Array(days.enumerated()), id: \.offset) { i, d in
                     VStack(spacing: 6) {
@@ -9620,8 +9873,116 @@ struct ProfileView: View {
             }
             .frame(height: 118, alignment: .bottom)
         }
-        .padding(16)
-        .background(showcaseCard, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    // MARK: Достижения — уровни по тому, что уже известно
+
+    private struct Achievement: Identifiable {
+        let id: String
+        let icon: String
+        let colors: [Color]
+        let title: String
+        let value: Int
+        let steps: [Int]
+        let unit: String
+        var level: Int { steps.filter { value >= $0 }.count }
+        var next: Int? { steps.first { value < $0 } }
+    }
+
+    private func achievements(_ u: ProfileUser) -> [Achievement] {
+        let chapters = activity.days.values.map { book ? $0.manga + $0.novels : $0.episodes }.reduce(0, +)
+        return [
+            Achievement(id: "streak", icon: "flame.fill", colors: [Color(hex: "FF9F0A"), Color(hex: "FF453A")],
+                        title: "Дней подряд", value: u.streak ?? 0, steps: [3, 7, 30, 100, 365], unit: "дн."),
+            Achievement(id: "read", icon: book ? "book.fill" : "play.fill", colors: [Theme.accent, Theme.accent2],
+                        title: book ? "Глав прочитано" : "Серий просмотрено", value: chapters,
+                        steps: [10, 100, 500, 1000, 5000], unit: book ? "гл." : "эп."),
+            Achievement(id: "done", icon: "trophy.fill", colors: [Color(hex: "FFD60A"), Color(hex: "FF9F0A")],
+                        title: book ? "Дочитано" : "Досмотрено", value: doneFolder?.count ?? 0,
+                        steps: [1, 10, 50, 100, 500], unit: "тайтл."),
+            Achievement(id: "library", icon: "books.vertical.fill", colors: [Color(hex: "64D2FF"), Color(hex: "0A84FF")],
+                        title: "В библиотеке", value: vm.totalTitles, steps: [10, 50, 100, 300, 1000], unit: "тайтл.")
+        ]
+    }
+
+    private func achievementCell(_ a: Achievement) -> some View {
+        let unlocked = a.level > 0
+        let lo = a.level > 0 ? a.steps[a.level - 1] : 0
+        let frac: Double = a.next.map { Double(a.value - lo) / Double(max($0 - lo, 1)) } ?? 1
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle().fill(unlocked
+                                  ? AnyShapeStyle(LinearGradient(colors: a.colors, startPoint: .topLeading, endPoint: .bottomTrailing))
+                                  : AnyShapeStyle(Color.primary.opacity(0.1)))
+                    Image(systemName: a.icon).font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(unlocked ? Color.white : Color.secondary)
+                }
+                .frame(width: 40, height: 40)
+                .overlay(alignment: .bottomTrailing) {
+                    if unlocked {
+                        Text("\(a.level)")
+                            .font(.system(size: 10, weight: .heavy, design: .rounded))
+                            .foregroundStyle(.white)
+                            .frame(width: 17, height: 17)
+                            .background(Color.black.opacity(0.75), in: Circle())
+                            .overlay(Circle().stroke(Color.white.opacity(0.6), lineWidth: 0.8))
+                            .offset(x: 3, y: 3)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(a.title).font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                    Text("\(a.value)").font(.title3.bold().monospacedDigit())
+                }
+            }
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.1))
+                    Capsule().fill(LinearGradient(colors: a.colors, startPoint: .leading, endPoint: .trailing))
+                        .frame(width: max(4, g.size.width * min(max(frac, 0), 1)))
+                }
+            }
+            .frame(height: 5)
+            Text(a.next.map { "до уровня \(a.level + 1): \($0) \(a.unit)" } ?? "максимальный уровень")
+                .font(.caption2).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(showcaseCard, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            if scheme != .dark {
+                RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func showcase(_ u: ProfileUser) -> some View {
+        let favs = favoriteTitles
+        if !favs.isEmpty {
+            showcaseHeader("Любимые") { AppRouter.shared.openFavorites(folder: siteFolders.favorite?.id) }
+                .padding(.top, 6)
+            coverRail(Array(favs.prefix(15)))
+        }
+
+        let recent = Array(history.items.prefix(10))
+        if !recent.isEmpty {
+            showcaseHeader(book ? "Сейчас читаю" : "Сейчас смотрю").padding(.top, 6)
+            recentRail(recent)
+        }
+
+        if genreList.count >= 3 {
+            showcaseHeader("Жанры").padding(.top, 6)
+            genresCard
+        }
+
+        showcaseHeader("За неделю").padding(.top, 6)
+        weekCard
+
+        showcaseHeader("Достижения").padding(.top, 6)
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+            ForEach(achievements(u)) { achievementCell($0) }
+        }
         Color.clear.frame(height: 90)
     }
 
@@ -9648,30 +10009,12 @@ struct ProfileView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
 
-                        if !vm.folders.isEmpty {
-                            let rows: [[BookmarkFolder]] = stride(from: 0, to: vm.folders.count, by: 2).map {
-                                Array(vm.folders[$0..<min($0 + 2, vm.folders.count)])
-                            }
-                            // 10. заголовок, чтобы было видно, что это списки-закладки, а не статистика
-                            HStack {
-                                Text("Мои списки").font(.title3.bold())
-                                Spacer()
-                            }
-                            .padding(.top, 6)
-                            .padding(.horizontal, 4)
-                            VStack(spacing: 10) {
-                                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                                    HStack(spacing: 10) {
-                                        ForEach(row) { folderTile($0) }
-                                    }
-                                }
-                            }
-                        }
+                        if !vm.folders.isEmpty { libraryCard }
 
                         if let e = vm.error {
                             Text(e).font(.footnote).foregroundStyle(.red)
                         }
-                        showcase
+                        showcase(u)
                     }
                     .padding(14)
                 } else if auth.token != nil {
@@ -9731,7 +10074,7 @@ struct ProfileView: View {
             // в профиле своя панель кнопок (нейтральное стекло), системная скрыта
             .toolbar(auth.user != nil ? .hidden : .visible, for: .navigationBar)
             .onPreferenceChange(ProfileScrollKey.self) { scrollY = $0 }
-            .statusBarBlur(opacity: auth.user == nil ? 1 : Double(min(1, max(0, (-scrollY - 200) / 60))))
+            .statusBarBlur(opacity: auth.user == nil ? 1 : Double(min(1, max(0, (-scrollY - 110) / 50))))
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
             .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
@@ -9748,6 +10091,7 @@ struct ProfileView: View {
                     vm.loadItems = false
                     await vm.loadFolders()
                     await SiteListSync.syncIfDue()
+                    await genreStats.load(userID: u.id, token: t)
                 }
             }
         }
