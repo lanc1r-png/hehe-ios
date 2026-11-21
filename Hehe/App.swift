@@ -1657,9 +1657,13 @@ struct CoverTintLayer: View {
     var strength: Double = 0.5
     var horizontal = false
     @State private var color: Color?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        LinearGradient(colors: [(color ?? .clear).opacity(strength), (color ?? .clear).opacity(0)],
+        // в светлой теме цвет обложки сильно разбавляется белым (светлота ~90%) — только лёгкий оттенок, без мути
+        let base = color ?? .clear
+        let c = scheme == .dark || color == nil ? base : Color(uiColor: Theme.mix(UIColor(base), .white, 0.72))
+        LinearGradient(colors: [c.opacity(strength), c.opacity(0)],
                        startPoint: horizontal ? .leading : .top, endPoint: horizontal ? .trailing : .bottom)
             .opacity(color == nil ? 0 : 1)
             .animation(.easeOut(duration: 0.6), value: color != nil)
@@ -1695,9 +1699,9 @@ enum ListStatus: String, CaseIterable, Codable {
     }
 
     /// Значок для маленькой круглой метки на обложке (без своего круга — круг рисует метка)
-    var badgeIcon: String {
+    func badgeIcon(book: Bool) -> String {
         switch self {
-        case .active: return "play.fill"
+        case .active: return book ? "bookmark.fill" : "eye.fill"   // не путать с кнопкой ▶ «Читать/Смотреть»
         case .planned: return "clock.fill"
         case .done: return "checkmark"
         case .dropped: return "xmark"
@@ -2062,7 +2066,7 @@ struct FavCard: View {
                         }
                     } label: {
                         // стеклянная подложка + цвет статуса из общей палитры
-                        Image(systemName: status?.badgeIcon ?? "tag")
+                        Image(systemName: status?.badgeIcon(book: book) ?? "tag")
                             .font(.system(size: 11, weight: .heavy))
                             .foregroundStyle(.white)
                             .frame(width: 28, height: 28)
@@ -2078,7 +2082,7 @@ struct FavCard: View {
                     .position(x: 22, y: 22)
 
                     Button(action: onContinue) {
-                        Image(systemName: "play.fill")
+                        Image(systemName: book ? "book.fill" : "play.fill")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
@@ -2121,7 +2125,7 @@ struct FavoritesView: View {
     @State private var renameText = ""
     @State private var namesTick = 0
     private let book = LibSite.current.isBook
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     private var sort: FavSort { FavSort(rawValue: sortRaw) ?? .added }
 
@@ -2147,15 +2151,20 @@ struct FavoritesView: View {
         return list
     }
 
-    private func chip(_ title: String, _ count: Int, _ on: Bool, _ action: @escaping () -> Void) -> some View {
+    private func chip(_ title: String, _ count: Int, _ on: Bool, dot: Color? = nil, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text("\(title) \(count)")
-                .font(.subheadline.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(on ? Theme.accent : Color.clear, in: Capsule())
-                .background { if !on { Capsule().fill(.ultraThinMaterial) } }
-                .foregroundStyle(on ? Color.white : Color.primary)
+            HStack(spacing: 6) {
+                // цветная точка статуса
+                if let dot {
+                    Circle().fill(on ? Color.white : dot).frame(width: 8, height: 8)
+                }
+                Text("\(title) \(count)")
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(on ? Theme.accent : Theme.chip, in: Capsule())
+            .foregroundStyle(on ? Color.white : Color.primary)
         }
         .buttonStyle(.pressable)
     }
@@ -2165,7 +2174,7 @@ struct FavoritesView: View {
             HStack(spacing: 8) {
                 chip("Все", favorites.items.count, filter == nil) { filter = nil }
                 ForEach(ListStatus.allCases, id: \.self) { st in
-                    chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st) {
+                    chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st, dot: st.color) {
                         filter = st
                     }
                     .contextMenu {
@@ -3743,16 +3752,20 @@ struct TodayHero: View {
     var body: some View {
         let dark = scheme == .dark
         let c = tint ?? Theme.accent
+        // светлая тема: светлая пастельная карточка с тёмным текстом; тёмная — насыщенная с белым
+        let pastel = Color(uiColor: Theme.mix(UIColor(c), .white, 0.78))
+        let fg: Color = dark ? .white : .primary
         ZStack {
-            // размытая обложка, поверх — её же цвет: карточка каждый день своего цвета, без тяжёлой коричневой плашки
             BlurredCover(url: anime.posterURL ?? anime.imageURL, radius: 30, scale: 1.5)
-            LinearGradient(colors: [c.opacity(dark ? 0.55 : 0.5), c.opacity(dark ? 0.8 : 0.72)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-                .allowsHitTesting(false)
-            // лёгкое затемнение только под текстом, чтобы он читался на любом цвете
-            LinearGradient(colors: [.black.opacity(0), .black.opacity(dark ? 0.35 : 0.22)],
-                           startPoint: .top, endPoint: .bottom)
-                .allowsHitTesting(false)
+            if dark {
+                LinearGradient(colors: [c.opacity(0.55), c.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .allowsHitTesting(false)
+                LinearGradient(colors: [.black.opacity(0), .black.opacity(0.35)], startPoint: .top, endPoint: .bottom)
+                    .allowsHitTesting(false)
+            } else {
+                LinearGradient(colors: [pastel.opacity(0.86), pastel.opacity(0.94)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .allowsHitTesting(false)
+            }
             HStack(spacing: 16) {
                 // обложка целиком, без обрезки
                 RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 600)
@@ -3772,13 +3785,13 @@ struct TodayHero: View {
                                 in: Capsule())
                     Text(anime.displayTitle)
                         .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(fg)
                         .lineLimit(4)
                         .minimumScaleFactor(0.8)
                         .multilineTextAlignment(.leading)
                     HStack(spacing: 8) {
                         if let r = anime.rateAvg { RatingBadge(text: r) }
-                        if let t = anime.type?.title { Text(t).foregroundStyle(.white.opacity(0.8)) }
+                        if let t = anime.type?.title { Text(t).foregroundStyle(fg.opacity(0.75)) }
                     }
                     .font(.footnote.weight(.semibold))
                     Spacer(minLength: 0)
@@ -3802,7 +3815,7 @@ struct TodayHero: View {
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.6))
-        .shadow(color: c.opacity(dark ? 0.35 : 0.3), radius: 16, y: 8)
+        .shadow(color: c.opacity(dark ? 0.35 : 0.18), radius: 16, y: 8)
         .padding(.horizontal, 14)
         .task(id: anime.id) { tint = await CoverTint.color(anime.posterURL ?? anime.imageURL) }
     }
@@ -3812,6 +3825,7 @@ struct TodayHero: View {
 struct ContinueHero: View {
     let item: HistoryItem
     @ObservedObject private var progress = ProgressStore.shared
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let book = LibSite.current.isBook
@@ -3819,7 +3833,8 @@ struct ContinueHero: View {
         let rp = book ? ReadPosStore.shared.get(item.anime.readKey) : nil
         let frac: Double? = {
             if let p, p.duration > 0, p.position > 5 { return min(p.position / p.duration, 1) }
-            if let rp, rp.c == item.episodeID, rp.pct > 0 { return Double(rp.pct) / 100 }
+            // для глав показываем полоску сразу, как только есть позиция в этой главе (даже 0%)
+            if let rp, rp.c == item.episodeID { return Double(min(max(rp.pct, 0), 100)) / 100 }
             return nil
         }()
         HStack(spacing: 14) {
@@ -3833,11 +3848,10 @@ struct ContinueHero: View {
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Text(item.episodeTitle)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.accent)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white)
                     .padding(.horizontal, 9).padding(.vertical, 4)
-                    .background(Theme.accent.opacity(0.16), in: Capsule())
-                    .overlay(Capsule().stroke(Theme.accent.opacity(0.25), lineWidth: 0.5))
+                    .background(Theme.accent, in: Capsule())
                     .lineLimit(1)
                 if let frac {
                     HStack(spacing: 8) {
@@ -3870,8 +3884,13 @@ struct ContinueHero: View {
             // за стеклом — размытая обложка тайтла
             ZStack {
                 BlurredCover(url: item.anime.posterURL ?? item.anime.imageURL, radius: 24, scale: 1.4)
-                Rectangle().fill(.ultraThinMaterial)
-                Theme.card
+                // тёмная тема — затемняем обложку, светлая — осветляем: текст читается на любой картинке
+                if scheme == .dark {
+                    Color.black.opacity(0.5)
+                } else {
+                    Rectangle().fill(.ultraThinMaterial)
+                    Color.white.opacity(0.45)
+                }
             }
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         }
@@ -3982,6 +4001,19 @@ struct HomeView: View {
             Group {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
+                        // заголовок и поиск как в «Каталоге»: крупно слева
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(LibSite.current.title).font(.largeTitle.bold())
+                            SearchBar(text: $query) {
+                                let q = query.trimmingCharacters(in: .whitespaces)
+                                guard !q.isEmpty else { return }
+                                SearchHistory.shared.add(q)
+                                router.openCatalog(query: q)
+                                query = ""
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.top, 4)
 
                         if let e = vm.error, vm.fresh.isEmpty {
                             VStack(spacing: 12) {
@@ -3997,50 +4029,33 @@ struct HomeView: View {
                                 .buttonStyle(.pressable)
                         }
 
-                        if let first = history.items.first {
+                        if !history.items.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: ranobe ? "Продолжить читать" : "Продолжить смотреть",
                                               action: { confirmClear = true }, actionTitle: "Очистить")
-                                ZStack(alignment: .topTrailing) {
-                                    Button { openContinue(first.anime) } label: { ContinueHero(item: first) }
-                                        .buttonStyle(.pressable)
-                                    Button {
-                                        Haptics.tap()
-                                        withAnimation(.easeInOut(duration: 0.25)) { history.remove(first.anime.id) }
-                                    } label: {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.title3)
-                                            .symbolRenderingMode(.palette)
-                                            .foregroundStyle(.white, Color.black.opacity(0.55))
-                                            .padding(8)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                    .padding(.horizontal, 14)
-                                    .contextMenu {
-                                        Button(role: .destructive) { history.remove(first.anime.id) } label: {
-                                            Label("Убрать из списка", systemImage: "trash")
-                                        }
-                                    }
-                                if history.items.count > 1 {
+                                // все карточки одинаковые, в карусели; следующая выглядывает краешком
+                                let list = Array(history.items.prefix(12))
+                                let w = ((UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.width ?? 390) - 28
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 12) {
-                                        ForEach(Array(history.items.dropFirst())) { h in
+                                        ForEach(list) { h in
                                             ZStack(alignment: .topTrailing) {
-                                                Button { openContinue(h.anime) } label: { ContinueCard(item: h) }
+                                                Button { openContinue(h.anime) } label: { ContinueHero(item: h) }
                                                     .buttonStyle(.pressable)
                                                 Button {
                                                     Haptics.tap()
                                                     withAnimation(.easeInOut(duration: 0.25)) { history.remove(h.anime.id) }
                                                 } label: {
-                                                    Image(systemName: "xmark.circle.fill")
-                                                        .font(.title3)
-                                                        .symbolRenderingMode(.palette)
-                                                        .foregroundStyle(.white, Color.black.opacity(0.55))
-                                                        .padding(6)
+                                                    Image(systemName: "xmark")
+                                                        .font(.system(size: 11, weight: .bold))
+                                                        .foregroundStyle(.white)
+                                                        .frame(width: 26, height: 26)
+                                                        .background(Color.black.opacity(0.45), in: Circle())
+                                                        .padding(10)
                                                 }
                                                 .buttonStyle(.plain)
                                             }
+                                            .frame(width: list.count == 1 ? w : w * 0.88)
                                             .transition(.opacity.combined(with: .scale(scale: 0.9)))
                                             .contextMenu {
                                                 Button(role: .destructive) { history.remove(h.anime.id) } label: {
@@ -4050,7 +4065,6 @@ struct HomeView: View {
                                         }
                                     }
                                     .padding(.horizontal, 14)
-                                }
                                 }
                             }
                             .confirmationDialog("Очистить список?", isPresented: $confirmClear, titleVisibility: .visible) {
@@ -4155,16 +4169,7 @@ struct HomeView: View {
                     }
                 }
             }
-            .navigationTitle(LibSite.current.title)
-            .navigationBarTitleDisplayMode(.large)
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск по названию")
-            .onSubmit(of: .search) {
-                let q = query.trimmingCharacters(in: .whitespaces)
-                guard !q.isEmpty else { return }
-                SearchHistory.shared.add(q)
-                router.openCatalog(query: q)
-                query = ""
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .navigationDestination(isPresented: $pushContinue) {
@@ -4522,7 +4527,7 @@ struct CatalogView: View {
     @State private var randomTarget: Anime?
     @State private var showRandom = false
     @State private var rolling = false
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     private func roll() {
         guard !rolling else { return }
@@ -4776,7 +4781,7 @@ final class AuthorViewModel: ObservableObject {
 struct AuthorView: View {
     let author: AuthorRef
     @StateObject private var vm: AuthorViewModel
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     init(author: AuthorRef) {
         self.author = author
@@ -7750,7 +7755,7 @@ struct FriendProfileView: View {
     @StateObject private var vm = ProfileViewModel()
     @ObservedObject private var auth = AuthStore.shared
     @ObservedObject private var local = LocalFriends.shared
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     private func folderIcon(_ name: String) -> String {
         let n = name.lowercased()
@@ -8598,7 +8603,7 @@ struct ProfileView: View {
     @State private var bannerRatio: CGFloat?
     @ObservedObject private var look = ProfileLook.shared
     @State private var showLook = false
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     /// Папка «Прочитано/Просмотрено», если она есть
     private var doneFolder: BookmarkFolder? {
@@ -14616,6 +14621,15 @@ struct HeheApp: App {
         // Неактивные вкладки — серые с оттенком акцента, а не чистые серые/чёрные
         _ = Theme.accent
         UITabBar.appearance().unselectedItemTintColor = Theme.mutedUI
+        // iOS 26+: стеклянный таб-бар берёт цвета из «внешнего вида» — меняем только цвет неактивных иконок и подписей,
+        // фон не трогаем
+        let tabLook = UITabBar.appearance().standardAppearance.copy()
+        for item in [tabLook.stackedLayoutAppearance, tabLook.inlineLayoutAppearance, tabLook.compactInlineLayoutAppearance] {
+            item.normal.iconColor = Theme.mutedUI
+            item.normal.titleTextAttributes = [.foregroundColor: Theme.mutedUI]
+        }
+        UITabBar.appearance().standardAppearance = tabLook
+        UITabBar.appearance().scrollEdgeAppearance = tabLook
         // Только выбираем режим «воспроизведение видео». Саму аудиосессию iOS включит при старте плеера:
         // музыка из других приложений не обрывается, пока ты просто листаешь каталог или читаешь.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
