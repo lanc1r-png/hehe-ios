@@ -1393,10 +1393,11 @@ enum AnimatedLoader {
 
 struct AnimatedImageView: UIViewRepresentable {
     let image: UIImage
+    var fit = false
 
     func makeUIView(context: Context) -> UIImageView {
         let v = UIImageView()
-        v.contentMode = .scaleAspectFill
+        v.contentMode = fit ? .scaleAspectFit : .scaleAspectFill
         v.clipsToBounds = true
         v.setContentHuggingPriority(.defaultLow, for: .horizontal)
         v.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -1415,12 +1416,14 @@ struct AnimatedImageView: UIViewRepresentable {
 struct AnimatedRemoteImage: View {
     let url: URL?
     var maxPixel: CGFloat = 400
+    /// Показать целиком (без обрезки), для просмотра на весь экран
+    var fit = false
     @State private var image: UIImage?
 
     var body: some View {
-        Rectangle().fill(.quaternary)
+        Rectangle().fill(fit ? AnyShapeStyle(Color.clear) : AnyShapeStyle(.quaternary))
             .overlay {
-                if let image { AnimatedImageView(image: image).transition(.opacity) }
+                if let image { AnimatedImageView(image: image, fit: fit).transition(.opacity) }
             }
             .clipped()
             .task(id: url) {
@@ -7775,6 +7778,42 @@ struct FriendProfileView: View {
     }
 }
 
+/// Иконка своего цвета, текст — обычного
+struct TintedIconLabel: LabelStyle {
+    let tint: Color
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 5) {
+            configuration.icon.foregroundStyle(tint)
+            configuration.title
+        }
+    }
+}
+
+/// Аватарка или обложка на весь экран (GIF остаётся анимированным). Нажатие или свайп закрывают.
+struct ProfileImageViewer: View {
+    struct Item: Identifiable { let url: URL; var id: String { url.absoluteString } }
+    let item: Item
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            AnimatedRemoteImage(url: item.url, maxPixel: 1600, fit: true)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { dismiss() }
+        .gesture(DragGesture(minimumDistance: 30).onEnded { if abs($0.translation.height) > 80 { dismiss() } })
+        .overlay(alignment: .topTrailing) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").font(.headline).foregroundStyle(.white)
+                    .frame(width: 44, height: 44).glassShape(Circle())
+            }
+            .padding(16)
+        }
+    }
+}
+
 struct ProfileView: View {
     @ObservedObject private var auth = AuthStore.shared
     @ObservedObject private var localFriends = LocalFriends.shared
@@ -7782,7 +7821,124 @@ struct ProfileView: View {
     @StateObject private var friendsVM = FriendsViewModel()
     @State private var showLogin = false
     @State private var confirmSignOut = false
+    /// Основной цвет обложки (или аватарки): им подкрашены фон страницы и обводка аватарки
+    @State private var tint: Color?
+    @State private var viewer: ProfileImageViewer.Item?
+    @State private var pulse = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
+    private let coverHeight: CGFloat = 280
+
+    private var ringColors: [Color] {
+        let t = tint ?? Theme.accent
+        return [t, Theme.accent, Theme.accent2, t]
+    }
+
+    /// Сколько тайтлов в папке «Прочитано/Просмотрено», если она есть
+    private var doneCount: Int? {
+        vm.folders.first {
+            let n = $0.name.lowercased()
+            return n.contains("прочитан") || n.contains("просмотрен")
+        }?.count
+    }
+
+    // MARK: шапка профиля
+    @ViewBuilder
+    private func profileHeader(_ u: ProfileUser) -> some View {
+        VStack(spacing: 0) {
+            // 1. Обложка во весь верх экрана: тянется при свайпе вниз, плавно растворяется в фоне
+            GeometryReader { g in
+                let y = g.frame(in: .named("profileScroll")).minY
+                let pull = max(0, y)
+                Group {
+                    if let c = u.cover {
+                        AnimatedRemoteImage(url: c, maxPixel: 1100)
+                    } else {
+                        LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                    }
+                }
+                .frame(width: g.size.width, height: coverHeight + pull)
+                .clipped()
+                .overlay(alignment: .top) {
+                    // затемнение сверху, чтобы читались часы и кнопки
+                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 120)
+                }
+                .mask(
+                    LinearGradient(stops: [.init(color: .black, location: 0),
+                                           .init(color: .black, location: 0.55),
+                                           .init(color: .clear, location: 1)],
+                                   startPoint: .top, endPoint: .bottom)
+                )
+                .offset(y: y > 0 ? -y : -y * 0.4)
+                .contentShape(Rectangle())
+                .onTapGesture { if let c = u.cover { viewer = .init(url: c) } }
+            }
+            .frame(height: coverHeight)
+
+            // 2. Крупная аватарка с градиентной обводкой в цветах обложки, заходит на обложку
+            ZStack {
+                // мягкая пульсация «в сети»
+                RoundedRectangle(cornerRadius: 40, style: .continuous)
+                    .stroke(AngularGradient(colors: ringColors, center: .center), lineWidth: 3)
+                    .frame(width: 136, height: 136)
+                    .scaleEffect(pulse ? 1.1 : 1)
+                    .opacity(pulse ? 0 : 0.7)
+                RoundedRectangle(cornerRadius: 38, style: .continuous)
+                    .stroke(AngularGradient(colors: ringColors, center: .center), lineWidth: 3.5)
+                    .frame(width: 132, height: 132)
+                    .shadow(color: (tint ?? Theme.accent).opacity(0.6), radius: 14)
+                AnimatedRemoteImage(url: u.avatar, maxPixel: 420)
+                    .frame(width: 118, height: 118)
+                    .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
+            }
+            .padding(.top, -96)
+            .onTapGesture { if let a = u.avatar { viewer = .init(url: a) } }
+            .onAppear {
+                withAnimation(.easeOut(duration: 2.2).repeatForever(autoreverses: false)) { pulse = true }
+            }
+
+            // 3. Имя прямо под аватаркой, без серой подложки
+            HStack(spacing: 6) {
+                Text(u.username).font(.title.bold()).lineLimit(1).minimumScaleFactor(0.7)
+                if u.premium {
+                    Image(systemName: "crown.fill").font(.headline).foregroundStyle(.yellow)
+                }
+            }
+            .padding(.top, 14)
+            .padding(.horizontal, 20)
+
+            // 4. Одна стеклянная строка статистики
+            let items: [(String, Color, String)] = [
+                u.streak.map { ("flame.fill", Color.orange, "\($0) дн.") },
+                u.level.map { ("star.fill", Color.yellow, "ур. \($0)") },
+                vm.totalTitles > 0 ? ("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles)") : nil,
+                doneCount.map { ("checkmark.circle.fill", Color.green, "\($0)") }
+            ].compactMap { $0 }
+            if !items.isEmpty {
+                HStack(spacing: 0) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { i, it in
+                        if i > 0 {
+                            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 0.5, height: 18)
+                        }
+                        Label(it.2, systemImage: it.0)
+                            .font(.subheadline.weight(.semibold))
+                            .labelStyle(TintedIconLabel(tint: it.1))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(.vertical, 12)
+                .padding(.horizontal, 6)
+                .glassCapsule()
+                .padding(.horizontal, 28)
+                .padding(.top, 12)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .task(id: u.cover ?? u.avatar) { tint = await CoverTint.color(u.cover ?? u.avatar) }
+    }
 
     private func folderIcon(_ name: String) -> String {
         let n = name.lowercased()
@@ -7879,54 +8035,9 @@ struct ProfileView: View {
             ScrollView {
                 if let u = auth.user {
                     VStack(spacing: 16) {
-                        VStack(spacing: 0) {
-                            Group {
-                                if let c = u.cover {
-                                    AnimatedRemoteImage(url: c, maxPixel: 900)
-                                } else {
-                                    LinearGradient(colors: [Theme.accent.opacity(0.55), Theme.accent.opacity(0.15)],
-                                                   startPoint: .topLeading, endPoint: .bottomTrailing)
-                                }
-                            }
-                            .frame(height: 150)
-                            .clipped()
-                            .overlay(alignment: .bottom) {
-                                LinearGradient(colors: [.clear, Theme.base.opacity(0.85)], startPoint: .top, endPoint: .bottom)
-                                    .frame(height: 70)
-                            }
-
-                            AnimatedRemoteImage(url: u.avatar, maxPixel: 360)
-                                .frame(width: 92, height: 92)
-                                .clipShape(RoundedRectangle(cornerRadius: 22))
-                                .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.base, lineWidth: 4))
-                                .overlay(alignment: .topTrailing) {
-                                    Circle().fill(Color.green)
-                                        .frame(width: 18, height: 18)
-                                        .overlay(Circle().stroke(Theme.base, lineWidth: 3))
-                                        .offset(x: 6, y: -6)
-                                }
-                                .padding(.top, -46)
-
-                            VStack(spacing: 10) {
-                                Text(u.username).font(.title2.bold())
-                                if u.premium {
-                                    Label("Premium", systemImage: "crown.fill")
-                                        .font(.caption.bold())
-                                        .foregroundStyle(.yellow)
-                                }
-                                HStack(spacing: 8) {
-                                    if let st = u.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
-                                    if let lv = u.level { stat("star.fill", .yellow, "Уровень \(lv)") }
-                                    if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
-                                }
-                            }
-                            .padding(.top, 10)
-                            .padding(.horizontal, 14)
-                            .padding(.bottom, 16)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .background(Theme.card)
-                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        profileHeader(u)
+                            .padding(.horizontal, -14)
+                            .padding(.top, -14)
 
                         friendsTile(userID: u.id)
 
@@ -8015,8 +8126,23 @@ struct ProfileView: View {
                     .padding(.top, 40)
                 }
             }
-            .background(AppBackground())
-            .navigationTitle("Профиль")
+            .coordinateSpace(name: "profileScroll")
+            .ignoresSafeArea(edges: auth.user != nil ? .top : [])
+            .background {
+                ZStack {
+                    AppBackground()
+                    if auth.user != nil, let t = tint {
+                        // вся страница слегка окрашена в цвета обложки
+                        LinearGradient(colors: [t.opacity(0.45), t.opacity(0.12), .clear],
+                                       startPoint: .top, endPoint: .bottom)
+                            .ignoresSafeArea()
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+            .fullScreenCover(item: $viewer) { ProfileImageViewer(item: $0) }
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if auth.user != nil {
