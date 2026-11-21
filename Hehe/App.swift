@@ -1938,6 +1938,41 @@ final class FavMetaStore: ObservableObject {
     }
 }
 
+/// Свои папки на сайте («Любимые», «Геншин»…) и какие тайтлы в них лежат — для чипов в «Избранном» и подборок в профиле.
+@MainActor
+final class SiteFolders: ObservableObject {
+    static let shared = SiteFolders()
+    struct Folder: Codable, Identifiable, Equatable {
+        let id: Int
+        let name: String
+        var ids: [Int]
+    }
+    /// Меняется при каждой записи — чтобы экраны перерисовались
+    @Published private(set) var version = 0
+    private var cache: [String: [Folder]] = [:]
+
+    private func key(_ s: String) -> String { "sitelists.folders.\(s)" }
+
+    /// Папки текущей платформы
+    var current: [Folder] {
+        let s = LibSite.current.key
+        if let c = cache[s] { return c }
+        var v: [Folder] = []
+        if let d = UserDefaults.standard.data(forKey: key(s)),
+           let dec = try? JSONDecoder().decode([Folder].self, from: d) { v = dec }
+        cache[s] = v
+        return v
+    }
+
+    func set(_ list: [Folder], site s: String) {
+        if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: key(s)) }
+        cache[s] = list
+        version += 1
+    }
+
+    var favorite: Folder? { current.first { $0.name.lowercased().contains("любим") } }
+}
+
 /// Списки на сайте → «Избранное» и значки статусов в «Каталоге». Не чаще раза в полчаса (по свайпу — сразу).
 @MainActor
 enum SiteListSync {
@@ -1961,8 +1996,10 @@ enum SiteListSync {
         var titles: [Anime] = []
         var status: [Int: ListStatus] = [:]
         var seenAll = Set<Int>()
+        var custom: [SiteFolders.Folder] = []
         for (fid, name) in folders {
             let st = ListStatus.fromFolderName(name)
+            var members: [Int] = []
             var seen = Set<Int>()
             var page = 1
             while page <= 40 {
@@ -1978,13 +2015,16 @@ enum SiteListSync {
                 for a in got {
                     if seenAll.insert(a.id).inserted { titles.append(a) }
                     if let st { status[a.id] = st }
+                    members.append(a.id)
                 }
                 page += 1
             }
+            if st == nil { custom.append(.init(id: fid, name: name, ids: members)) }
         }
         guard LibSite.current.key == site, !folders.isEmpty else { return }
         FavoritesStore.current.mergeFromSite(titles, siteKey: site)
         FavMetaStore.shared.applySiteStatuses(titles.map { ($0, status[$0.id]) })
+        SiteFolders.shared.set(custom, site: site)
         UserDefaults.standard.set(Date(), forKey: lastKey)
     }
 }
@@ -2268,6 +2308,11 @@ struct FavoritesView: View {
     @ObservedObject private var readStore = ReadStore.shared
     @AppStorage("fav.sort") private var sortRaw = FavSort.added.rawValue
     @State private var filter: ListStatus?
+    /// Своя папка сайта («Любимые»…) — вместо статуса
+    @State private var folderFilter: Int?
+    @ObservedObject private var siteFolders = SiteFolders.shared
+    @ObservedObject private var favRouter = AppRouter.shared
+    @ObservedObject private var folderStyles = FolderStyles.shared
     @State private var continueAnime: Anime?
     @State private var pushContinue = false
     @State private var refreshing = false
@@ -2287,6 +2332,10 @@ struct FavoritesView: View {
     private var visible: [Anime] {
         var list = favorites.items
         if let f = filter { list = list.filter { meta.status($0) == f } }
+        if let fid = folderFilter, let folder = siteFolders.current.first(where: { $0.id == fid }) {
+            let ids = Set(folder.ids)
+            list = list.filter { ids.contains($0.id) }
+        }
         switch sort {
         case .added:
             break
@@ -2323,11 +2372,12 @@ struct FavoritesView: View {
     private var chips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                chip("Все", favorites.items.count, filter == nil) { filter = nil }
+                chip("Все", favorites.items.count, filter == nil && folderFilter == nil) { filter = nil; folderFilter = nil }
                 // пустые списки не показываем (кроме выбранного)
                 ForEach(ListStatus.allCases.filter { st in filter == st || favorites.items.contains { meta.status($0) == st } }, id: \.self) { st in
                     chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st, dot: st.color) {
                         filter = st
+                        folderFilter = nil
                     }
                     .contextMenu {
                         Button {
@@ -2342,8 +2392,27 @@ struct FavoritesView: View {
                         }
                     }
                 }
+                // свои папки с сайта — после статусов
+                ForEach(siteFolders.current.filter { !$0.ids.isEmpty || folderFilter == $0.id }) { f in
+                    let have = Set(favorites.items.map { $0.id })
+                    chip(f.name, f.ids.filter { have.contains($0) }.count, folderFilter == f.id,
+                         dot: folderStyles.style(f.id)?.color ?? (f.name.lowercased().contains("любим") ? Color(red: 1, green: 0.42, blue: 0.62) : Theme.accent)) {
+                        folderFilter = f.id
+                        filter = nil
+                    }
+                }
             }
             .padding(.horizontal, 14)
+        }
+    }
+
+    /// Пришли из профиля по нажатию на плитку списка
+    private func applyPending() {
+        if favRouter.pendingFavStatus != nil || favRouter.pendingFavFolder != nil {
+            filter = favRouter.pendingFavStatus
+            folderFilter = favRouter.pendingFavFolder
+            favRouter.pendingFavStatus = nil
+            favRouter.pendingFavFolder = nil
         }
     }
 
@@ -2458,6 +2527,8 @@ struct FavoritesView: View {
             .refreshable { await refresh(force: true) }
             .statusBarBlur()
             .task { await refresh(force: false) }
+            .onAppear { applyPending() }
+            .onChange(of: favRouter.tab) { _ in applyPending() }
             .background(AppBackground())
             .alert("Название папки", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
                 TextField("Название", text: $renameText)
@@ -3505,6 +3576,15 @@ final class AppRouter: ObservableObject {
     @Published var pendingGenres: Set<Int>?
     @Published var pendingTags: Set<Int>?
     @Published var toast: String?
+    /// Избранное с фильтром: статус («Читаю»…) или своя папка сайта («Любимые»…)
+    @Published var pendingFavStatus: ListStatus?
+    @Published var pendingFavFolder: Int?
+
+    func openFavorites(status: ListStatus? = nil, folder: Int? = nil) {
+        pendingFavStatus = status
+        pendingFavFolder = folder
+        tab = 2
+    }
 
     /// Каталог с одним выбранным жанром или тегом (по нажатию на него на странице тайтла).
     func openCatalog(genre: Int? = nil, tag: Int? = nil) {
@@ -3667,9 +3747,14 @@ final class HomeViewModel: ObservableObject {
     }
 }
 
+struct ProfileScrollKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 extension View {
     /// Мягкое размытие под часами: содержимое уезжает под строку состояния, как в системных приложениях
-    func statusBarBlur() -> some View {
+    func statusBarBlur(opacity: Double = 1) -> some View {
         overlay(alignment: .top) {
             GeometryReader { g in
                 Rectangle()
@@ -3682,6 +3767,7 @@ extension View {
                     ], startPoint: .top, endPoint: .bottom))
             }
             .ignoresSafeArea(edges: .top)
+            .opacity(opacity)
             .allowsHitTesting(false)
         }
     }
@@ -7299,6 +7385,8 @@ final class ProfileViewModel: ObservableObject {
     @Published var error: String?
     @Published var debug = ""
     var totalTitles: Int { folders.compactMap { $0.count }.reduce(0, +) }
+    /// В своём профиле обложки списков больше не показываем (они в «Избранном») — тайтлы не грузим
+    var loadItems = true
 
     private var userID: Int?
     private var token: String?
@@ -7332,7 +7420,7 @@ final class ProfileViewModel: ObservableObject {
                 selected = folders.first?.id
             }
             error = nil
-            await reload()
+            if loadItems { await reload() }
         } catch {
             self.error = error.localizedDescription
         }
@@ -9021,6 +9109,12 @@ struct ProfileView: View {
     @State private var bannerRatio: CGFloat?
     @ObservedObject private var look = ProfileLook.shared
     @State private var showLook = false
+    @ObservedObject private var siteFolders = SiteFolders.shared
+    @ObservedObject private var favStore: FavoritesStore = FavoritesStore.current
+    @ObservedObject private var history: HistoryStore = HistoryStore.current
+    @ObservedObject private var activity = ActivityStore.shared
+    /// Насколько прокручена страница — размытие под часами появляется, когда шапка уехала
+    @State private var scrollY: CGFloat = 0
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14, alignment: .top)]
 
     /// Папка «Прочитано/Просмотрено», если она есть
@@ -9061,7 +9155,6 @@ struct ProfileView: View {
         }
         .padding(.top, topInset + 4)
         .padding(.trailing, 16)
-        .ignoresSafeArea(edges: .top)
     }
 
     // MARK: шапка профиля (формат 4:3, своя или с сайта)
@@ -9141,6 +9234,13 @@ struct ProfileView: View {
                 .onTapGesture { if let v = headerViewerURL(u) { viewer = .init(url: v) } }
                 .contextMenu {
                     Button { showLook = true } label: { Label("Изменить шапку и аватарку", systemImage: "paintbrush") }
+                }
+                // кнопки — часть шапки и уезжают вместе с ней
+                .overlay(alignment: .topTrailing) { topButtons(u) }
+                .background {
+                    GeometryReader { g in
+                        Color.clear.preference(key: ProfileScrollKey.self, value: g.frame(in: .named("profileScroll")).minY)
+                    }
                 }
 
             // Аватарка: одно кольцо с ровным зазором и мягким свечением
@@ -9272,8 +9372,15 @@ struct ProfileView: View {
     }
 
     private func folderTile(_ f: BookmarkFolder) -> some View {
-        let on = f.id == vm.selected
-        return Button { Haptics.select(); Task { await vm.select(f.id) } } label: {
+        // плитка открывает «Избранное» с этим списком
+        return Button {
+            Haptics.select()
+            if let st = ListStatus.fromFolderName(f.name) {
+                AppRouter.shared.openFavorites(status: st)
+            } else {
+                AppRouter.shared.openFavorites(folder: f.id)
+            }
+        } label: {
             HStack(spacing: 10) {
                 Group {
                     if let e = folderStyles.style(f.id)?.emoji, !e.isEmpty {
@@ -9298,19 +9405,9 @@ struct ProfileView: View {
             .padding(.horizontal, 14)
             .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
             .foregroundStyle(Color.primary)
-            .background {
-                // выбранный список — та же нейтральная карточка, но с подложкой и рамкой цвета своего статуса
-                ZStack {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous).fill(cardFill)
-                    if on {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous).fill(folderColor(f).opacity(0.14))
-                    }
-                }
-            }
+            .background(cardFill, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             .overlay {
-                if on {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(folderColor(f), lineWidth: 1.6)
-                } else if scheme != .dark {
+                if scheme != .dark {
                     RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
                 }
             }
@@ -9396,6 +9493,138 @@ struct ProfileView: View {
         .buttonStyle(.pressable)
     }
 
+    // MARK: подборки вместо сетки обложек
+
+    private var book: Bool { LibSite.current.isBook }
+
+    private func showcaseHeader(_ title: String, action: (() -> Void)? = nil) -> some View {
+        HStack(spacing: 4) {
+            Text(title).font(.title3.bold())
+            if action != nil {
+                Image(systemName: "chevron.right").font(.footnote.bold()).foregroundStyle(Theme.accent)
+            }
+            Spacer()
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { action?() }
+        .padding(.horizontal, 4)
+    }
+
+    private func coverRail(_ list: [Anime]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(list) { a in
+                    TitleLink(anime: a) { PosterCard(anime: a, width: 118) }
+                        .buttonStyle(.pressable)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+        .padding(.horizontal, -14)
+    }
+
+    /// Тайтлы из папки «Любимые» на сайте — твой топ
+    private var favoriteTitles: [Anime] {
+        guard let f = siteFolders.favorite else { return [] }
+        let byID = Dictionary(favStore.items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return f.ids.compactMap { byID[$0] }
+    }
+
+    /// Жанры, которые у тебя чаще всего: по избранному и недавно открытому
+    private var topGenres: [(String, Int)] {
+        var seen = Set<Int>()
+        var counts: [String: Int] = [:]
+        for a in favStore.items + history.items.map({ $0.anime }) where seen.insert(a.id).inserted {
+            for g in a.genres ?? [] where !g.title.isEmpty { counts[g.title, default: 0] += 1 }
+        }
+        return counts.sorted { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) }.prefix(5).map { ($0.key, $0.value) }
+    }
+
+    /// Последние 7 дней: сколько глав (или серий) за день
+    private var week: [(String, Int)] {
+        let cal = Calendar.current
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "EEEEEE"
+        return (0..<7).reversed().map { back in
+            let d = cal.date(byAdding: .day, value: -back, to: Date()) ?? Date()
+            let a = activity.days[ActivityStore.dayKey(d)]
+            let n = book ? ((a?.manga ?? 0) + (a?.novels ?? 0)) : (a?.episodes ?? 0)
+            return (f.string(from: d).capitalized, n)
+        }
+    }
+
+    private var showcaseCard: AnyShapeStyle { cardFill }
+
+    @ViewBuilder
+    private var showcase: some View {
+        let favs = favoriteTitles
+        if !favs.isEmpty {
+            showcaseHeader("Любимые") { AppRouter.shared.openFavorites(folder: siteFolders.favorite?.id) }
+                .padding(.top, 6)
+            coverRail(Array(favs.prefix(15)))
+        }
+
+        let recent = Array(history.items.prefix(10)).map { $0.anime }
+        if !recent.isEmpty {
+            showcaseHeader(book ? "Сейчас читаю" : "Сейчас смотрю")
+                .padding(.top, 6)
+            coverRail(recent)
+        }
+
+        let genres = topGenres
+        if genres.count >= 3, let maxN = genres.first?.1 {
+            showcaseHeader("Мои жанры").padding(.top, 6)
+            VStack(spacing: 10) {
+                ForEach(genres, id: \.0) { g in
+                    HStack(spacing: 10) {
+                        Text(g.0).font(.subheadline.weight(.medium)).lineLimit(1)
+                            .frame(width: 110, alignment: .leading)
+                        GeometryReader { geo in
+                            Capsule()
+                                .fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: max(8, geo.size.width * CGFloat(g.1) / CGFloat(maxN)))
+                        }
+                        .frame(height: 10)
+                        Text("\(g.1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .frame(width: 28, alignment: .trailing)
+                    }
+                }
+            }
+            .padding(16)
+            .background(showcaseCard, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        }
+
+        let days = week
+        let total = days.map { $0.1 }.reduce(0, +)
+        let top = max(days.map { $0.1 }.max() ?? 0, 1)
+        showcaseHeader("За неделю").padding(.top, 6)
+        VStack(alignment: .leading, spacing: 12) {
+            Text(total == 0 ? "Пока ни одной \(book ? "главы" : "серии")"
+                 : "\(total) \(book ? "гл." : "эп.") за 7 дней")
+                .font(.subheadline.weight(.semibold))
+            HStack(alignment: .bottom, spacing: 8) {
+                ForEach(Array(days.enumerated()), id: \.offset) { i, d in
+                    VStack(spacing: 6) {
+                        Text(d.1 > 0 ? "\(d.1)" : " ").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(d.1 > 0
+                                  ? AnyShapeStyle(LinearGradient(colors: [Theme.accent2, Theme.accent], startPoint: .top, endPoint: .bottom))
+                                  : AnyShapeStyle(Color.primary.opacity(0.1)))
+                            .frame(height: max(6, 80 * CGFloat(d.1) / CGFloat(top)))
+                        Text(d.0).font(.caption2.weight(i == days.count - 1 ? .bold : .regular))
+                            .foregroundStyle(i == days.count - 1 ? Theme.accent : Color.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(height: 118, alignment: .bottom)
+        }
+        .padding(16)
+        .background(showcaseCard, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        Color.clear.frame(height: 90)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -9442,25 +9671,7 @@ struct ProfileView: View {
                         if let e = vm.error {
                             Text(e).font(.footnote).foregroundStyle(.red)
                         }
-                        LazyVGrid(columns: columns, spacing: 18) {
-                            ForEach(vm.items) { anime in
-                                TitleLink(anime: anime) { AnimeCard(anime: anime) }
-                                    .buttonStyle(.pressable)
-                                    .onAppear {
-                                        if anime.id == vm.items.last?.id { Task { await vm.loadMore() } }
-                                    }
-                            }
-                        }
-                        if vm.isLoading { ProgressView() }
-                        if vm.items.isEmpty && !vm.isLoading {
-                            Text("В этом списке пока ничего нет").foregroundStyle(.secondary)
-                            if !vm.debug.isEmpty && ((vm.folders.first { $0.id == vm.selected }?.count ?? 0) > 0) {
-                                Text(vm.debug)
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+                        showcase
                     }
                     .padding(14)
                 } else if auth.token != nil {
@@ -9519,9 +9730,8 @@ struct ProfileView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
             // в профиле своя панель кнопок (нейтральное стекло), системная скрыта
             .toolbar(auth.user != nil ? .hidden : .visible, for: .navigationBar)
-            .overlay(alignment: .topTrailing) {
-                if let u = auth.user { topButtons(u) }
-            }
+            .onPreferenceChange(ProfileScrollKey.self) { scrollY = $0 }
+            .statusBarBlur(opacity: auth.user == nil ? 1 : Double(min(1, max(0, (-scrollY - 200) / 60))))
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
             .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
@@ -9535,7 +9745,9 @@ struct ProfileView: View {
                 if let u = auth.user, let t = auth.token {
                     if !friendsVM.loaded { Task { await friendsVM.load(userID: u.id, token: t) } }
                     vm.configure(userID: u.id, token: t)
+                    vm.loadItems = false
                     await vm.loadFolders()
+                    await SiteListSync.syncIfDue()
                 }
             }
         }
