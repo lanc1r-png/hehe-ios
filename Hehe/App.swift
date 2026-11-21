@@ -6116,9 +6116,40 @@ final class CommentsViewModel: ObservableObject {
         [q("post_id", String(animeID)), q("post_type", type), q("page", "1")]
     }
 
-    private func fetch(page: Int) async throws -> ([CommentItem], Bool?) {
+    /// id комментариев, пришедших по запросу конкретной страницы манги (как делает сайт: `post_page`).
+    @Published var pageIDs: [Int: Set<Int>] = [:]
+    @Published var loadingPages: Set<Int> = []
+
+    /// Загружает комментарии одной страницы главы напрямую с сервера — один быстрый запрос
+    /// вместо перебора всех комментариев главы (раньше к дальним страницам они могли не дойти).
+    func loadPostPage(_ pp: Int) async {
+        guard pageIDs[pp] == nil, !loadingPages.contains(pp) else { return }
+        loadingPages.insert(pp)
+        defer { loadingPages.remove(pp) }
+        var ids = Set<Int>()
+        var pg = 1
+        while pg <= 5 {
+            guard let (list, hasNext) = try? await fetch(page: pg, postPage: pp) else { break }
+            let known = Set(items.map { $0.id })
+            items += list.filter { !known.contains($0.id) }
+            ids.formUnion(list.map { $0.id })
+            if hasNext != true || list.isEmpty { break }
+            pg += 1
+        }
+        pageIDs[pp] = ids
+    }
+
+    func onPostPage(_ c: CommentItem, _ pp: Int) -> Bool {
+        c.page == pp || (pageIDs[pp]?.contains(c.id) ?? false)
+    }
+
+    private func fetch(page: Int, postPage: Int? = nil) async throws -> ([CommentItem], Bool?) {
         let attempts: [(String, [URLQueryItem])] = types.map {
-            ("/comments", [q("post_id", String(animeID)), q("post_type", $0), q("page", String(page))])
+            var items = [q("post_id", String(animeID)), q("post_type", $0), q("page", String(page))]
+            if let pp = postPage {
+                items += [q("post_page", String(pp)), q("sort_by", "id"), q("sort_type", "desc")]
+            }
+            return ("/comments", items)
         }
         var lastError: Error = APIError.badURL
         for (path, query) in attempts {
@@ -9966,9 +9997,20 @@ struct ChapterCommentsView: View {
                                                                    postType: "chapter"))
     }
 
-    private var hasPages: Bool { vm.items.contains { $0.page != nil } }
+    private var hasPages: Bool { pageCount > 0 || vm.items.contains { $0.page != nil } }
     private var perPage: Bool { !wholeChapter && hasPages }
-    private var onPage: [CommentItem] { vm.items.filter { $0.page == page } }
+    private var onPage: [CommentItem] { vm.items.filter { vm.onPostPage($0, page) } }
+    private var pageLoading: Bool { vm.loadingPages.contains(page) || vm.pageIDs[page] == nil }
+
+    /// Комментарии текущей страницы + соседних заранее, чтобы перелистывание в окне было мгновенным.
+    private func loadAround() {
+        let p = page
+        Task { await vm.loadPostPage(p) }
+        Task {
+            if p + 1 <= max(pageCount, p + 1) { await vm.loadPostPage(p + 1) }
+            if p > 1 { await vm.loadPostPage(p - 1) }
+        }
+    }
 
     private func syncPostPage() { vm.postPage = perPage ? page : nil }
 
@@ -10003,9 +10045,14 @@ struct ChapterCommentsView: View {
                 ScrollView {
                     VStack(spacing: 10) {
                         if perPage {
-                            CommentsList(vm: vm, filter: { $0.page == page })
-                            if onPage.isEmpty && !vm.isLoading {
-                                Text("К этой странице комментариев нет").foregroundStyle(.secondary).padding(.top, 30)
+                            let p = page
+                            CommentsList(vm: vm, filter: { vm.onPostPage($0, p) })
+                            if onPage.isEmpty {
+                                if pageLoading {
+                                    ProgressView().padding(.top, 30)
+                                } else {
+                                    Text("К этой странице комментариев нет").foregroundStyle(.secondary).padding(.top, 30)
+                                }
                             }
                         } else {
                             CommentsList(vm: vm)
@@ -10031,8 +10078,13 @@ struct ChapterCommentsView: View {
                 }
             }
             .commentSheets(vm, showCompose: $showCompose)
-            .task { await vm.loadAll(); syncPostPage() }
-            .onChange(of: page) { _ in syncPostPage() }
+            .task {
+                syncPostPage()
+                if hasPages { loadAround() }
+                // вся глава: первая порция сразу, остальное — по мере прокрутки списка
+                if vm.items.isEmpty { await vm.loadMore() }
+            }
+            .onChange(of: page) { _ in syncPostPage(); loadAround() }
             .onChange(of: wholeChapter) { _ in syncPostPage() }
         }
     }
