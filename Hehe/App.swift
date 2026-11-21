@@ -7793,6 +7793,7 @@ struct TintedIconLabel: LabelStyle {
 /// Баннер профиля в родных пропорциях: во всю ширину, высота по картинке — без растягивания и мыла.
 struct ProfileBanner: View {
     let url: URL
+    var ratio: Binding<CGFloat?>? = nil
     @State private var image: UIImage?
 
     var body: some View {
@@ -7809,9 +7810,16 @@ struct ProfileBanner: View {
             }
         }
         .task(id: url) {
-            if let c = AnimatedLoader.cached(url, 2400) { image = c; return }
+            if let c = AnimatedLoader.cached(url, 2400) {
+                image = c
+                ratio?.wrappedValue = c.size.width / max(c.size.height, 1)
+                return
+            }
             if let img = await AnimatedLoader.load(url, maxPixel: 2400, referer: LibSite.current.referer) {
-                withAnimation(.easeOut(duration: 0.25)) { image = img }
+                withAnimation(.easeOut(duration: 0.25)) {
+                    image = img
+                    ratio?.wrappedValue = img.size.width / max(img.size.height, 1)
+                }
             }
         }
     }
@@ -7852,6 +7860,8 @@ struct ProfileView: View {
     @State private var tint: Color?
     @State private var viewer: ProfileImageViewer.Item?
     @State private var pulse = false
+    /// Пропорции баннера (ширина / высота), когда он загрузился
+    @State private var bannerRatio: CGFloat?
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     /// Папка «Прочитано/Просмотрено», если она есть
@@ -7871,16 +7881,32 @@ struct ProfileView: View {
         VStack(spacing: 0) {
             // Вариант А: баннер в родных пропорциях (резкий, без растягивания),
             // а вокруг — тот же баннер, размытый и увеличенный, как подложка в Apple Music.
+            // Высокий баннер (не уже ~2.3 : 1) начинается прямо с верха экрана, без шва.
+            // Узкий баннер был бы слишком низким — он стоит ниже часов, а его верх растворяется в подложке.
+            let tall = u.cover != nil && (bannerRatio ?? 9) <= 2.3
             VStack(spacing: 0) {
-                Color.clear.frame(height: headerTop)
+                if !tall { Color.clear.frame(height: headerTop) }
                 if let c = u.cover {
-                    ProfileBanner(url: c)
+                    ProfileBanner(url: c, ratio: $bannerRatio)
                         .mask(
-                            LinearGradient(stops: [.init(color: .black, location: 0),
-                                                   .init(color: .black, location: 0.8),
-                                                   .init(color: .black.opacity(0), location: 1)],
+                            LinearGradient(stops: tall
+                                           ? [.init(color: .black, location: 0),
+                                              .init(color: .black, location: 0.78),
+                                              .init(color: .black.opacity(0), location: 1)]
+                                           : [.init(color: .black.opacity(0), location: 0),
+                                              .init(color: .black, location: 0.2),
+                                              .init(color: .black, location: 0.8),
+                                              .init(color: .black.opacity(0), location: 1)],
                                            startPoint: .top, endPoint: .bottom)
                         )
+                        .overlay(alignment: .top) {
+                            if tall {
+                                // затемнение под часами и кнопкой выхода
+                                LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
+                                    .frame(height: 120)
+                                    .allowsHitTesting(false)
+                            }
+                        }
                         .contentShape(Rectangle())
                         .onTapGesture { viewer = .init(url: c) }
                 } else {
@@ -8016,10 +8042,12 @@ struct ProfileView: View {
         return Button { Haptics.select(); Task { await vm.select(f.id) } } label: {
             HStack(spacing: 10) {
                 Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold)).frame(width: 24)
+                // одно слово — в одну строку с уменьшением (без «Люби-мые»), несколько слов — переносим по словам
+                let multiWord = f.name.trimmingCharacters(in: .whitespaces).contains(" ")
                 Text(f.name)
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
+                    .lineLimit(multiWord ? 2 : 1)
+                    .minimumScaleFactor(multiWord ? 0.85 : 0.65)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 4)
                 Text(f.count.map(String.init) ?? "")
