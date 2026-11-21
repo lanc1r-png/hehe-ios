@@ -8689,17 +8689,11 @@ struct ProfileView: View {
         HStack(spacing: 10) {
             Button { showLook = true } label: { glassCircle("pencil") }
                 .buttonStyle(.pressable)
-            Menu {
-                Button { showLook = true } label: { Label("Шапка и аватарка", systemImage: "paintbrush") }
-                if let link = URL(string: LibSite.current.referer + "ru/user/\(u.id)") {
-                    ShareLink(item: link) { Label("Поделиться профилем", systemImage: "square.and.arrow.up") }
-                }
-                Divider()
-                Button(role: .destructive) { confirmSignOut = true } label: {
-                    Label("Выйти из аккаунта", systemImage: "rectangle.portrait.and.arrow.right")
-                }
-            } label: {
-                glassCircle("ellipsis")
+            // «Поделиться» сразу открывает системное окно со ссылкой на профиль на сайте (там есть и «Скопировать»).
+            // Выход из аккаунта — в Настройках.
+            if let link = URL(string: LibSite.current.referer + "ru/user/\(u.id)") {
+                ShareLink(item: link) { glassCircle("square.and.arrow.up") }
+                    .buttonStyle(.pressable)
             }
         }
         .padding(.top, topInset + 4)
