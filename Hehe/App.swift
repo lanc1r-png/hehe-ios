@@ -8608,6 +8608,45 @@ struct ProfileView: View {
         }
     }
 
+    /// Отступ под часы (вью игнорирует безопасную зону сверху)
+    private var topInset: CGFloat {
+        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow?.safeAreaInsets.top ?? 47
+    }
+
+    /// Круглая кнопка из нейтрального стекла с белой иконкой — не окрашивается баннером
+    private func glassCircle(_ icon: String) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 44, height: 44)
+            .background(Circle().fill(Color.black.opacity(0.28)))
+            .glassShape(Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.22), lineWidth: 0.6))
+            .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
+    }
+
+    private func topButtons(_ u: ProfileUser) -> some View {
+        HStack(spacing: 10) {
+            Button { showLook = true } label: { glassCircle("pencil") }
+                .buttonStyle(.pressable)
+            Menu {
+                Button { showLook = true } label: { Label("Шапка и аватарка", systemImage: "paintbrush") }
+                if let link = URL(string: LibSite.current.referer + "ru/user/\(u.id)") {
+                    ShareLink(item: link) { Label("Поделиться профилем", systemImage: "square.and.arrow.up") }
+                }
+                Divider()
+                Button(role: .destructive) { confirmSignOut = true } label: {
+                    Label("Выйти из аккаунта", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            } label: {
+                glassCircle("ellipsis")
+            }
+        }
+        .padding(.top, topInset + 4)
+        .padding(.trailing, 16)
+        .ignoresSafeArea(edges: .top)
+    }
+
     // MARK: шапка профиля (формат 4:3, своя или с сайта)
     @ViewBuilder
     private func headerArt(_ u: ProfileUser) -> some View {
@@ -8690,8 +8729,8 @@ struct ProfileView: View {
             // Аватарка: одно кольцо с ровным зазором и мягким свечением
             let side: CGFloat = 106
             let r: CGFloat = 28
-            let gap: CGFloat = 4
-            let line: CGFloat = 3
+            let gap: CGFloat = 0   // картинка упирается прямо в рамку
+            let line: CGFloat = 3.5
             ZStack {
                 // одна обводка: медленно вращающийся градиент из акцента и цвета баннера
                 let bc = tint ?? Theme.accent2
@@ -8826,7 +8865,7 @@ struct ProfileView: View {
                         Text(e).font(.system(size: 19))
                     } else {
                         Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(on ? Color.white : folderColor(f))
+                            .foregroundStyle(folderColor(f))
                     }
                 }
                 .frame(width: 24)
@@ -8843,13 +8882,20 @@ struct ProfileView: View {
             }
             .padding(.horizontal, 14)
             .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
-            .foregroundStyle(on ? Color.white : Color.primary)
+            .foregroundStyle(Color.primary)
             .background {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(on ? AnyShapeStyle(Theme.accent) : cardFill)
+                // выбранный список — та же нейтральная карточка, но с подложкой и рамкой цвета своего статуса
+                ZStack {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous).fill(cardFill)
+                    if on {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous).fill(folderColor(f).opacity(0.14))
+                    }
+                }
             }
             .overlay {
-                if scheme != .dark && !on {
+                if on {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(folderColor(f), lineWidth: 1.6)
+                } else if scheme != .dark {
                     RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
                 }
             }
@@ -8896,10 +8942,16 @@ struct ProfileView: View {
                     if rest > 0 {
                         Text("+\(rest)")
                             .font(.caption.weight(.bold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(Theme.accent)
                             .frame(width: 40, height: 40)
-                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
-                            .overlay(Circle().stroke(Theme.base, lineWidth: 2.5))
+                            .background {
+                                ZStack {
+                                    Circle().fill(.ultraThinMaterial)
+                                    Circle().fill(Theme.accent.opacity(0.12))
+                                }
+                            }
+                            .overlay(Circle().stroke(Theme.accent.opacity(0.35), lineWidth: 1))
+                            .overlay(Circle().stroke(Theme.base, lineWidth: 2.5).padding(-1.25))
                             .offset(x: CGFloat(shownAv.count) * 26)
                     }
                 }
@@ -9050,30 +9102,13 @@ struct ProfileView: View {
             .sheet(isPresented: $showLook) { NavigationStack { ProfileAppearanceView() } }
             .sheet(item: $styleFolder) { f in FolderStyleSheet(folder: f) }
             .toolbarBackground(.hidden, for: .navigationBar)
+            // в профиле своя панель кнопок (нейтральное стекло), системная скрыта
+            .toolbar(auth.user != nil ? .hidden : .visible, for: .navigationBar)
+            .overlay(alignment: .topTrailing) {
+                if let u = auth.user { topButtons(u) }
+            }
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if let u = auth.user {
-                    // 1. вместо выхода — «Редактировать», а выход и «Поделиться» в меню «⋯»
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { showLook = true } label: { Image(systemName: "pencil") }
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Menu {
-                            Button { showLook = true } label: { Label("Шапка и аватарка", systemImage: "paintbrush") }
-                            if let link = URL(string: LibSite.current.referer + "ru/user/\(u.id)") {
-                                ShareLink(item: link) { Label("Поделиться профилем", systemImage: "square.and.arrow.up") }
-                            }
-                            Divider()
-                            Button(role: .destructive) { confirmSignOut = true } label: {
-                                Label("Выйти из аккаунта", systemImage: "rectangle.portrait.and.arrow.right")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                        }
-                    }
-                }
-            }
             .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Выйти", role: .destructive) { auth.signOut() }
                 Button("Отмена", role: .cancel) {}
