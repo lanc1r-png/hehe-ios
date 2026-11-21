@@ -40,17 +40,48 @@ enum Theme {
             cachedHex = hex
             cachedColor = Color(hex: hex)
             cachedSecondary = shifted(hex)
+            rebuildPalette(UIColor(Color(hex: hex)))
         }
+    }
+
+    /// Смешивает два цвета: t = доля второго.
+    static func mix(_ a: UIColor, _ b: UIColor, _ t: CGFloat) -> UIColor {
+        var r1: CGFloat = 0, g1: CGFloat = 0, b1: CGFloat = 0, a1: CGFloat = 0
+        var r2: CGFloat = 0, g2: CGFloat = 0, b2: CGFloat = 0, a2: CGFloat = 0
+        a.getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
+        b.getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
+        return UIColor(red: r1 + (r2 - r1) * t, green: g1 + (g2 - g1) * t, blue: b1 + (b2 - b1) * t, alpha: 1)
+    }
+
+    private static var cachedBase = Color(uiColor: .systemBackground)
+    private static var cachedCard = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+        ? UIColor(white: 1, alpha: 0.08) : UIColor(white: 0, alpha: 0.06) })
+    private static var cachedChip = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+        ? UIColor(white: 1, alpha: 0.10) : UIColor(white: 0, alpha: 0.08) })
+    /// «Серый с оттенком акцента» — для неактивных иконок и подписей
+    private(set) static var mutedUI: UIColor = .secondaryLabel
+
+    /// Палитра из акцента: светлый фон — белый с 5% акцента, тёмный — почти чёрный с оттенком акцента,
+    /// плашки и чипы в светлой теме — с лёгким оттенком акцента вместо серого.
+    private static func rebuildPalette(_ acc: UIColor) {
+        let lightBase = mix(.white, acc, 0.05)
+        let darkBase = mix(UIColor(red: 0.04, green: 0.035, blue: 0.06, alpha: 1), acc, 0.07)
+        cachedBase = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? darkBase : lightBase })
+        let lightCard = acc.withAlphaComponent(0.07)
+        cachedCard = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.08) : lightCard })
+        let lightChip = acc.withAlphaComponent(0.11)
+        cachedChip = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.10) : lightChip })
+        let lightMuted = mix(UIColor(white: 0.45, alpha: 1), acc, 0.25)
+        mutedUI = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.55) : lightMuted }
     }
 
     static var accent2: Color { refresh(); return cachedSecondary }
 
     /// Цвета, которые сами подстраиваются под светлую и тёмную тему.
-    static let card = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
-        ? UIColor(white: 1, alpha: 0.08) : UIColor(white: 0, alpha: 0.06) })
-    static let chip = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
-        ? UIColor(white: 1, alpha: 0.10) : UIColor(white: 0, alpha: 0.08) })
-    static let base = Color(uiColor: .systemBackground)
+    static var card: Color { refresh(); return cachedCard }
+    static var chip: Color { refresh(); return cachedChip }
+    static var base: Color { refresh(); return cachedBase }
+    static var muted: Color { refresh(); return Color(uiColor: mutedUI) }
 
     static var accent: Color { refresh(); return cachedColor }
 }
@@ -125,14 +156,45 @@ struct AppBackground: View {
     var body: some View {
         let dark = scheme == .dark
         ZStack {
+            // светлая: белый с 5% акцента; тёмная: почти чёрный с оттенком акцента (не чистый чёрный)
             Theme.base
-            RadialGradient(colors: [Theme.accent.opacity(dark ? 0.35 : 0.22), .clear],
-                           center: .topLeading, startRadius: 20, endRadius: 460)
-            RadialGradient(colors: [Theme.accent2.opacity(dark ? 0.24 : 0.14), .clear],
-                           center: .bottomTrailing, startRadius: 20, endRadius: 460)
+            // мягкое пятно акцента слева сверху
+            RadialGradient(colors: [Theme.accent.opacity(dark ? 0.32 : 0.16), .clear],
+                           center: UnitPoint(x: 0.05, y: 0.0), startRadius: 10, endRadius: 380)
+            // соседний оттенок справа
+            RadialGradient(colors: [Theme.accent2.opacity(dark ? 0.22 : 0.13), .clear],
+                           center: UnitPoint(x: 1.0, y: 0.18), startRadius: 10, endRadius: 340)
+            // слабое свечение у таб-бара, чтобы стеклу было что преломлять
+            RadialGradient(colors: [Theme.accent.opacity(dark ? 0.16 : 0.07), .clear],
+                           center: UnitPoint(x: 0.5, y: 1.02), startRadius: 10, endRadius: 300)
+            // зерно 2–3%: убирает полосы на плавных переходах
+            Image(uiImage: Grain.tile)
+                .resizable(resizingMode: .tile)
+                .opacity(dark ? 0.10 : 0.08)
+                .blendMode(.softLight)
+                .allowsHitTesting(false)
         }
         .ignoresSafeArea()
     }
+}
+
+/// Маленькая текстура шума, генерируется один раз.
+enum Grain {
+    static let tile: UIImage = {
+        let n = 96
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        var seed: UInt32 = 0x9E3779B9
+        for i in 0..<(n * n) {
+            seed = seed &* 1664525 &+ 1013904223
+            let v = UInt8(truncatingIfNeeded: seed >> 24)
+            px[i * 4] = v; px[i * 4 + 1] = v; px[i * 4 + 2] = v; px[i * 4 + 3] = 255
+        }
+        guard let ctx = CGContext(data: &px, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let cg = ctx.makeImage() else { return UIImage() }
+        return UIImage(cgImage: cg, scale: 2, orientation: .up)
+    }()
 }
 
 struct Chip: View {
@@ -1632,12 +1694,23 @@ enum ListStatus: String, CaseIterable, Codable {
         }
     }
 
+    /// Значок для маленькой круглой метки на обложке (без своего круга — круг рисует метка)
+    var badgeIcon: String {
+        switch self {
+        case .active: return "play.fill"
+        case .planned: return "clock.fill"
+        case .done: return "checkmark"
+        case .dropped: return "xmark"
+        }
+    }
+
+    /// Цвета статусов в одной палитре: «в процессе» — акцент, остальные — мягкие соседние тона.
     var color: Color {
         switch self {
-        case .active: return .green
-        case .planned: return .orange
-        case .done: return .blue
-        case .dropped: return .red
+        case .active: return Theme.accent
+        case .planned: return Color(red: 1.0, green: 0.70, blue: 0.36)
+        case .done: return Color(red: 0.30, green: 0.80, blue: 0.66)
+        case .dropped: return Color(red: 1.0, green: 0.45, blue: 0.56)
         }
     }
 }
@@ -1988,11 +2061,19 @@ struct FavCard: View {
                             }
                         }
                     } label: {
-                        Image(systemName: status?.icon ?? "tag")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(status?.color ?? Color.white)
+                        // стеклянная подложка + цвет статуса из общей палитры
+                        Image(systemName: status?.badgeIcon ?? "tag")
+                            .font(.system(size: 11, weight: .heavy))
+                            .foregroundStyle(.white)
                             .frame(width: 28, height: 28)
-                            .background(.ultraThinMaterial, in: Circle())
+                            .background {
+                                ZStack {
+                                    Circle().fill(.ultraThinMaterial)
+                                    Circle().fill((status?.color ?? Color.black).opacity(status == nil ? 0.25 : 0.82))
+                                }
+                            }
+                            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.6))
+                            .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
                     }
                     .position(x: 22, y: 22)
 
@@ -2001,8 +2082,9 @@ struct FavCard: View {
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
-                            .background(Theme.accent, in: Circle())
-                            .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
+                            .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 0.6))
+                            .shadow(color: Theme.accent.opacity(0.45), radius: 4, y: 1)
                     }
                     .buttonStyle(.plain)
                     .position(x: geo.size.width - 22, y: geo.size.width * 1.5 - 22)
@@ -3654,12 +3736,22 @@ struct BlurredCover: View {
 
 struct TodayHero: View {
     let anime: Anime
+    @Environment(\.colorScheme) private var scheme
+    /// Доминантный цвет обложки — им окрашена карточка (как в Apple Music)
+    @State private var tint: Color?
 
     var body: some View {
+        let dark = scheme == .dark
+        let c = tint ?? Theme.accent
         ZStack {
-            // размытый фон из той же обложки
+            // размытая обложка, поверх — её же цвет: карточка каждый день своего цвета, без тяжёлой коричневой плашки
             BlurredCover(url: anime.posterURL ?? anime.imageURL, radius: 30, scale: 1.5)
-            LinearGradient(colors: [.black.opacity(0.25), .black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [c.opacity(dark ? 0.55 : 0.5), c.opacity(dark ? 0.8 : 0.72)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                .allowsHitTesting(false)
+            // лёгкое затемнение только под текстом, чтобы он читался на любом цвете
+            LinearGradient(colors: [.black.opacity(0), .black.opacity(dark ? 0.35 : 0.22)],
+                           startPoint: .top, endPoint: .bottom)
                 .allowsHitTesting(false)
             HStack(spacing: 16) {
                 // обложка целиком, без обрезки
@@ -3674,7 +3766,10 @@ struct TodayHero: View {
                         Text("ВЫБОР ДНЯ").tracking(1.2)
                     }
                     .font(.caption2.weight(.heavy))
-                    .foregroundStyle(LinearGradient(colors: [Color(red: 1, green: 0.85, blue: 0.5), Color(red: 1, green: 0.62, blue: 0.75)], startPoint: .leading, endPoint: .trailing))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing),
+                                in: Capsule())
                     Text(anime.displayTitle)
                         .font(.title3.weight(.bold))
                         .foregroundStyle(.white)
@@ -3706,9 +3801,10 @@ struct TodayHero: View {
         .frame(height: 220)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.6))
-        .shadow(color: .black.opacity(0.3), radius: 14, y: 8)
+        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.6))
+        .shadow(color: c.opacity(dark ? 0.35 : 0.3), radius: 16, y: 8)
         .padding(.horizontal, 14)
+        .task(id: anime.id) { tint = await CoverTint.color(anime.posterURL ?? anime.imageURL) }
     }
 }
 
@@ -3738,13 +3834,25 @@ struct ContinueHero: View {
                     .multilineTextAlignment(.leading)
                 Text(item.episodeTitle)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.85))
+                    .foregroundStyle(Theme.accent)
                     .padding(.horizontal, 9).padding(.vertical, 4)
-                    .background(Color.white.opacity(0.12), in: Capsule())
+                    .background(Theme.accent.opacity(0.16), in: Capsule())
+                    .overlay(Capsule().stroke(Theme.accent.opacity(0.25), lineWidth: 0.5))
                     .lineLimit(1)
                 if let frac {
-                    ProgressView(value: frac).tint(Theme.accent)
-                    Text("\(Int(frac * 100))%").font(.caption2.weight(.semibold)).foregroundStyle(Theme.accent)
+                    HStack(spacing: 8) {
+                        // тонкая полоска прогресса цветом акцента
+                        GeometryReader { g in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.12))
+                                Capsule()
+                                    .fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
+                                    .frame(width: max(4, g.size.width * frac))
+                            }
+                        }
+                        .frame(height: 4)
+                        Text("\(Int(frac * 100))%").font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.accent)
+                    }
                 }
             }
             Spacer(minLength: 0)
@@ -3758,12 +3866,16 @@ struct ContinueHero: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: 138)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .background {
-            CoverTintLayer(url: item.anime.imageURL, strength: 0.45, horizontal: true)
-                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            // за стеклом — размытая обложка тайтла
+            ZStack {
+                BlurredCover(url: item.anime.posterURL ?? item.anime.imageURL, radius: 24, scale: 1.4)
+                Rectangle().fill(.ultraThinMaterial)
+                Theme.card
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         }
-        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
     }
 }
 
@@ -14289,6 +14401,9 @@ struct StatsView: View {
 struct HeheApp: App {
     init() {
         BackupManager.restoreOnLaunch()
+        // Неактивные вкладки — серые с оттенком акцента, а не чистые серые/чёрные
+        _ = Theme.accent
+        UITabBar.appearance().unselectedItemTintColor = Theme.mutedUI
         // Только выбираем режим «воспроизведение видео». Саму аудиосессию iOS включит при старте плеера:
         // музыка из других приложений не обрывается, пока ты просто листаешь каталог или читаешь.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
