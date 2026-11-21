@@ -9786,13 +9786,40 @@ struct ZoomableImageView: UIViewRepresentable {
         func gestureRecognizer(_ g: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
 
+        /// Жесты листания страниц, которые мы временно выключили на время свайпа вверх.
+        private var paused: [UIGestureRecognizer] = []
+
         @objc func swipe(_ g: UIPanGestureRecognizer) {
-            guard g.state == .ended, let s = g.view else { return }
-            let t = g.translation(in: s)
-            let v = g.velocity(in: s)
-            // Длинный или быстрый свайп вверх; случайное касание при листании не сработает.
-            guard abs(t.y) > abs(t.x) * 1.8 else { return }
-            if t.y < -110 || (t.y < -60 && v.y < -900) { onSwipeUp?() }
+            guard let s = g.view else { return }
+            switch g.state {
+            case .began:
+                // Палец пошёл вверх — блокируем перелистывание, пока свайп не закончится,
+                // чтобы небольшой увод вбок не перевернул страницу.
+                var v = s.superview
+                while let x = v {
+                    for r in x.gestureRecognizers ?? [] where r is UIPanGestureRecognizer && r.isEnabled {
+                        r.isEnabled = false
+                        paused.append(r)
+                    }
+                    v = x.superview
+                }
+            case .ended:
+                restore()
+                let t = g.translation(in: s)
+                let vel = g.velocity(in: s)
+                // Длинный или быстрый свайп в основном вверх (небольшой наклон допустим).
+                guard abs(t.y) > abs(t.x) * 1.2 else { return }
+                if t.y < -110 || (t.y < -60 && vel.y < -900) { onSwipeUp?() }
+            case .cancelled, .failed:
+                restore()
+            default:
+                break
+            }
+        }
+
+        private func restore() {
+            for r in paused { r.isEnabled = true }
+            paused.removeAll()
         }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { (scrollView as? FitScrollView)?.imageView }
