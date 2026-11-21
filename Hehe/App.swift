@@ -7989,6 +7989,18 @@ struct ProfileView: View {
         .task(id: u.cover ?? u.avatar) { tint = await CoverTint.color(u.cover ?? u.avatar) }
     }
 
+    private func folderIcon(_ name: String) -> String {
+        let n = name.lowercased()
+        if n.contains("любим") { return "heart.fill" }
+        if n.contains("смотрю") || n.contains("читаю") { return "play.circle.fill" }
+        if n.contains("план") { return "calendar" }
+        if n.contains("просмотр") || n.contains("прочитан") { return "checkmark.circle.fill" }
+        if n.contains("брош") { return "xmark.circle.fill" }
+        if n.contains("отлож") { return "pause.circle.fill" }
+        if n.contains("не нрав") { return "hand.thumbsdown.fill" }
+        return "bookmark.fill"
+    }
+
     private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
         Label(text, systemImage: icon)
             .font(.caption.weight(.semibold))
