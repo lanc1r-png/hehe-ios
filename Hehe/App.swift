@@ -1689,10 +1689,12 @@ enum ListStatus: String, CaseIterable, Codable {
         }
     }
 
-    var icon: String {
+    /// Единый значок статуса для всех экранов: «Читаю» — открытая книга, «Смотрю» — глаз, «В планах» — календарь,
+    /// «Прочитано/Просмотрено» — галочка, «Брошено» — крестик. Закладка — только у своих списков.
+    func icon(book: Bool) -> String {
         switch self {
-        case .active: return "play.circle.fill"
-        case .planned: return "clock.fill"
+        case .active: return book ? "book.fill" : "eye.fill"
+        case .planned: return "calendar"
         case .done: return "checkmark.circle.fill"
         case .dropped: return "xmark.circle.fill"
         }
@@ -1701,11 +1703,21 @@ enum ListStatus: String, CaseIterable, Codable {
     /// Значок для маленькой круглой метки на обложке (без своего круга — круг рисует метка)
     func badgeIcon(book: Bool) -> String {
         switch self {
-        case .active: return book ? "bookmark.fill" : "eye.fill"   // не путать с кнопкой ▶ «Читать/Смотреть»
-        case .planned: return "clock.fill"
+        case .active: return book ? "book.fill" : "eye.fill"
+        case .planned: return "calendar"
         case .done: return "checkmark"
         case .dropped: return "xmark"
         }
+    }
+
+    /// Статус по названию папки сайта («Читаю», «В планах»…) — чтобы и в профиле были те же значки и цвета
+    static func fromFolderName(_ name: String) -> ListStatus? {
+        let n = name.lowercased()
+        if n.contains("смотрю") || n.contains("читаю") { return .active }
+        if n.contains("план") { return .planned }
+        if n.contains("просмотр") || n.contains("прочитан") { return .done }
+        if n.contains("брош") { return .dropped }
+        return nil
     }
 
     /// Цвета статусов в одной палитре: «в процессе» — акцент, остальные — мягкие соседние тона.
@@ -2041,6 +2053,28 @@ struct NewInFavoritesView: View {
     }
 }
 
+/// Маленький значок статуса на обложке (тот же вид, что в «Избранном»).
+struct StatusBadge: View {
+    let status: ListStatus
+    let book: Bool
+    var body: some View {
+        Image(systemName: status.badgeIcon(book: book))
+            .font(.system(size: 10, weight: .heavy))
+            .foregroundStyle(.white)
+            .frame(width: 24, height: 24)
+            .background {
+                ZStack {
+                    Circle().fill(.ultraThinMaterial)
+                    Circle().fill(status.color.opacity(0.85))
+                }
+            }
+            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.6))
+            .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+            .padding(6)
+            .allowsHitTesting(false)
+    }
+}
+
 struct FavCard: View {
     let anime: Anime
     let status: ListStatus?
@@ -2057,7 +2091,7 @@ struct FavCard: View {
                 ZStack {
                     Menu {
                         ForEach(ListStatus.allCases, id: \.self) { st in
-                            Button { onStatus(st) } label: { Label(st.title(book: book), systemImage: st.icon) }
+                            Button { onStatus(st) } label: { Label(st.title(book: book), systemImage: st.icon(book: book)) }
                         }
                         if status != nil {
                             Button(role: .destructive) { onStatus(nil) } label: {
@@ -2082,7 +2116,7 @@ struct FavCard: View {
                     .position(x: 22, y: 22)
 
                     Button(action: onContinue) {
-                        Image(systemName: book ? "book.fill" : "play.fill")
+                        Image(systemName: "play.fill")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
@@ -3678,12 +3712,14 @@ struct ContinueCard: View {
 /// Единая плашка рейтинга: белая звезда на тёмной капсуле, как на обложках в каталоге.
 struct RatingBadge: View {
     let text: String
+    /// Плотность тёмной подложки (на светлом фоне — плотнее, чтобы не была серой)
+    var opacity: Double = 0.5
     var body: some View {
         Label(text, systemImage: "star.fill")
             .font(.caption.bold())
             .foregroundStyle(.white)
             .padding(.horizontal, 9).padding(.vertical, 4)
-            .background(Color.black.opacity(0.5), in: Capsule())
+            .background(Color.black.opacity(opacity), in: Capsule())
             .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
     }
 }
@@ -3790,7 +3826,7 @@ struct TodayHero: View {
                         .minimumScaleFactor(0.8)
                         .multilineTextAlignment(.leading)
                     HStack(spacing: 8) {
-                        if let r = anime.rateAvg { RatingBadge(text: r) }
+                        if let r = anime.rateAvg { RatingBadge(text: r, opacity: dark ? 0.5 : 0.8) }
                         if let t = anime.type?.title { Text(t).foregroundStyle(fg.opacity(0.75)) }
                     }
                     .font(.footnote.weight(.semibold))
@@ -3831,11 +3867,17 @@ struct ContinueHero: View {
         let book = LibSite.current.isBook
         let p = book ? nil : progress.get(item.episodeID)
         let rp = book ? ReadPosStore.shared.get(item.anime.readKey) : nil
+        let here = rp.flatMap { $0.c == item.episodeID ? $0 : nil }
         let frac: Double? = {
             if let p, p.duration > 0, p.position > 5 { return min(p.position / p.duration, 1) }
-            // для глав показываем полоску сразу, как только есть позиция в этой главе (даже 0%)
-            if let rp, rp.c == item.episodeID { return Double(min(max(rp.pct, 0), 100)) / 100 }
+            // манга: известно число страниц — полоска сразу; ранобэ — только с 1%, чтобы не было «0%»
+            if let r = here, let total = r.n, total > 0 { return Double(min(r.p + 1, total)) / Double(total) }
+            if let r = here, r.pct > 0 { return Double(min(r.pct, 100)) / 100 }
             return nil
+        }()
+        let progressText: String? = {
+            if let r = here, let total = r.n, total > 0 { return "стр. \(min(r.p + 1, total)) из \(total)" }
+            return frac.map { "\(Int($0 * 100))%" }
         }()
         HStack(spacing: 14) {
             RemoteImage(url: item.anime.posterURL ?? item.anime.imageURL, maxPixel: 480)
@@ -3865,7 +3907,8 @@ struct ContinueHero: View {
                             }
                         }
                         .frame(height: 4)
-                        Text("\(Int(frac * 100))%").font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.accent)
+                        Text(progressText ?? "").font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.accent)
+                            .lineLimit(1).fixedSize()
                     }
                 }
             }
@@ -3890,6 +3933,8 @@ struct ContinueHero: View {
                 } else {
                     Rectangle().fill(.ultraThinMaterial)
                     Color.white.opacity(0.45)
+                    // лёгкий пастельный оттенок обложки, как у «Выбора дня»
+                    CoverTintLayer(url: item.anime.posterURL ?? item.anime.imageURL, strength: 0.6, horizontal: true)
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
@@ -4520,6 +4565,11 @@ struct FilterSheet: View {
 }
 
 struct CatalogView: View {
+    @ObservedObject private var favMeta = FavMetaStore.shared
+    /// Статус тайтла из твоих списков — показываем маленьким значком на обложке
+    private func favStatus(_ a: Anime) -> ListStatus? {
+        FavoritesStore.current.contains(a) ? favMeta.status(a) : nil
+    }
     @StateObject private var vm = CatalogViewModel()
     @ObservedObject private var router = AppRouter.shared
     @State private var showFilters = false
@@ -4649,7 +4699,7 @@ struct CatalogView: View {
                 }
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(vm.items) { anime in
-                        TitleLink(anime: anime) { AnimeCard(anime: anime, mark: vm.showsUpdateMarks ? (vm.newIDs.contains(anime.id) ? "НОВОЕ" : "НОВАЯ ГЛАВА") : nil) }
+                        TitleLink(anime: anime) { AnimeCard(anime: anime, status: favStatus(anime), mark: vm.showsUpdateMarks ? (vm.newIDs.contains(anime.id) ? "НОВОЕ" : "НОВАЯ ГЛАВА") : nil) }
                             .buttonStyle(.pressable)
                             .task { await vm.loadNewIDs() }
                             .onAppear {
@@ -4707,6 +4757,8 @@ struct CatalogView: View {
 
 struct AnimeCard: View {
     let anime: Anime
+    /// Статус, если тайтл есть в твоих списках (значок слева сверху)
+    var status: ListStatus? = nil
     /// Пометка в правом верхнем углу («НОВОЕ» / «НОВАЯ ГЛАВА») — только в списке по последним обновлениям
     var mark: String? = nil
     var body: some View {
@@ -4717,6 +4769,9 @@ struct AnimeCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
                 .overlay(alignment: .topTrailing) {
                     if let mark { UpdateMark(text: mark) }
+                }
+                .overlay(alignment: .topLeading) {
+                    if let status { StatusBadge(status: status, book: LibSite.current.isBook) }
                 }
                 .overlay(alignment: .bottomLeading) {
                     if let r = anime.rateAvg {
@@ -8842,10 +8897,7 @@ struct ProfileView: View {
     private func folderIcon(_ name: String) -> String {
         let n = name.lowercased()
         if n.contains("любим") { return "heart.fill" }
-        if n.contains("смотрю") || n.contains("читаю") { return "play.circle.fill" }
-        if n.contains("план") { return "calendar" }
-        if n.contains("просмотр") || n.contains("прочитан") { return "checkmark.circle.fill" }
-        if n.contains("брош") { return "xmark.circle.fill" }
+        if let st = ListStatus.fromFolderName(name) { return st.icon(book: LibSite.current.isBook) }
         if n.contains("отлож") { return "pause.circle.fill" }
         if n.contains("не нрав") { return "hand.thumbsdown.fill" }
         return "bookmark.fill"
@@ -9454,6 +9506,7 @@ struct ReadPos: Codable {
     var b: Int      // ранобэ (прокрутка): номер блока
     var pct: Int    // прочитано в главе, %
     var t: Int      // когда, секунды
+    var n: Int? = nil   // манга: всего страниц в главе
 }
 
 @MainActor
@@ -11968,7 +12021,8 @@ struct MangaReaderView: View {
         guard let ch = chapter, !loading, !pages.isEmpty, pendingPage == nil else { return }
         let n = min(shown, pages.count)
         let pct = pages.count > 1 ? min(100, n * 100 / (pages.count - 1)) : 0
-        ReadPosStore.shared.set(novel.readKey, ReadPos(c: ch.id, p: n, b: 0, pct: pct, t: Int(Date().timeIntervalSince1970)))
+        ReadPosStore.shared.set(novel.readKey, ReadPos(c: ch.id, p: n, b: 0, pct: pct, t: Int(Date().timeIntervalSince1970),
+                                                       n: pages.count))
     }
 
     private var vertical: Bool {
