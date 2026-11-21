@@ -1707,10 +1707,10 @@ enum ListStatus: String, CaseIterable, Codable {
     /// Цвета статусов в одной палитре: «в процессе» — акцент, остальные — мягкие соседние тона.
     var color: Color {
         switch self {
-        case .active: return Theme.accent
-        case .planned: return Color(red: 1.0, green: 0.70, blue: 0.36)
-        case .done: return Color(red: 0.30, green: 0.80, blue: 0.66)
-        case .dropped: return Color(red: 1.0, green: 0.45, blue: 0.56)
+        case .active: return Color(red: 0.25, green: 0.80, blue: 0.48)
+        case .planned: return Color(red: 1.0, green: 0.70, blue: 0.30)
+        case .done: return Color(red: 0.35, green: 0.62, blue: 1.0)
+        case .dropped: return Color(red: 1.0, green: 0.40, blue: 0.48)
         }
     }
 }
@@ -8499,6 +8499,87 @@ struct ProfileImageViewer: View {
     }
 }
 
+/// Свой цвет или эмодзи для списков в профиле (только в приложении; попадает в резервную копию).
+@MainActor
+final class FolderStyles: ObservableObject {
+    static let shared = FolderStyles()
+    struct Style: Codable, Equatable {
+        var hex: String?
+        var emoji: String?
+        var color: Color? { hex.map { Color(hex: $0) } }
+    }
+    @Published private var items: [Int: Style] = [:]
+    private let key = "profile.folderStyles"
+
+    private init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([Int: Style].self, from: d) { items = v }
+    }
+
+    func style(_ id: Int) -> Style? { items[id] }
+
+    func set(_ id: Int, _ s: Style?) {
+        items[id] = (s?.hex == nil && (s?.emoji ?? "").isEmpty) ? nil : s
+        if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+struct FolderStyleSheet: View {
+    let folder: BookmarkFolder
+    @ObservedObject private var styles = FolderStyles.shared
+    @Environment(\.dismiss) private var dismiss
+    private let colors = ["#A78BFA", "#F472B6", "#FB7185", "#F59E0B", "#FACC15", "#34D399", "#2DD4BF", "#38BDF8", "#60A5FA", "#94A3B8"]
+    private let emojis = ["⭐️", "🔥", "💜", "❤️", "🌸", "🎮", "⚔️", "🗡️", "🐉", "👑", "😂", "😭", "🥀", "🌙", "☀️", "🍜", "📚", "🎧", "💤", "✨", "🧩", "🏆", "💀", "👻"]
+
+    var body: some View {
+        let cur = styles.style(folder.id) ?? FolderStyles.Style()
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Цвет").font(.headline)
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 5), spacing: 12) {
+                        ForEach(colors, id: \.self) { h in
+                            Button {
+                                Haptics.select()
+                                var s = cur; s.hex = (cur.hex == h ? nil : h); styles.set(folder.id, s)
+                            } label: {
+                                Circle().fill(Color(hex: h))
+                                    .frame(height: 44)
+                                    .overlay(Circle().stroke(Color.primary, lineWidth: cur.hex == h ? 3 : 0).padding(-4))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    Text("Эмодзи вместо значка").font(.headline).padding(.top, 6)
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 6), spacing: 8) {
+                        ForEach(emojis, id: \.self) { e in
+                            Button {
+                                Haptics.select()
+                                var s = cur; s.emoji = (cur.emoji == e ? nil : e); styles.set(folder.id, s)
+                            } label: {
+                                Text(e).font(.system(size: 28))
+                                    .frame(maxWidth: .infinity, minHeight: 50)
+                                    .background(cur.emoji == e ? Theme.accent.opacity(0.25) : Theme.card,
+                                                in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    Button(role: .destructive) { styles.set(folder.id, nil) } label: {
+                        Text("Сбросить").frame(maxWidth: .infinity).padding(.vertical, 12)
+                    }
+                    .padding(.top, 8)
+                }
+                .padding(20)
+            }
+            .navigationTitle(folder.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
 struct ProfileView: View {
     @ObservedObject private var auth = AuthStore.shared
     @ObservedObject private var localFriends = LocalFriends.shared
@@ -8506,10 +8587,13 @@ struct ProfileView: View {
     @StateObject private var friendsVM = FriendsViewModel()
     @State private var showLogin = false
     @State private var confirmSignOut = false
+    @State private var styleFolder: BookmarkFolder?
+    @State private var spin = false
+    @ObservedObject private var folderStyles = FolderStyles.shared
+    @Environment(\.colorScheme) private var scheme
     /// Основной цвет обложки (или аватарки): им подкрашены фон страницы и обводка аватарки
     @State private var tint: Color?
     @State private var viewer: ProfileImageViewer.Item?
-    @State private var pulse = false
     /// Пропорции баннера (ширина / высота), когда он загрузился
     @State private var bannerRatio: CGFloat?
     @ObservedObject private var look = ProfileLook.shared
@@ -8576,16 +8660,22 @@ struct ProfileView: View {
                     GeometryReader { g in
                         let y = g.frame(in: .named("profileScroll")).minY
                         let pull = max(0, y)
+                        // шапка уходит ниже рамки 4:3 и растворяется длинным мягким градиентом — без видимой границы
+                        let extra: CGFloat = 110
                         headerArt(u)
-                            .frame(width: g.size.width, height: g.size.height + pull)
+                            .frame(width: g.size.width, height: g.size.height + pull + extra)
                             .clipped()
+                            // при прокрутке вниз картинка уезжает медленнее и слегка размывается
+                            .blur(radius: y < 0 ? min(14, -y / 14) : 0)
                             .overlay(alignment: .top) {
                                 LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
                                     .frame(height: 120)
                                     .allowsHitTesting(false)
                             }
                             .mask(LinearGradient(stops: [.init(color: .black, location: 0),
-                                                         .init(color: .black, location: 0.72),
+                                                         .init(color: .black, location: 0.5),
+                                                         .init(color: .black.opacity(0.6), location: 0.7),
+                                                         .init(color: .black.opacity(0.2), location: 0.86),
                                                          .init(color: .black.opacity(0), location: 1)],
                                                  startPoint: .top, endPoint: .bottom))
                             .offset(y: y > 0 ? -y : -y * 0.35)
@@ -8603,15 +8693,14 @@ struct ProfileView: View {
             let gap: CGFloat = 4
             let line: CGFloat = 3
             ZStack {
+                // одна обводка: медленно вращающийся градиент из акцента и цвета баннера
+                let bc = tint ?? Theme.accent2
                 RoundedRectangle(cornerRadius: r + gap + line / 2, style: .continuous)
-                    .stroke(LinearGradient(colors: [tint ?? Theme.accent, Theme.accent2],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                    .stroke(AngularGradient(gradient: Gradient(colors: [Theme.accent, bc, Theme.accent2, bc, Theme.accent]),
+                                            center: .center, angle: .degrees(spin ? 360 : 0)),
                             lineWidth: line)
                     .frame(width: side + 2 * gap + line, height: side + 2 * gap + line)
-                    .shadow(color: (tint ?? Theme.accent).opacity(pulse ? 0.65 : 0.25), radius: pulse ? 14 : 8)
-                RoundedRectangle(cornerRadius: r + gap, style: .continuous)
-                    .fill(Color.black.opacity(0.35))
-                    .frame(width: side + 2 * gap, height: side + 2 * gap)
+                    .shadow(color: bc.opacity(0.45), radius: 10)
                 Group {
                     if let a = look.activeAvatar {
                         ProfileMediaView(media: a, maxPixel: 420)
@@ -8631,7 +8720,7 @@ struct ProfileView: View {
                 Button { showLook = true } label: { Label("Изменить шапку и аватарку", systemImage: "paintbrush") }
             }
             .onAppear {
-                withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { pulse = true }
+                withAnimation(.linear(duration: 14).repeatForever(autoreverses: false)) { spin = true }
             }
 
             HStack(spacing: 6) {
@@ -8648,7 +8737,7 @@ struct ProfileView: View {
                 u.streak.map { ("flame.fill", Color.orange, "\($0)", "дней подряд") },
                 u.level.map { ("star.fill", Color.yellow, "\($0)", "уровень") },
                 vm.totalTitles > 0 ? ("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles)", "тайтлов") : nil,
-                doneFolder.map { ("checkmark.circle.fill", Color.green, "\($0.count ?? 0)", $0.name.lowercased()) }
+                doneFolder.map { ("trophy.fill", Color(red: 1, green: 0.76, blue: 0.3), "\($0.count ?? 0)", "завершено") }
             ].compactMap { $0 }
             if !items.isEmpty {
                 HStack(spacing: 0) {
@@ -8674,12 +8763,36 @@ struct ProfileView: View {
                 .padding(.vertical, 12)
                 .padding(.horizontal, 8)
                 .glassShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                // лёгкая подсветка цветом баннера: у каждого профиля свой оттенок
+                .background((tint ?? Theme.accent).opacity(scheme == .dark ? 0.16 : 0.12),
+                            in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke((tint ?? Theme.accent).opacity(0.3), lineWidth: 0.6))
                 .padding(.horizontal, 20)
                 .padding(.top, 12)
             }
         }
         .frame(maxWidth: .infinity)
         .task(id: tintSource(u)) { tint = await CoverTint.color(tintSource(u)) }
+    }
+
+    /// Цвет иконки списка: системные списки — по статусу, свои — выбранный цвет.
+    private func folderColor(_ f: BookmarkFolder) -> Color {
+        if let c = folderStyles.style(f.id)?.color { return c }
+        let n = f.name.lowercased()
+        if n.contains("смотрю") || n.contains("читаю") { return ListStatus.active.color }
+        if n.contains("план") { return ListStatus.planned.color }
+        if n.contains("просмотр") || n.contains("прочитан") { return ListStatus.done.color }
+        if n.contains("брош") { return ListStatus.dropped.color }
+        if n.contains("любим") { return Color(red: 1, green: 0.42, blue: 0.62) }
+        if n.contains("отлож") { return Color(red: 0.55, green: 0.62, blue: 0.8) }
+        if n.contains("не нрав") { return .gray }
+        return Theme.accent
+    }
+
+    private var cardFill: AnyShapeStyle {
+        // светлая тема: белое стекло плотнее, тёмная — как было
+        scheme == .dark ? AnyShapeStyle(Theme.card) : AnyShapeStyle(Color.white.opacity(0.72))
     }
 
     private func folderIcon(_ name: String) -> String {
@@ -8708,7 +8821,15 @@ struct ProfileView: View {
         let on = f.id == vm.selected
         return Button { Haptics.select(); Task { await vm.select(f.id) } } label: {
             HStack(spacing: 10) {
-                Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold)).frame(width: 24)
+                Group {
+                    if let e = folderStyles.style(f.id)?.emoji, !e.isEmpty {
+                        Text(e).font(.system(size: 19))
+                    } else {
+                        Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(on ? Color.white : folderColor(f))
+                    }
+                }
+                .frame(width: 24)
                 // одно слово — в одну строку с уменьшением (без «Люби-мые»), несколько слов — переносим по словам
                 let multiWord = f.name.trimmingCharacters(in: .whitespaces).contains(" ")
                 Text(f.name)
@@ -8725,15 +8846,25 @@ struct ProfileView: View {
             .foregroundStyle(on ? Color.white : Color.primary)
             .background {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(on ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.card))
+                    .fill(on ? AnyShapeStyle(Theme.accent) : cardFill)
+            }
+            .overlay {
+                if scheme != .dark && !on {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
+                }
             }
         }
         .buttonStyle(.pressable)
+        .contextMenu {
+            Button { styleFolder = f } label: { Label("Цвет и эмодзи списка", systemImage: "paintpalette") }
+        }
     }
 
     private func friendsTile(userID: Int) -> some View {
         let list = FriendsViewModel.merged(friendsVM.friends, localFriends.items)
-        let shownAv = Array(list.prefix(4))
+        // три аватарки и кружок «+N», если друзей больше
+        let shownAv = Array(list.prefix(list.count > 4 ? 3 : 4))
+        let rest = list.count - shownAv.count
         let online = list.filter { $0.online == true }.count
         return NavigationLink {
             FriendsView(userID: userID, vm: friendsVM)
@@ -8747,14 +8878,32 @@ struct ProfileView: View {
                             .background(Theme.accent.opacity(0.18), in: Circle())
                     }
                     ForEach(Array(shownAv.enumerated()), id: \.element.id) { i, f in
-                        AnimatedRemoteImage(url: f.avatar, maxPixel: 120)
+                        Group {
+                            if f.avatar != nil {
+                                AnimatedRemoteImage(url: f.avatar, maxPixel: 120)
+                            } else {
+                                Image(systemName: "person.fill").font(.system(size: 16))
+                                    .foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                    .background(Theme.accent.opacity(0.6))
+                            }
+                        }
+                        .frame(width: 40, height: 40)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(Theme.base, lineWidth: 2.5))
+                        .offset(x: CGFloat(i) * 26)
+                    }
+                    if rest > 0 {
+                        Text("+\(rest)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
                             .frame(width: 40, height: 40)
-                            .clipShape(Circle())
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
                             .overlay(Circle().stroke(Theme.base, lineWidth: 2.5))
-                            .offset(x: CGFloat(i) * 26)
+                            .offset(x: CGFloat(shownAv.count) * 26)
                     }
                 }
-                .frame(width: shownAv.isEmpty ? 44 : CGFloat(shownAv.count - 1) * 26 + 40, height: 44, alignment: .leading)
+                .frame(width: shownAv.isEmpty ? 44 : CGFloat(shownAv.count + (rest > 0 ? 1 : 0) - 1) * 26 + 40, height: 44, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Друзья").font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
@@ -8770,7 +8919,12 @@ struct ProfileView: View {
                 Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
             }
             .padding(14)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background(cardFill, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay {
+                if scheme != .dark {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
+                }
+            }
         }
         .buttonStyle(.pressable)
     }
@@ -8802,6 +8956,13 @@ struct ProfileView: View {
                             let rows: [[BookmarkFolder]] = stride(from: 0, to: vm.folders.count, by: 2).map {
                                 Array(vm.folders[$0..<min($0 + 2, vm.folders.count)])
                             }
+                            // 10. заголовок, чтобы было видно, что это списки-закладки, а не статистика
+                            HStack {
+                                Text("Мои списки").font(.title3.bold())
+                                Spacer()
+                            }
+                            .padding(.top, 6)
+                            .padding(.horizontal, 4)
                             VStack(spacing: 10) {
                                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                                     HStack(spacing: 10) {
@@ -8887,13 +9048,29 @@ struct ProfileView: View {
             }
             .fullScreenCover(item: $viewer) { ProfileImageViewer(item: $0) }
             .sheet(isPresented: $showLook) { NavigationStack { ProfileAppearanceView() } }
+            .sheet(item: $styleFolder) { f in FolderStyleSheet(folder: f) }
             .toolbarBackground(.hidden, for: .navigationBar)
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if auth.user != nil {
+                if let u = auth.user {
+                    // 1. вместо выхода — «Редактировать», а выход и «Поделиться» в меню «⋯»
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button { confirmSignOut = true } label: { Image(systemName: "rectangle.portrait.and.arrow.right") }
+                        Button { showLook = true } label: { Image(systemName: "pencil") }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Button { showLook = true } label: { Label("Шапка и аватарка", systemImage: "paintbrush") }
+                            if let link = URL(string: LibSite.current.referer + "ru/user/\(u.id)") {
+                                ShareLink(item: link) { Label("Поделиться профилем", systemImage: "square.and.arrow.up") }
+                            }
+                            Divider()
+                            Button(role: .destructive) { confirmSignOut = true } label: {
+                                Label("Выйти из аккаунта", systemImage: "rectangle.portrait.and.arrow.right")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                        }
                     }
                 }
             }
