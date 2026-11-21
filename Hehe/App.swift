@@ -828,7 +828,8 @@ actor AnimelibAPI {
 
     /// «По рейтингу» без тайтлов с парой оценок: иначе наверх попадает всё, что оценили один-два человека на десятку.
     func catalogRated(filter: CatalogFilter, startPage: Int) async throws -> (items: [Anime], hasNext: Bool, next: Int) {
-        let minVotes = LibSite.current.isBook ? 20 : 100
+        // мало оценок — не «лучшее»: иначе наверху тайтлы с парой десяток
+        let minVotes = LibSite.current.isBook ? 300 : 500
         var page = startPage
         var out: [Anime] = []
         var firstRaw: [Anime] = []
@@ -2161,11 +2162,12 @@ struct NewInFavoritesView: View {
 struct StatusBadge: View {
     let status: ListStatus
     let book: Bool
+    var size: CGFloat = 24
     var body: some View {
         Image(systemName: status.badgeIcon(book: book))
-            .font(.system(size: 10, weight: .heavy))
+            .font(.system(size: size * 0.42, weight: .heavy))
             .foregroundStyle(.white)
-            .frame(width: 24, height: 24)
+            .frame(width: size, height: size)
             .background {
                 ZStack {
                     Circle().fill(.ultraThinMaterial)
@@ -2174,9 +2176,17 @@ struct StatusBadge: View {
             }
             .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.6))
             .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
-            .padding(6)
+            .padding(size < 24 ? 4 : 6)
             .allowsHitTesting(false)
     }
+}
+
+/// «12 тыс.», «1,2 млн», «850»
+func fmtVotes(_ n: Int) -> String {
+    if n >= 1_000_000 { return String(format: "%.1f млн", Double(n) / 1_000_000).replacingOccurrences(of: ".", with: ",") }
+    if n >= 10_000 { return "\(n / 1000) тыс." }
+    if n >= 1000 { return String(format: "%.1f тыс.", Double(n) / 1000).replacingOccurrences(of: ".", with: ",") }
+    return "\(n)"
 }
 
 struct FavCard: View {
@@ -3635,7 +3645,7 @@ final class HomeViewModel: ObservableObject {
                     ImageLoader.prefetch(list.prefix(1).compactMap { $0.posterURL }, maxPixel: 720)
                     ImageLoader.prefetch(list.dropFirst().prefix(14).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
                 case .top:
-                    ImageLoader.prefetch(list.prefix(6).compactMap { $0.posterURL }, maxPixel: AnimeRow.thumbPixels)
+                    ImageLoader.prefetch(list.prefix(10).compactMap { $0.imageURL }, maxPixel: 480)
                 }
             }
         }
@@ -3833,13 +3843,22 @@ struct AnimeRow: View {
     var rank: Int? = nil
     /// Лёгкий вид без плашки: обложка, название, рейтинг.
     var light = false
+    /// Статус из твоих списков — маленький значок на обложке
+    var status: ListStatus? = nil
+    /// Показать число оценок рядом с рейтингом
+    var showVotes = false
+
+    private var subtitle: String {
+        [anime.type?.title, anime.status?.title, LibSite.current.isBook ? nil : anime.episodesCount.map { "\($0) эп." }]
+            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
 
     var body: some View {
         HStack(spacing: 12) {
             if let rank {
                 if light {
                     Text("\(rank)")
-                        .font(.system(size: 30, weight: .heavy, design: .rounded))
+                        .font(.system(size: rank >= 10 ? 22 : 28, weight: .heavy, design: .rounded))
                         .foregroundStyle(rank <= 3
                                          ? AnyShapeStyle(LinearGradient(colors: [Theme.accent, Theme.accent2],
                                                                         startPoint: .top, endPoint: .bottom))
@@ -3847,7 +3866,7 @@ struct AnimeRow: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.5)
                         .fixedSize(horizontal: false, vertical: true)
-                        .frame(width: 46)
+                        .frame(width: 38)
                 } else {
                     Text("\(rank)")
                         .font(.headline.bold())
@@ -3856,29 +3875,48 @@ struct AnimeRow: View {
                 }
             }
             RemoteImage(url: light ? anime.posterURL : anime.imageURL, maxPixel: AnimeRow.thumbPixels)
-                .frame(width: light ? 62 : 52, height: light ? 93 : 78)
-                .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
-            VStack(alignment: .leading, spacing: 4) {
+                .frame(width: 52, height: 78)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(alignment: .topLeading) {
+                    if let status { StatusBadge(status: status, book: LibSite.current.isBook, size: 18) }
+                }
+            VStack(alignment: .leading, spacing: 3) {
                 Text(anime.cardTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                Text([anime.type?.title, LibSite.current.isBook ? nil : anime.episodesCount.map { "\($0) эп." }]
-                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 6)
             if let r = anime.rateAvg {
-                RatingBadge(text: r)
+                if light {
+                    // в списке — просто звезда и цифра: капсула нужна только поверх пёстрой обложки
+                    VStack(alignment: .trailing, spacing: 1) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "star.fill").font(.caption2).foregroundStyle(Theme.accent)
+                            Text(r).font(.subheadline.weight(.semibold).monospacedDigit())
+                        }
+                        if showVotes, let v = anime.rateVotes, v > 0 {
+                            Text(fmtVotes(v)).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .fixedSize()
+                } else {
+                    RatingBadge(text: r)
+                }
             }
         }
-        .padding(light ? EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0) : EdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10))
+        .padding(light ? EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0) : EdgeInsets(top: 10, leading: 10, bottom: 10, trailing: 10))
         .background {
             if !light { RoundedRectangle(cornerRadius: 16).fill(Theme.card) }
         }
         .overlay(alignment: .bottom) {
-            if light { Divider().opacity(0.5).padding(.leading, 34) }
+            if light { Divider().opacity(0.5).padding(.leading, 50) }
         }
         .contentShape(Rectangle())
     }
@@ -4223,6 +4261,14 @@ struct ContinueHero: View {
 struct WideCard: View {
     let anime: Anime
     var mark: String? = nil
+    @ObservedObject private var fresh = FreshInfo.shared
+
+    private var meta: String {
+        let g = (anime.genres ?? []).map { $0.title }.filter { !$0.isEmpty }.prefix(2)
+        var parts: [String] = g.isEmpty ? [anime.status?.title].compactMap { $0 }.filter { !$0.isEmpty } : Array(g)
+        if let n = fresh.get(anime)?.count, n > 0 { parts.append(LibSite.current.isBook ? "\(n) гл." : "\(n) эп.") }
+        return parts.joined(separator: " · ")
+    }
     var body: some View {
         HStack(spacing: 12) {
             RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 420)
@@ -4236,12 +4282,17 @@ struct WideCard: View {
                 if let t = anime.type?.title {
                     Text(t).font(.caption).foregroundStyle(.secondary)
                 }
+                if !meta.isEmpty {
+                    Text(meta).font(.caption).foregroundStyle(Theme.accent).lineLimit(2)
+                }
                 Spacer(minLength: 0)
                 HStack(spacing: 6) {
                     if let r = anime.rateAvg { RatingBadge(text: r) }
                     if let mark {
-                        Text(mark)
-                            .font(.system(size: 10, weight: .heavy))
+                        Text(mark == "НОВОЕ" ? "Новое" : "Глава")
+                            .font(.system(size: 11, weight: .heavy))
+                            .lineLimit(1)
+                            .fixedSize()
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .foregroundStyle(.white)
                             .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing), in: Capsule())
@@ -4258,11 +4309,49 @@ struct WideCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         }
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
+        .task(id: anime.id) { await fresh.load(anime) }
     }
 }
 
 struct HomeView: View {
     @StateObject private var vm = HomeViewModel()
+    @ObservedObject private var favMeta = FavMetaStore.shared
+    private func favStatus(_ a: Anime) -> ListStatus? {
+        FavoritesStore.current.contains(a) ? favMeta.status(a) : nil
+    }
+
+    /// «Лучшее по рейтингу»: лента обложек с местом, чтобы не сливалось со списком «Сейчас читают»
+    private func rankedRail(_ list: [Anime]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(Array(list.enumerated()), id: \.element.id) { i, a in
+                    TitleLink(anime: a) {
+                        PosterCard(anime: a, width: 128)
+                            .overlay(alignment: .topLeading) {
+                                Text("\(i + 1)")
+                                    .font(.system(size: 15, weight: .heavy, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .frame(minWidth: 28, minHeight: 28)
+                                    .background {
+                                        if i < 3 {
+                                            Circle().fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .top, endPoint: .bottom))
+                                        } else {
+                                            Circle().fill(Color.black.opacity(0.7))
+                                        }
+                                    }
+                                    .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.6))
+                                    .padding(6)
+                            }
+                            .overlay(alignment: .topTrailing) {
+                                if let st = favStatus(a) { StatusBadge(status: st, book: LibSite.current.isBook) }
+                            }
+                    }
+                    .buttonStyle(.pressable)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+    }
     @ObservedObject private var history: HistoryStore = HistoryStore.current
     @ObservedObject private var router = AppRouter.shared
     @State private var query = ""
@@ -4413,63 +4502,41 @@ struct HomeView: View {
                                             .buttonStyle(.pressable)
                                             .padding(.bottom, 8)
                                     }
-                                    ForEach(Array(vm.popular.enumerated()).dropFirst(), id: \.element.id) { i, a in
-                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true) }
+                                    // на главной — только первая десятка, весь список открывается в Каталоге
+                                    ForEach(Array(vm.popular.prefix(10).enumerated()).dropFirst(), id: \.element.id) { i, a in
+                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true, status: favStatus(a)) }
                                             .buttonStyle(.pressable)
                                     }
-                                    if vm.canLoadMorePopular {
-                                        Button { Task { await vm.morePopular() } } label: {
-                                            Group {
-                                                if vm.loadingMore { ProgressView() } else { Text("Показать ещё") }
-                                            }
-                                            .font(.subheadline.weight(.semibold))
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 12)
-                                            .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
+                                    Button { router.openCatalog(sort: .views) } label: {
+                                        HStack(spacing: 6) {
+                                            Text("Весь список")
+                                            Image(systemName: "chevron.right").font(.caption.weight(.bold))
                                         }
-                                        .buttonStyle(.pressable)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(Theme.accent)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(Theme.card, in: RoundedRectangle(cornerRadius: 14))
                                     }
+                                    .buttonStyle(.pressable)
+                                    .padding(.top, 10)
                                 }
                                 .padding(.horizontal, 14)
                             }
                         }
 
+                        // только новые тайтлы: вышедшие главы уже в «Свежих главах» наверху
                         if !vm.newest.isEmpty {
-                            if ranobe {
-                                // «Последние обновления»: новые тайтлы вперемешку с тайтлами, где вышла новая глава
-                                let newIDs = Set(vm.newest.map { $0.id })
-                                let merged: [Anime] = {
-                                    var out: [Anime] = []
-                                    let a = vm.newest, b = vm.fresh
-                                    for i in 0..<max(a.count, b.count) {
-                                        if i < b.count { out.append(b[i]) }
-                                        if i < a.count { out.append(a[i]) }
-                                    }
-                                    var seen = Set<Int>()
-                                    return out.filter { seen.insert($0.id).inserted }
-                                }()
-                                VStack(alignment: .leading, spacing: 10) {
-                                    SectionHeader(title: "Последние обновления") { router.openCatalog(sort: .lastEpisode) }
-                                    wideRail(Array(merged.prefix(24)), newIDs: newIDs)
-                                }
-                            } else {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
-                                    wideRail(vm.newest)
-                                }
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Новинки") { router.openCatalog(sort: .newest) }
+                                wideRail(vm.newest)
                             }
                         }
 
                         if !vm.top.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 SectionHeader(title: "Лучшее по рейтингу") { router.openCatalog(sort: .rating) }
-                                VStack(spacing: 0) {
-                                    ForEach(Array(vm.top.prefix(6).enumerated()), id: \.element.id) { i, a in
-                                        TitleLink(anime: a) { AnimeRow(anime: a, rank: i + 1, light: true) }
-                                            .buttonStyle(.pressable)
-                                    }
-                                }
-                                .padding(.horizontal, 14)
+                                rankedRail(Array(vm.top.prefix(10)))
                             }
                         }
 
