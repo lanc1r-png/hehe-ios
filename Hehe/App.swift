@@ -115,7 +115,7 @@ struct LibSite: Hashable {
 
     static let hentai = LibSite(key: "hentai", id: "4", referer: "https://kz.hentailib.me/",
                                 origin: "https://kz.hentailib.me", apiPath: "/manga",
-                                postType: "manga", title: "Hentai")
+                                postType: "manga", title: "Хентай")
 
     static var current: LibSite {
         switch UserDefaults.standard.string(forKey: "set.platform") {
@@ -479,6 +479,23 @@ struct RatingBox: Decodable {
     }
 }
 
+extension String {
+    /// Без переносов внутри слов: iOS сама ставит «примор-ского» в коротких названиях.
+    /// Между буквами одного слова — невидимый «соединитель слов» (U+2060): строка переносится только между словами.
+    var noHyphens: String {
+        var out = ""
+        out.reserveCapacity(count * 2)
+        var prevLetter = false
+        for ch in self {
+            let letter = ch.isLetter || ch.isNumber
+            if letter && prevLetter { out.append("\u{2060}") }
+            out.append(ch)
+            prevLetter = letter
+        }
+        return out
+    }
+}
+
 struct Anime: Codable, Identifiable, Hashable {
     private enum RatingKeys: String, CodingKey { case rating }
 
@@ -505,6 +522,8 @@ struct Anime: Codable, Identifiable, Hashable {
         if let r = rusName, !r.isEmpty { return r }
         return name ?? engName ?? "Без названия"
     }
+    /// Название для карточек: без переносов внутри слов
+    var cardTitle: String { displayTitle.noHyphens }
     /// Для карточек. У манги и ранобэ миниатюра слишком мелкая и выглядит пиксельной, берём средний размер.
     var imageURL: URL? {
         let s = LibSite.current.isBook
@@ -1572,6 +1591,22 @@ final class FavoritesStore: ObservableObject {
 
     func contains(_ a: Anime) -> Bool { items.contains { $0.id == a.id } }
 
+    /// Тайтлы из списков на сайте: новые добавляются в конец, а те, что раньше пришли с сайта
+    /// и оттуда убраны, — убираются и здесь. Добавленное только в приложении не трогаем.
+    func mergeFromSite(_ list: [Anime], siteKey: String) {
+        let idsKey = "sitelists.ids.\(siteKey)"
+        let before = Set((UserDefaults.standard.array(forKey: idsKey) as? [Int]) ?? [])
+        let now = Set(list.map { $0.id })
+        var out = items.filter { !(before.contains($0.id) && !now.contains($0.id)) }
+        var have = Set(out.map { $0.id })
+        for a in list where have.insert(a.id).inserted { out.append(a) }
+        if out.map({ $0.id }) != items.map({ $0.id }) {
+            items = out
+            if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+        }
+        UserDefaults.standard.set(Array(now), forKey: idsKey)
+    }
+
     func clear() {
         items = []
         UserDefaults.standard.removeObject(forKey: key)
@@ -1747,6 +1782,8 @@ enum FavSort: String, CaseIterable {
 
 struct FavMeta: Codable {
     var status: String?
+    /// Статус по спискам сайта при прошлой синхронизации: меняем свой, только когда на сайте он сменился
+    var site: String?
     var count: Int?
     var release: Date?
     var changed: Date?
@@ -1823,6 +1860,22 @@ final class FavMetaStore: ObservableObject {
         save()
     }
 
+    func applySiteStatuses(_ list: [(Anime, ListStatus?)]) {
+        var all = items
+        var changed = false
+        for (a, st) in list {
+            let k = Self.key(a)
+            var m = all[k] ?? FavMeta()
+            let s = st?.rawValue
+            guard m.site != s else { continue }
+            if let s { m.status = s }
+            m.site = s
+            all[k] = m
+            changed = true
+        }
+        if changed { items = all; save() }
+    }
+
     func updateDate(_ a: Anime) -> Date? {
         guard let m = items[Self.key(a)] else { return nil }
         return m.release ?? m.changed
@@ -1881,6 +1934,57 @@ final class FavMetaStore: ObservableObject {
 
     private func save() {
         if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
+/// Списки на сайте → «Избранное» и значки статусов в «Каталоге». Не чаще раза в полчаса (по свайпу — сразу).
+@MainActor
+enum SiteListSync {
+    private static var running = false
+
+    static func syncIfDue(force: Bool = false) async {
+        let auth = AuthStore.shared
+        guard !running, let t = auth.token, let uid = auth.user?.id else { return }
+        let site = LibSite.current.key
+        let lastKey = "sitelists.last.\(site)"
+        if !force, let d = UserDefaults.standard.object(forKey: lastKey) as? Date, Date().timeIntervalSince(d) < 1800 { return }
+        running = true
+        defer { running = false }
+        guard let data = try? await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t),
+              let root = J.obj(data) as? [String: Any],
+              let arr = root["data"] as? [[String: Any]] else { return }
+        let folders: [(Int, String)] = arr.compactMap { d in
+            guard let id = J.int(d["id"]) else { return nil }
+            return (id, J.str(d["name"]) ?? J.str(d["title"]) ?? "")
+        }
+        var titles: [Anime] = []
+        var status: [Int: ListStatus] = [:]
+        var seenAll = Set<Int>()
+        for (fid, name) in folders {
+            let st = ListStatus.fromFolderName(name)
+            var seen = Set<Int>()
+            var page = 1
+            while page <= 40 {
+                let q = [URLQueryItem(name: "user_id", value: String(uid)),
+                         URLQueryItem(name: "page", value: String(page)),
+                         URLQueryItem(name: "status", value: String(fid))]
+                // ошибка посреди — ничего не меняем, чтобы не убрать лишнего
+                guard let d = try? await AnimelibAPI.shared.rawData("/bookmarks", query: q, token: t),
+                      let r = J.obj(d) as? [String: Any],
+                      let list = r["data"] as? [[String: Any]] else { return }
+                let got = list.compactMap { ProfileViewModel.anime(from: $0) }.filter { seen.insert($0.id).inserted }
+                if got.isEmpty { break }
+                for a in got {
+                    if seenAll.insert(a.id).inserted { titles.append(a) }
+                    if let st { status[a.id] = st }
+                }
+                page += 1
+            }
+        }
+        guard LibSite.current.key == site, !folders.isEmpty else { return }
+        FavoritesStore.current.mergeFromSite(titles, siteKey: site)
+        FavMetaStore.shared.applySiteStatuses(titles.map { ($0, status[$0.id]) })
+        UserDefaults.standard.set(Date(), forKey: lastKey)
     }
 }
 
@@ -2080,12 +2184,14 @@ struct FavCard: View {
     let status: ListStatus?
     let book: Bool
     var newCount: Int = 0
+    var subtitle: String? = nil
+    var progress: Double? = nil
     let onStatus: (ListStatus?) -> Void
     let onContinue: () -> Void
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            TitleLink(anime: anime) { AnimeCard(anime: anime) }
+            TitleLink(anime: anime) { AnimeCard(anime: anime, showRating: false, subtitle: subtitle, progress: progress) }
                 .buttonStyle(.pressable)
             GeometryReader { geo in
                 ZStack {
@@ -2149,6 +2255,7 @@ struct FavoritesView: View {
     @ObservedObject private var favorites: FavoritesStore = FavoritesStore.current
     @ObservedObject private var meta = FavMetaStore.shared
     @ObservedObject private var history: HistoryStore = HistoryStore.current
+    @ObservedObject private var readStore = ReadStore.shared
     @AppStorage("fav.sort") private var sortRaw = FavSort.added.rawValue
     @State private var filter: ListStatus?
     @State private var continueAnime: Anime?
@@ -2207,7 +2314,8 @@ struct FavoritesView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 chip("Все", favorites.items.count, filter == nil) { filter = nil }
-                ForEach(ListStatus.allCases, id: \.self) { st in
+                // пустые списки не показываем (кроме выбранного)
+                ForEach(ListStatus.allCases.filter { st in filter == st || favorites.items.contains { meta.status($0) == st } }, id: \.self) { st in
                     chip(st.title(book: book), favorites.items.filter { meta.status($0) == st }.count, filter == st, dot: st.color) {
                         filter = st
                     }
@@ -2231,8 +2339,52 @@ struct FavoritesView: View {
 
     private func refresh(force: Bool) async {
         refreshing = true
+        await SiteListSync.syncIfDue(force: force)
         await FavUpdater.refresh(favorites.items, force: force)
         refreshing = false
+    }
+
+    /// Где остановился: последняя открытая глава/серия, иначе сколько всего вышло
+    private func cardSubtitle(_ a: Anime) -> String? {
+        if let h = history.items.first(where: { $0.anime.id == a.id }), !h.episodeTitle.isEmpty { return h.episodeTitle }
+        if let n = meta.items[FavMetaStore.key(a)]?.count, n > 0 { return book ? "\(n) гл." : "\(n) эп." }
+        return nil
+    }
+
+    /// Прочитано глав из вышедших (для манги и ранобэ)
+    private func cardProgress(_ a: Anime) -> Double? {
+        guard book, let total = meta.items[FavMetaStore.key(a)]?.count, total > 0 else { return nil }
+        let done = readStore.read[String(a.readKey)]?.count ?? 0
+        return done > 0 ? Double(done) / Double(total) : nil
+    }
+
+    private func headerButton(_ icon: String) -> some View {
+        Image(systemName: icon)
+            .font(.headline)
+            .foregroundStyle(Theme.accent)
+            .frame(width: 44, height: 44)
+            .glassShape(Circle())
+    }
+
+    /// Шапка как в «Каталоге»: заголовок слева, кнопки на той же строке
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text("Избранное").font(.largeTitle.bold())
+            Spacer()
+            Button { showNew = true } label: {
+                headerButton(meta.totalNew(favorites.items) > 0 ? "bell.badge.fill" : "bell")
+            }
+            .buttonStyle(.pressable)
+            Menu {
+                Picker("Сортировка", selection: $sortRaw) {
+                    ForEach(FavSort.allCases, id: \.rawValue) { o in
+                        Text(o.title).tag(o.rawValue)
+                    }
+                }
+            } label: { headerButton("arrow.up.arrow.down") }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -2250,6 +2402,7 @@ struct FavoritesView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 12) {
+                    header
                     if !favorites.items.isEmpty { chips }
                     if sort == .updated, !favorites.items.isEmpty,
                        favorites.items.allSatisfy({ meta.updateDate($0) == nil }) {
@@ -2275,6 +2428,7 @@ struct FavoritesView: View {
                     LazyVGrid(columns: columns, spacing: 18) {
                         ForEach(visible) { anime in
                             FavCard(anime: anime, status: meta.status(anime), book: book, newCount: meta.newCount(anime),
+                                    subtitle: cardSubtitle(anime), progress: cardProgress(anime),
                                     onStatus: { st in
                                         meta.setStatus(anime, st)
                                         Haptics.select()
@@ -2287,7 +2441,9 @@ struct FavoritesView: View {
                         }
                     }
                     .padding(.horizontal, 14)
+                    Color.clear.frame(height: 110)
                 }
+                .padding(.top, 6)
             }
             .refreshable { await refresh(force: true) }
             .task { await refresh(force: false) }
@@ -2303,25 +2459,7 @@ struct FavoritesView: View {
                 Text("Папка «\(renaming?.defaultTitle(book: book) ?? "")» будет называться так. Фильтр и статус не изменятся.")
             }
             .id(namesTick)
-            .navigationTitle("Избранное")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { showNew = true } label: {
-                        Image(systemName: meta.totalNew(favorites.items) > 0 ? "bell.badge.fill" : "bell")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Picker("Сортировка", selection: $sortRaw) {
-                            ForEach(FavSort.allCases, id: \.rawValue) { o in
-                                Text(o.title).tag(o.rawValue)
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "arrow.up.arrow.down")
-                    }
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Anime.self) { DetailView(anime: $0) }
             .navigationDestination(for: Novel.self) { NovelDetailView(novel: $0) }
             .navigationDestination(isPresented: $pushContinue) { continueDestination }
@@ -2672,6 +2810,7 @@ struct SettingsView: View {
     @ObservedObject private var offline = OfflineStore.current
     @State private var confirmOffline = false
     @ObservedObject private var auth = AuthStore.shared
+    @ObservedObject private var heroLook = ProfileLook.shared
     @State private var custom: Color = Theme.accent
     @State private var info: String?
     @State private var shareItem: ShareItem?
@@ -2708,7 +2847,7 @@ struct SettingsView: View {
         ("anime", "Аниме", "AnimeLib", true),
         ("ranobe", "Ранобэ", "RanobeLib", true),
         ("manga", "Манга", "MangaLib", true),
-        ("hentai", "Hentai", "HentaiLib", true)
+        ("hentai", "Хентай", "HentaiLib", true)
     ]
 
     private func platformIcon(_ id: String) -> String {
@@ -2774,12 +2913,22 @@ struct SettingsView: View {
     private var hero: some View {
         VStack(spacing: 14) {
             HStack(spacing: 14) {
-                Image(systemName: "sparkles.tv.fill")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 64, height: 64)
-                    .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                // твоя аватарка (своя из галереи или с сайта); без входа — значок приложения
+                Group {
+                    if heroLook.useAvatar, let a = heroLook.avatar {
+                        ProfileMediaView(media: a, maxPixel: 300)
+                    } else if let av = auth.user?.avatar {
+                        AnimatedRemoteImage(url: av, maxPixel: 300)
+                    } else {
+                        Image(systemName: "sparkles.tv.fill")
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    }
+                }
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(auth.user?.username ?? "Yume").font(.title3.weight(.bold)).lineLimit(1)
                     Text(heroSubtitle).font(.subheadline).foregroundStyle(.secondary)
@@ -2787,7 +2936,6 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             HStack(spacing: 8) {
-                heroStat("heart.fill", "\(FavoritesStore.current.items.count)", "избранное")
                 heroStat("arrow.down.circle.fill", "\(offline.allEntries.count)", "скачано")
                 heroStat("internaldrive.fill", offline.totalBytes == 0 ? "0 МБ" : fmtBytes(offline.totalBytes), "занято")
             }
@@ -3003,7 +3151,7 @@ struct SettingsView: View {
     // MARK: чтение и просмотр
 
     private var feelBlock: some View {
-        section("Ощущения") {
+        section("Отклик") {
             toggleRow("hand.tap.fill", "Вибрация при нажатиях", $haptics)
                 .onChange(of: haptics) { on in if on { Haptics.bump() } }
             rowDivider
@@ -3226,6 +3374,12 @@ struct SettingsView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
+                    // заголовок как на остальных вкладках: на той же высоте, без пустой полосы сверху
+                    Text("Настройки")
+                        .font(.largeTitle.bold())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, -4)
+                        .padding(.bottom, -10)
                     backupWarning
                     hero
                     platformSwitch
@@ -3245,7 +3399,7 @@ struct SettingsView: View {
                 .padding(.bottom, 90)
             }
             .background(AppBackground())
-            .navigationTitle("Настройки")
+            .toolbar(.hidden, for: .navigationBar)
             .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Выйти", role: .destructive) { auth.signOut() }
                 Button("Отмена", role: .cancel) {}
@@ -3255,7 +3409,6 @@ struct SettingsView: View {
             } message: {
                 Text("Чтобы всё подхватилось, приложение закроется. Открой Yume снова.")
             }
-            .navigationBarTitleDisplayMode(.large)
         }
     }
 }
@@ -3403,7 +3556,7 @@ final class HomeViewModel: ObservableObject {
                 // Обложки тех же размеров, что берут карточки, иначе подгрузка уходит впустую.
                 switch part {
                 case .fresh:
-                    ImageLoader.prefetch(list.prefix(14).compactMap { $0.posterURL }, maxPixel: 720)
+                    ImageLoader.prefetch(list.prefix(14).compactMap { $0.imageURL }, maxPixel: 480)
                 case .newest:
                     ImageLoader.prefetch(list.prefix(10).compactMap { $0.posterURL ?? $0.imageURL }, maxPixel: 420)
                 case .popular:
@@ -3513,11 +3666,43 @@ struct UpdateMark: View {
     }
 }
 
+/// Сколько глав/серий и когда вышла последняя — для подписи в «Свежих главах». Один запрос на тайтл, с кэшем.
+@MainActor
+final class FreshInfo: ObservableObject {
+    static let shared = FreshInfo()
+    @Published private(set) var items: [String: (count: Int?, date: Date?)] = [:]
+    private var loading = Set<String>()
+    private func key(_ a: Anime) -> String { "\(LibSite.current.key)-\(a.id)" }
+    func get(_ a: Anime) -> (count: Int?, date: Date?)? { items[key(a)] }
+    func load(_ a: Anime) async {
+        let k = key(a)
+        guard items[k] == nil, !loading.contains(k) else { return }
+        loading.insert(k)
+        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
+        loading.remove(k)
+        items[k] = (r.count, r.date.flatMap(parseLibDate))
+    }
+}
+
 struct PosterCard: View {
     let anime: Anime
     var width: CGFloat = 124
     /// Необязательная пометка в правом верхнем углу («Новое» и т. п.)
     var mark: String? = nil
+    /// Подпись под названием: тип и что вышло («Манхва · 87 гл. · сегодня»)
+    var showFresh = false
+    @ObservedObject private var fresh = FreshInfo.shared
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if let t = anime.type?.title, !t.isEmpty { parts.append(t) }
+        if showFresh, let f = fresh.get(anime) {
+            let book = LibSite.current.isBook
+            if let n = f.count, n > 0 { parts.append(book ? "\(n) гл." : "\(n) эп.") }
+            if let d = f.date { parts.append(ChapterAge.ago(d)) }
+        }
+        return parts.joined(separator: " · ")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3525,38 +3710,27 @@ struct PosterCard: View {
                 .frame(width: width, height: width * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.chip, lineWidth: 1))
-                .overlay(alignment: .topLeading) {
-                    if let t = anime.type?.title, !t.isEmpty {
-                        Text(t)
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.5), in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
-                            .padding(6)
-                    }
-                }
                 .overlay(alignment: .topTrailing) {
                     if let mark { UpdateMark(text: mark) }
                 }
                 .overlay(alignment: .bottomLeading) {
-                    if let r = anime.rateAvg {
-                        Label(r, systemImage: "star.fill")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.5), in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
-                            .padding(6)
-                    }
+                    if let r = anime.rateAvg { RatingBadge(text: r, compact: true).padding(6) }
                 }
-            Text(anime.displayTitle)
-                .font(width > 140 ? .subheadline.weight(.medium) : .footnote.weight(.medium))
+            Text(anime.cardTitle)
+                .font(width > 140 ? .subheadline.weight(.medium) : .footnote.weight(.semibold))
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
                 .frame(width: width, alignment: .leading)
+            if !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: width, alignment: .leading)
+            }
         }
         .contentShape(Rectangle())
+        .task(id: anime.id) { if showFresh { await fresh.load(anime) } }
     }
 }
 
@@ -3593,7 +3767,7 @@ struct AnimeRow: View {
                 .frame(width: light ? 62 : 52, height: light ? 93 : 78)
                 .clipShape(RoundedRectangle(cornerRadius: light ? 12 : 10))
             VStack(alignment: .leading, spacing: 4) {
-                Text(anime.displayTitle)
+                Text(anime.cardTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
@@ -3639,7 +3813,7 @@ struct PopularHero: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .glassCapsule()
-                    Text(anime.displayTitle)
+                    Text(anime.cardTitle)
                         .font(.title3.bold())
                         .foregroundStyle(.white)
                         .lineLimit(3)
@@ -3712,13 +3886,15 @@ struct ContinueCard: View {
 /// Единая плашка рейтинга: белая звезда на тёмной капсуле, как на обложках в каталоге.
 struct RatingBadge: View {
     let text: String
-    /// Плотность тёмной подложки (на светлом фоне — плотнее, чтобы не была серой)
-    var opacity: Double = 0.5
+    /// Плотность тёмной подложки: плотная, чтобы читалась и на светлых обложках
+    var opacity: Double = 0.74
+    /// Маленькая — для обложек в сетке и лентах
+    var compact = false
     var body: some View {
         Label(text, systemImage: "star.fill")
-            .font(.caption.bold())
+            .font(compact ? .caption2.bold() : .caption.bold())
             .foregroundStyle(.white)
-            .padding(.horizontal, 9).padding(.vertical, 4)
+            .padding(.horizontal, compact ? 8 : 9).padding(.vertical, 4)
             .background(Color.black.opacity(opacity), in: Capsule())
             .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
     }
@@ -3782,6 +3958,12 @@ struct BlurredCover: View {
 struct TodayHero: View {
     let anime: Anime
     @Environment(\.colorScheme) private var scheme
+    private var todayMeta: String {
+        let g = (anime.genres ?? []).map { $0.title }.filter { !$0.isEmpty }.prefix(2)
+        if !g.isEmpty { return g.joined(separator: " · ") }
+        return [anime.status?.title, LibSite.current.isBook ? nil : anime.episodesCount.map { "\($0) эп." }]
+            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
     /// Доминантный цвет обложки — им окрашена карточка (как в Apple Music)
     @State private var tint: Color?
 
@@ -3819,20 +4001,22 @@ struct TodayHero: View {
                     .padding(.horizontal, 9).padding(.vertical, 4)
                     .background(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing),
                                 in: Capsule())
-                    Text(anime.displayTitle)
+                    Text(anime.cardTitle)
                         .font(.title3.weight(.bold))
                         .foregroundStyle(fg)
                         .lineLimit(4)
                         .minimumScaleFactor(0.8)
                         .multilineTextAlignment(.leading)
                     HStack(spacing: 8) {
-                        if let r = anime.rateAvg { RatingBadge(text: r, opacity: dark ? 0.5 : 0.8) }
-                        if let t = anime.type?.title { Text(t).foregroundStyle(fg.opacity(0.75)) }
+                        if let r = anime.rateAvg { RatingBadge(text: r) }
+                        // вместо типа (он и так в заголовке экрана) — жанры, а если их нет — статус выпуска
+                        if !todayMeta.isEmpty { Text(todayMeta).foregroundStyle(fg.opacity(0.75)).lineLimit(1) }
                     }
                     .font(.footnote.weight(.semibold))
                     Spacer(minLength: 0)
                     HStack(spacing: 8) {
-                        Image(systemName: LibSite.current.isBook ? "book.fill" : "play.fill")
+                        // ▶ и для чтения: книга — это значок статуса «Читаю»
+                        Image(systemName: "play.fill")
                         Text(LibSite.current.isBook ? "Читать" : "Смотреть")
                     }
                     .font(.subheadline.weight(.bold))
@@ -3953,7 +4137,7 @@ struct WideCard: View {
                 .frame(width: 92, height: 138)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             VStack(alignment: .leading, spacing: 6) {
-                Text(anime.displayTitle)
+                Text(anime.cardTitle)
                     .font(.subheadline.weight(.bold))
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
@@ -4033,7 +4217,8 @@ struct HomeView: View {
         return ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(unique) { a in
-                    TitleLink(anime: a) { PosterCard(anime: a, width: 154, mark: newIDs.contains(a.id) ? "НОВОЕ" : nil) }
+                    // поменьше, чтобы было видно 3+ карточки и что лента листается
+                    TitleLink(anime: a) { PosterCard(anime: a, width: 128, mark: newIDs.contains(a.id) ? "НОВОЕ" : nil, showFresh: true) }
                         .buttonStyle(.pressable)
                 }
             }
@@ -4734,6 +4919,7 @@ struct CatalogView: View {
             .navigationDestination(isPresented: $showRandom) { randomDestination }
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
+            .task { await SiteListSync.syncIfDue() }
             .task(id: vm.filter.query) {
                 // живой поиск: ждём, пока вы закончите печатать
                 guard vm.filter.query != vm.loadedQuery else { return }
@@ -4761,6 +4947,10 @@ struct AnimeCard: View {
     var status: ListStatus? = nil
     /// Пометка в правом верхнем углу («НОВОЕ» / «НОВАЯ ГЛАВА») — только в списке по последним обновлениям
     var mark: String? = nil
+    /// В «Избранном» рейтинг не нужен — вместо него прогресс и где остановился
+    var showRating = true
+    var subtitle: String? = nil
+    var progress: Double? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             RemoteImage(url: anime.posterURL ?? anime.imageURL, maxPixel: 520)
@@ -4774,20 +4964,33 @@ struct AnimeCard: View {
                     if let status { StatusBadge(status: status, book: LibSite.current.isBook) }
                 }
                 .overlay(alignment: .bottomLeading) {
-                    if let r = anime.rateAvg {
-                        Label(r, systemImage: "star.fill")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .foregroundStyle(.white)
-                            .background(Color.black.opacity(0.5), in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
-                            .padding(7)
+                    if showRating, let r = anime.rateAvg { RatingBadge(text: r, compact: true).padding(7) }
+                }
+            if let progress {
+                // тонкая полоска прогресса под обложкой
+                GeometryReader { g in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.12))
+                        Capsule().fill(LinearGradient(colors: [Theme.accent, Theme.accent2], startPoint: .leading, endPoint: .trailing))
+                            .frame(width: max(4, g.size.width * min(max(progress, 0), 1)))
                     }
                 }
-            Text(anime.displayTitle)
-                .font(.footnote.weight(.semibold))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
+                .frame(height: 3)
+                .padding(.horizontal, 4)
+                .padding(.top, -2)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(anime.cardTitle)
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(Theme.accent)
+                        .lineLimit(1)
+                }
+            }
         }
     }
 }
@@ -8829,7 +9032,7 @@ struct ProfileView: View {
             let items: [(String, Color, String, String)] = [
                 u.streak.map { ("flame.fill", Color.orange, "\($0)", "дней подряд") },
                 u.level.map { ("star.fill", Color.yellow, "\($0)", "уровень") },
-                vm.totalTitles > 0 ? ("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles)", "тайтлов") : nil,
+                vm.totalTitles > 0 ? (LibSite.current.isBook ? "books.vertical.fill" : "film.stack.fill", Theme.accent, "\(vm.totalTitles)", "тайтлов") : nil,
                 doneFolder.map { ("trophy.fill", Color(red: 1, green: 0.76, blue: 0.3), "\($0.count ?? 0)", "завершено") }
             ].compactMap { $0 }
             if !items.isEmpty {
@@ -8855,13 +9058,14 @@ struct ProfileView: View {
                 }
                 .padding(.vertical, 12)
                 .padding(.horizontal, 8)
-                .glassShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                // лёгкая подсветка цветом баннера: у каждого профиля свой оттенок
-                .background((tint ?? Theme.accent).opacity(scheme == .dark ? 0.16 : 0.12),
-                            in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke((tint ?? Theme.accent).opacity(0.3), lineWidth: 0.6))
-                .padding(.horizontal, 20)
+                // та же карточка, что у «Друзей» и списков: один стиль на всём экране
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay {
+                    if scheme != .dark {
+                        RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.9), lineWidth: 0.6)
+                    }
+                }
+                .padding(.horizontal, 14)
                 .padding(.top, 12)
             }
         }
