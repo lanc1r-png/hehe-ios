@@ -9,6 +9,7 @@ import Combine
 import ImageIO
 import CoreImage
 import UniformTypeIdentifiers
+import PhotosUI
 
 // MARK: - Тема и общие элементы дизайна
 
@@ -2208,7 +2209,7 @@ struct FavoritesView: View {
 enum BackupManager {
     private static let prefixes = ["favorites", "history", "progress", "read", "search.", "set.",
                                    "accent.", "reader.", "manga.", "novel.", "off.",
-                                   "activity", "bookmarks", "highlights", "favmeta", "fav.", "friends"]
+                                   "activity", "bookmarks", "highlights", "favmeta", "fav.", "friends", "profile."]
 
     private static func allowed(_ key: String) -> Bool {
         if key.hasPrefix("friends.cache") { return false }   // кэш, подтянется заново
@@ -2226,7 +2227,9 @@ enum BackupManager {
     }
 
     static func data(date: Date = Date()) -> Data? {
-        let root: [String: Any] = ["app": "Yume", "version": 1, "date": date, "defaults": snapshot()]
+        var root: [String: Any] = ["app": "Yume", "version": 1, "date": date, "defaults": snapshot()]
+        let files = ProfileLook.backupFiles()   // своя шапка/аватарка (фото и GIF)
+        if !files.isEmpty { root["files"] = files }
         return try? PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)
     }
 
@@ -2319,6 +2322,7 @@ enum BackupManager {
             UserDefaults.standard.set(v, forKey: k)
             n += 1
         }
+        if let files = root["files"] as? [String: Data] { ProfileLook.restoreFiles(files) }
         UserDefaults.standard.synchronize()
         frozen = true
         return n
@@ -2975,6 +2979,12 @@ struct SettingsView: View {
         }
     }
 
+    private var profileLookBlock: some View {
+        section("Профиль", footer: "Своя шапка (фото, GIF или видео) и аватарка — видны только тебе.") {
+            linkRow("paintbrush.fill", "Шапка и аватарка") { ProfileAppearanceView() }
+        }
+    }
+
     private var statsBlock: some View {
         section("Статистика", footer: "Сколько просмотрено и прочитано, серия дней подряд.") {
             linkRow("chart.bar.xaxis", "Моя активность") { StatsView() }
@@ -3101,6 +3111,7 @@ struct SettingsView: View {
                     playbackBlock
                     downloadsBlock
                     dataBlock
+                    profileLookBlock
                     statsBlock
                     backupBlock
                     miscBlock
@@ -7778,6 +7789,531 @@ struct FriendProfileView: View {
     }
 }
 
+// MARK: - Своя шапка и аватарка профиля (видны только в этом приложении)
+
+/// Своя картинка, GIF или короткое видео для шапки/аватарки + положение кадра.
+struct ProfileMedia: Codable, Equatable {
+    var file: String
+    /// "image", "gif" или "video"
+    var kind: String
+    /// Пропорции самого файла: ширина / высота
+    var aspect: Double
+    var scale: Double = 1
+    var x: Double = 0
+    var y: Double = 0
+
+    var isVideo: Bool { kind == "video" }
+}
+
+@MainActor
+final class ProfileLook: ObservableObject {
+    static let shared = ProfileLook()
+
+    @Published private(set) var header: ProfileMedia?
+    @Published private(set) var avatar: ProfileMedia?
+    /// Показывать свою шапку/аватарку (иначе — с сайта)
+    @Published var useHeader: Bool { didSet { UserDefaults.standard.set(useHeader, forKey: "profile.header.on") } }
+    @Published var useAvatar: Bool { didSet { UserDefaults.standard.set(useAvatar, forKey: "profile.avatar.on") } }
+
+    private init() {
+        useHeader = UserDefaults.standard.bool(forKey: "profile.header.on")
+        useAvatar = UserDefaults.standard.bool(forKey: "profile.avatar.on")
+        header = Self.read("profile.header")
+        avatar = Self.read("profile.avatar")
+    }
+
+    nonisolated static var dir: URL {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ProfileLook", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    nonisolated static func url(_ m: ProfileMedia) -> URL { dir.appendingPathComponent(m.file) }
+
+    nonisolated static func read(_ key: String) -> ProfileMedia? {
+        guard let d = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(ProfileMedia.self, from: d)
+    }
+
+    private static func write(_ m: ProfileMedia?, _ key: String) {
+        if let m, let d = try? JSONEncoder().encode(m) { UserDefaults.standard.set(d, forKey: key) }
+        else { UserDefaults.standard.removeObject(forKey: key) }
+    }
+
+    private func exists(_ m: ProfileMedia?) -> ProfileMedia? {
+        guard let m, FileManager.default.fileExists(atPath: Self.url(m).path) else { return nil }
+        return m
+    }
+
+    /// То, что реально показывать (nil — брать с сайта)
+    var activeHeader: ProfileMedia? { useHeader ? exists(header) : nil }
+    var activeAvatar: ProfileMedia? { useAvatar ? exists(avatar) : nil }
+
+    func setHeader(_ m: ProfileMedia?) {
+        if let old = header, old.file != m?.file { try? FileManager.default.removeItem(at: Self.url(old)) }
+        header = m
+        Self.write(m, "profile.header")
+        useHeader = m != nil
+    }
+
+    func setAvatar(_ m: ProfileMedia?) {
+        if let old = avatar, old.file != m?.file { try? FileManager.default.removeItem(at: Self.url(old)) }
+        avatar = m
+        Self.write(m, "profile.avatar")
+        useAvatar = m != nil
+    }
+
+    /// Только кадр (масштаб/сдвиг) без смены файла
+    func updateCrop(header m: ProfileMedia) { header = m; Self.write(m, "profile.header") }
+    func updateCrop(avatar m: ProfileMedia) { avatar = m; Self.write(m, "profile.avatar") }
+
+    /// Файлы для резервной копии: фото и GIF (видео — слишком большие).
+    nonisolated static func backupFiles() -> [String: Data] {
+        var out: [String: Data] = [:]
+        for key in ["profile.header", "profile.avatar"] {
+            guard let m = read(key), !m.isVideo,
+                  let d = try? Data(contentsOf: url(m)), d.count < 12_000_000 else { continue }
+            out[m.file] = d
+        }
+        return out
+    }
+
+    nonisolated static func restoreFiles(_ files: [String: Data]) {
+        for (name, d) in files where !name.contains("/") {
+            try? d.write(to: dir.appendingPathComponent(name), options: .atomic)
+        }
+    }
+}
+
+/// Видео из галереи (копируется во временную папку).
+struct PickedMovie: Transferable {
+    let url: URL
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { SentTransferredFile($0.url) } importing: { f in
+            let ext = f.file.pathExtension.isEmpty ? "mov" : f.file.pathExtension
+            let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
+            try FileManager.default.copyItem(at: f.file, to: dst)
+            return PickedMovie(url: dst)
+        }
+    }
+}
+
+enum ProfileMediaImporter {
+    enum Failure: LocalizedError {
+        case unreadable, tooBig, noVideo, export(String)
+        var errorDescription: String? {
+            switch self {
+            case .unreadable: return "Не получилось прочитать файл"
+            case .tooBig: return "Файл слишком большой (GIF — до 20 МБ)"
+            case .noVideo: return "В видео нет картинки"
+            case .export(let s): return "Не получилось подготовить видео: \(s)"
+            }
+        }
+    }
+
+    private static func name(_ prefix: String, _ ext: String) -> String {
+        "\(prefix)-\(Int(Date().timeIntervalSince1970 * 1000)).\(ext)"
+    }
+
+    /// Фото уменьшается до разумного размера; GIF и другие анимации сохраняются как есть, чтобы двигались.
+    static func importImage(_ data: Data, prefix: String, maxPixel: CGFloat) async throws -> ProfileMedia {
+        try await Task.detached(priority: .userInitiated) { () throws -> ProfileMedia in
+            guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { throw Failure.unreadable }
+            let frames = CGImageSourceGetCount(src)
+            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+            var w = (props?[kCGImagePropertyPixelWidth] as? Double) ?? 1
+            var h = (props?[kCGImagePropertyPixelHeight] as? Double) ?? 1
+            if let o = props?[kCGImagePropertyOrientation] as? Int, (5...8).contains(o) { swap(&w, &h) }
+            if frames > 1 {
+                guard data.count < 20_000_000 else { throw Failure.tooBig }
+                let n = name(prefix, "gif")
+                try data.write(to: ProfileLook.dir.appendingPathComponent(n), options: .atomic)
+                return ProfileMedia(file: n, kind: "gif", aspect: w / max(h, 1))
+            }
+            guard let img = ImageLoader.downsample(data, maxPixel: maxPixel),
+                  let jpg = img.jpegData(compressionQuality: 0.9) else { throw Failure.unreadable }
+            let n = name(prefix, "jpg")
+            try jpg.write(to: ProfileLook.dir.appendingPathComponent(n), options: .atomic)
+            return ProfileMedia(file: n, kind: "image", aspect: img.size.width / max(img.size.height, 1))
+        }.value
+    }
+
+    /// Видео: первые 15 секунд, без звука (чтобы не перебивать музыку), до Full HD.
+    static func importVideo(_ src: URL, prefix: String) async throws -> ProfileMedia {
+        defer { try? FileManager.default.removeItem(at: src) }
+        let asset = AVURLAsset(url: src)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { throw Failure.noVideo }
+        let (natural, transform) = try await track.load(.naturalSize, .preferredTransform)
+        let shown = natural.applying(transform)
+        let aspect = abs(shown.width) / max(abs(shown.height), 1)
+        let duration = try await asset.load(.duration)
+        let length = CMTimeMinimum(duration, CMTime(seconds: 15, preferredTimescale: 600))
+
+        let comp = AVMutableComposition()
+        guard let vt = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw Failure.export("дорожка")
+        }
+        try vt.insertTimeRange(CMTimeRange(start: .zero, duration: length), of: track, at: .zero)
+        vt.preferredTransform = transform
+
+        guard let ex = AVAssetExportSession(asset: comp, presetName: AVAssetExportPreset1920x1080) else {
+            throw Failure.export("кодировщик")
+        }
+        let n = name(prefix, "mp4")
+        let out = ProfileLook.dir.appendingPathComponent(n)
+        ex.outputURL = out
+        ex.outputFileType = .mp4
+        ex.shouldOptimizeForNetworkUse = true
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            ex.exportAsynchronously { c.resume() }
+        }
+        guard ex.status == .completed else { throw Failure.export(ex.error?.localizedDescription ?? "ошибка") }
+        return ProfileMedia(file: n, kind: "video", aspect: Double(aspect))
+    }
+
+    /// Не даёт сдвинуть кадр так, чтобы появились пустые края.
+    static func clamp(_ m: inout ProfileMedia, frame: CGSize) {
+        let W = max(frame.width, 1), H = max(frame.height, 1)
+        m.scale = min(max(m.scale, 1), 4)
+        let a = max(m.aspect, 0.05)
+        let base = a > Double(W / H) ? CGSize(width: H * a, height: H) : CGSize(width: W, height: W / a)
+        let mx = max(0, (base.width * m.scale - W) / 2 / W)
+        let my = max(0, (base.height * m.scale - H) / 2 / H)
+        m.x = min(max(m.x, -mx), mx)
+        m.y = min(max(m.y, -my), my)
+    }
+}
+
+/// Показывает свою картинку/GIF/видео с учётом кадра; заполняет весь отведённый прямоугольник.
+struct ProfileMediaView: View {
+    let media: ProfileMedia
+    var maxPixel: CGFloat = 1600
+
+    var body: some View {
+        GeometryReader { g in
+            let W = max(g.size.width, 1), H = max(g.size.height, 1)
+            let a = max(media.aspect, 0.05)
+            let base = a > Double(W / H) ? CGSize(width: H * a, height: H) : CGSize(width: W, height: W / a)
+            content
+                .frame(width: base.width * media.scale, height: base.height * media.scale)
+                .offset(x: media.x * W, y: media.y * H)
+                .frame(width: W, height: H)
+        }
+        .clipped()
+    }
+
+    @ViewBuilder private var content: some View {
+        let u = ProfileLook.url(media)
+        if media.isVideo {
+            LoopingVideoView(url: u)
+        } else {
+            AnimatedRemoteImage(url: u, maxPixel: maxPixel)
+        }
+    }
+}
+
+/// Беззвучное видео по кругу (для шапки профиля).
+struct LoopingVideoView: UIViewRepresentable {
+    let url: URL
+
+    final class PlayerView: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+        var looper: AVPlayerLooper?
+        var player: AVQueuePlayer?
+        var current: URL?
+
+        func play(_ u: URL) {
+            guard current != u else { return }
+            current = u
+            player?.pause()
+            let p = AVQueuePlayer()
+            p.isMuted = true
+            p.preventsDisplaySleepDuringVideoPlayback = false
+            looper = AVPlayerLooper(player: p, templateItem: AVPlayerItem(url: u))
+            playerLayer.player = p
+            playerLayer.videoGravity = .resizeAspectFill
+            player = p
+            p.play()
+        }
+    }
+
+    func makeUIView(context: Context) -> PlayerView {
+        let v = PlayerView()
+        v.backgroundColor = .clear
+        v.play(url)
+        return v
+    }
+
+    func updateUIView(_ v: PlayerView, context: Context) { v.play(url) }
+
+    static func dismantleUIView(_ v: PlayerView, coordinator: ()) {
+        v.player?.pause()
+        v.looper = nil
+        v.player = nil
+    }
+}
+
+/// Кадрирование: двигай и увеличивай пальцами, как будет в шапке или аватарке.
+struct MediaCropEditor: View {
+    let title: String
+    let aspect: CGFloat
+    let rounded: Bool
+    @State var media: ProfileMedia
+    let onSave: (ProfileMedia) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var start: ProfileMedia?
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                Spacer(minLength: 0)
+                GeometryReader { g in
+                    ProfileMediaView(media: media, maxPixel: 1800)
+                        .clipShape(RoundedRectangle(cornerRadius: rounded ? 40 : 20, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: rounded ? 40 : 20, style: .continuous)
+                            .stroke(Color.white.opacity(0.5), lineWidth: 1))
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture()
+                                .onChanged { v in
+                                    let s = start ?? media
+                                    if start == nil { start = media }
+                                    var m = media
+                                    m.x = s.x + v.translation.width / g.size.width
+                                    m.y = s.y + v.translation.height / g.size.height
+                                    ProfileMediaImporter.clamp(&m, frame: g.size)
+                                    media = m
+                                }
+                                .onEnded { _ in start = nil }
+                                .simultaneously(with:
+                                    MagnificationGesture()
+                                        .onChanged { k in
+                                            let s = start ?? media
+                                            if start == nil { start = media }
+                                            var m = media
+                                            m.scale = s.scale * k
+                                            ProfileMediaImporter.clamp(&m, frame: g.size)
+                                            media = m
+                                        }
+                                        .onEnded { _ in start = nil }
+                                )
+                        )
+                }
+                .aspectRatio(aspect, contentMode: .fit)
+                .padding(.horizontal, rounded ? 60 : 16)
+                Text("Двигай и увеличивай двумя пальцами")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            .background(Color.black.ignoresSafeArea())
+            .preferredColorScheme(.dark)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Отмена") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Готово") { onSave(media); dismiss() }.fontWeight(.semibold)
+                }
+                ToolbarItem(placement: .bottomBar) {
+                    Button("Сбросить") {
+                        withAnimation(.easeOut(duration: 0.2)) { media.scale = 1; media.x = 0; media.y = 0 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Настройки → Шапка и аватарка профиля.
+struct ProfileAppearanceView: View {
+    @ObservedObject private var look = ProfileLook.shared
+    @ObservedObject private var auth = AuthStore.shared
+    @State private var headerItem: PhotosPickerItem?
+    @State private var avatarItem: PhotosPickerItem?
+    @State private var busy: String?
+    @State private var error: String?
+    @State private var editHeader: ProfileMedia?
+    @State private var editAvatar: ProfileMedia?
+
+    private func card<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                .padding(.horizontal, 18)
+            VStack(alignment: .leading, spacing: 0) { c() }
+                .padding(.horizontal, 16).padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            if let footer {
+                Text(footer).font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 18)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func row(_ icon: String, _ title: String, tint: Color = .primary) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).foregroundStyle(tint == .primary ? Theme.accent : tint).frame(width: 26)
+            Text(title).foregroundStyle(tint)
+            Spacer()
+        }
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+    }
+
+    private func source(_ on: Binding<Bool>, hasOwn: Bool) -> some View {
+        Picker("", selection: Binding(get: { on.wrappedValue && hasOwn }, set: { on.wrappedValue = $0 })) {
+            Text("С сайта").tag(false)
+            Text("Своя").tag(true)
+        }
+        .pickerStyle(.segmented)
+        .disabled(!hasOwn)
+        .padding(.vertical, 10)
+    }
+
+    /// Мини-превью: шапка 4:3 и аватарка поверх
+    private var preview: some View {
+        VStack(spacing: 0) {
+            Group {
+                if let h = look.activeHeader {
+                    ProfileMediaView(media: h, maxPixel: 900)
+                } else if let c = auth.user?.cover {
+                    AnimatedRemoteImage(url: c, maxPixel: 900)
+                } else {
+                    LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                }
+            }
+            .aspectRatio(4 / 3, contentMode: .fit)
+            .mask(LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.7),
+                                         .init(color: .black.opacity(0), location: 1)],
+                                 startPoint: .top, endPoint: .bottom))
+            Group {
+                if let a = look.activeAvatar {
+                    ProfileMediaView(media: a, maxPixel: 400)
+                } else {
+                    AnimatedRemoteImage(url: auth.user?.avatar, maxPixel: 300)
+                }
+            }
+            .frame(width: 76, height: 76)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Theme.accent, lineWidth: 2.5))
+            .padding(.top, -44)
+            Text(auth.user?.username ?? "Профиль").font(.headline).padding(.top, 8).padding(.bottom, 14)
+        }
+        .frame(maxWidth: .infinity)
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                preview
+
+                if let busy {
+                    HStack(spacing: 10) { ProgressView(); Text(busy).font(.subheadline) }
+                }
+                if let error {
+                    Text(error).font(.footnote).foregroundStyle(.red)
+                }
+
+                card("Шапка профиля", footer: "Фото, GIF или видео. Видео — первые 15 секунд, без звука, крутится по кругу.") {
+                    source($look.useHeader, hasOwn: look.header != nil)
+                    Divider()
+                    PhotosPicker(selection: $headerItem, matching: .any(of: [.images, .videos])) {
+                        row("photo.on.rectangle.angled", look.header == nil ? "Выбрать из галереи" : "Заменить")
+                    }
+                    if let h = look.header {
+                        Divider()
+                        Button { editHeader = h } label: { row("crop", "Настроить кадр") }
+                        Divider()
+                        Button { look.setHeader(nil) } label: { row("trash", "Удалить свою шапку", tint: .red) }
+                    }
+                }
+
+                card("Аватарка", footer: "Фото или GIF — GIF останется анимированной.") {
+                    source($look.useAvatar, hasOwn: look.avatar != nil)
+                    Divider()
+                    PhotosPicker(selection: $avatarItem, matching: .images) {
+                        row("person.crop.square", look.avatar == nil ? "Выбрать из галереи" : "Заменить")
+                    }
+                    if let a = look.avatar {
+                        Divider()
+                        Button { editAvatar = a } label: { row("crop", "Настроить кадр") }
+                        Divider()
+                        Button { look.setAvatar(nil) } label: { row("trash", "Удалить свою аватарку", tint: .red) }
+                    }
+                }
+
+                Text("Всё это видно только тебе в этом приложении — на сайте и у друзей ничего не меняется. В резервную копию попадают фото и GIF, видео — нет.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 18)
+            }
+            .padding(16)
+        }
+        .background(AppBackground())
+        .navigationTitle("Шапка и аватарка")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: headerItem) { item in
+            guard let item else { return }
+            Task { await importItem(item, header: true) }
+        }
+        .onChange(of: avatarItem) { item in
+            guard let item else { return }
+            Task { await importItem(item, header: false) }
+        }
+        .sheet(item: Binding(get: { editHeader.map { CropTarget(media: $0, header: true) } ?? editAvatar.map { CropTarget(media: $0, header: false) } },
+                             set: { if $0 == nil { editHeader = nil; editAvatar = nil } })) { t in
+            MediaCropEditor(title: t.header ? "Кадр шапки" : "Кадр аватарки",
+                            aspect: t.header ? 4 / 3 : 1, rounded: !t.header, media: t.media) { m in
+                if t.header { look.updateCrop(header: m) } else { look.updateCrop(avatar: m) }
+            }
+        }
+    }
+
+    private struct CropTarget: Identifiable {
+        let media: ProfileMedia
+        let header: Bool
+        var id: String { media.file }
+    }
+
+    private func importItem(_ item: PhotosPickerItem, header: Bool) async {
+        error = nil
+        busy = header ? "Готовлю шапку…" : "Готовлю аватарку…"
+        defer {
+            busy = nil
+            if header { headerItem = nil } else { avatarItem = nil }
+        }
+        do {
+            let m: ProfileMedia
+            if header, item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+                guard let mv = try await item.loadTransferable(type: PickedMovie.self) else {
+                    throw ProfileMediaImporter.Failure.unreadable
+                }
+                m = try await ProfileMediaImporter.importVideo(mv.url, prefix: "header")
+            } else {
+                guard let d = try await item.loadTransferable(type: Data.self) else {
+                    throw ProfileMediaImporter.Failure.unreadable
+                }
+                m = try await ProfileMediaImporter.importImage(d, prefix: header ? "header" : "avatar",
+                                                               maxPixel: header ? 2400 : 900)
+            }
+            if header {
+                look.setHeader(m)
+                editHeader = m
+            } else {
+                look.setAvatar(m)
+                editAvatar = m
+            }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+}
+
 /// Иконка своего цвета, текст — обычного
 struct TintedIconLabel: LabelStyle {
     let tint: Color
@@ -7862,6 +8398,8 @@ struct ProfileView: View {
     @State private var pulse = false
     /// Пропорции баннера (ширина / высота), когда он загрузился
     @State private var bannerRatio: CGFloat?
+    @ObservedObject private var look = ProfileLook.shared
+    @State private var showLook = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
 
     /// Папка «Прочитано/Просмотрено», если она есть
@@ -7872,77 +8410,80 @@ struct ProfileView: View {
         }
     }
 
-    // MARK: шапка профиля
-    /// Отступ сверху под часы и кнопку выхода — там видна только размытая подложка
-    private let headerTop: CGFloat = 104
+    // MARK: шапка профиля (формат 4:3, своя или с сайта)
+    @ViewBuilder
+    private func headerArt(_ u: ProfileUser) -> some View {
+        if let h = look.activeHeader {
+            ProfileMediaView(media: h, maxPixel: 2000)
+        } else if let c = u.cover {
+            if let r = bannerRatio, r <= 2.3 {
+                // высокий баннер с сайта заполняет шапку целиком
+                AnimatedRemoteImage(url: c, maxPixel: 2400)
+            } else {
+                // широкий баннер — резкий по центру, вокруг он же, размытый
+                ZStack {
+                    BlurredCover(url: c, radius: 26, scale: 1.25)
+                    ProfileBanner(url: c, ratio: $bannerRatio)
+                        .mask(LinearGradient(stops: [.init(color: .black.opacity(0), location: 0),
+                                                     .init(color: .black, location: 0.18),
+                                                     .init(color: .black, location: 0.82),
+                                                     .init(color: .black.opacity(0), location: 1)],
+                                             startPoint: .top, endPoint: .bottom))
+                        .padding(.top, 40)
+                }
+            }
+        } else {
+            LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+        }
+    }
+
+    /// Что открыть на весь экран по нажатию на шапку
+    private func headerViewerURL(_ u: ProfileUser) -> URL? {
+        if let h = look.activeHeader { return h.isVideo ? nil : ProfileLook.url(h) }
+        return u.cover
+    }
+
+    /// Откуда брать цвет для фона страницы и кольца аватарки
+    private func tintSource(_ u: ProfileUser) -> URL? {
+        if let h = look.activeHeader, !h.isVideo { return ProfileLook.url(h) }
+        if let a = look.activeAvatar { return ProfileLook.url(a) }
+        return u.cover ?? u.avatar
+    }
 
     @ViewBuilder
     private func profileHeader(_ u: ProfileUser) -> some View {
         VStack(spacing: 0) {
-            // Вариант А: баннер в родных пропорциях (резкий, без растягивания),
-            // а вокруг — тот же баннер, размытый и увеличенный, как подложка в Apple Music.
-            // Высокий баннер (не уже ~2.3 : 1) начинается прямо с верха экрана, без шва.
-            // Узкий баннер был бы слишком низким — он стоит ниже часов, а его верх растворяется в подложке.
-            let tall = u.cover != nil && (bannerRatio ?? 9) <= 2.3
-            VStack(spacing: 0) {
-                if !tall { Color.clear.frame(height: headerTop) }
-                if let c = u.cover {
-                    ProfileBanner(url: c, ratio: $bannerRatio)
-                        .mask(
-                            LinearGradient(stops: tall
-                                           ? [.init(color: .black, location: 0),
-                                              .init(color: .black, location: 0.78),
-                                              .init(color: .black.opacity(0), location: 1)]
-                                           : [.init(color: .black.opacity(0), location: 0),
-                                              .init(color: .black, location: 0.2),
-                                              .init(color: .black, location: 0.8),
-                                              .init(color: .black.opacity(0), location: 1)],
-                                           startPoint: .top, endPoint: .bottom)
-                        )
-                        .overlay(alignment: .top) {
-                            if tall {
-                                // затемнение под часами и кнопкой выхода
+            // Шапка 4:3 от самого верха экрана: тянется при свайпе вниз, низ растворяется в фоне
+            Color.clear
+                .aspectRatio(4 / 3, contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .overlay(alignment: .top) {
+                    GeometryReader { g in
+                        let y = g.frame(in: .named("profileScroll")).minY
+                        let pull = max(0, y)
+                        headerArt(u)
+                            .frame(width: g.size.width, height: g.size.height + pull)
+                            .clipped()
+                            .overlay(alignment: .top) {
                                 LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
                                     .frame(height: 120)
                                     .allowsHitTesting(false)
                             }
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture { viewer = .init(url: c) }
-                } else {
-                    Color.clear.frame(height: 110)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .background(alignment: .top) {
-                GeometryReader { g in
-                    let y = g.frame(in: .named("profileScroll")).minY
-                    let pull = max(0, y)
-                    Group {
-                        if let c = u.cover {
-                            BlurredCover(url: c, radius: 26, scale: 1.25)
-                        } else {
-                            LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing)
-                        }
+                            .mask(LinearGradient(stops: [.init(color: .black, location: 0),
+                                                         .init(color: .black, location: 0.72),
+                                                         .init(color: .black.opacity(0), location: 1)],
+                                                 startPoint: .top, endPoint: .bottom))
+                            .offset(y: y > 0 ? -y : -y * 0.35)
                     }
-                    .overlay(alignment: .top) {
-                        LinearGradient(colors: [.black.opacity(0.4), .clear], startPoint: .top, endPoint: .bottom)
-                            .frame(height: 110)
-                    }
-                    // подложка уходит ниже баннера и растворяется в фоне за аватаркой
-                    .frame(width: g.size.width, height: g.size.height + 140 + pull)
-                    .mask(
-                        LinearGradient(stops: [.init(color: .black, location: 0),
-                                               .init(color: .black, location: 0.6),
-                                               .init(color: .black.opacity(0), location: 1)],
-                                       startPoint: .top, endPoint: .bottom)
-                    )
-                    .offset(y: y > 0 ? -y : -y * 0.4)
                 }
-            }
+                .contentShape(Rectangle())
+                .onTapGesture { if let v = headerViewerURL(u) { viewer = .init(url: v) } }
+                .contextMenu {
+                    Button { showLook = true } label: { Label("Изменить шапку и аватарку", systemImage: "paintbrush") }
+                }
 
-            // Аватарка: одно чёткое кольцо с ровным зазором, мягкое свечение вместо второго контура
+            // Аватарка: одно кольцо с ровным зазором и мягким свечением
             let side: CGFloat = 106
             let r: CGFloat = 28
             let gap: CGFloat = 4
@@ -7957,12 +8498,24 @@ struct ProfileView: View {
                 RoundedRectangle(cornerRadius: r + gap, style: .continuous)
                     .fill(Color.black.opacity(0.35))
                     .frame(width: side + 2 * gap, height: side + 2 * gap)
-                AnimatedRemoteImage(url: u.avatar, maxPixel: 420)
-                    .frame(width: side, height: side)
-                    .clipShape(RoundedRectangle(cornerRadius: r, style: .continuous))
+                Group {
+                    if let a = look.activeAvatar {
+                        ProfileMediaView(media: a, maxPixel: 420)
+                    } else {
+                        AnimatedRemoteImage(url: u.avatar, maxPixel: 420)
+                    }
+                }
+                .frame(width: side, height: side)
+                .clipShape(RoundedRectangle(cornerRadius: r, style: .continuous))
             }
-            .padding(.top, -64)
-            .onTapGesture { if let a = u.avatar { viewer = .init(url: a) } }
+            .padding(.top, -70)
+            .onTapGesture {
+                if let a = look.activeAvatar { viewer = .init(url: ProfileLook.url(a)) }
+                else if let a = u.avatar { viewer = .init(url: a) }
+            }
+            .contextMenu {
+                Button { showLook = true } label: { Label("Изменить шапку и аватарку", systemImage: "paintbrush") }
+            }
             .onAppear {
                 withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { pulse = true }
             }
@@ -8012,7 +8565,7 @@ struct ProfileView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .task(id: u.cover ?? u.avatar) { tint = await CoverTint.color(u.cover ?? u.avatar) }
+        .task(id: tintSource(u)) { tint = await CoverTint.color(tintSource(u)) }
     }
 
     private func folderIcon(_ name: String) -> String {
@@ -8219,6 +8772,7 @@ struct ProfileView: View {
                 }
             }
             .fullScreenCover(item: $viewer) { ProfileImageViewer(item: $0) }
+            .sheet(isPresented: $showLook) { NavigationStack { ProfileAppearanceView() } }
             .toolbarBackground(.hidden, for: .navigationBar)
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
