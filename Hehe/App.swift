@@ -7790,6 +7790,33 @@ struct TintedIconLabel: LabelStyle {
 }
 
 /// Аватарка или обложка на весь экран (GIF остаётся анимированным). Нажатие или свайп закрывают.
+/// Баннер профиля в родных пропорциях: во всю ширину, высота по картинке — без растягивания и мыла.
+struct ProfileBanner: View {
+    let url: URL
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                // очень «высокие» картинки ограничиваем, чтобы шапка не занимала полэкрана
+                let ratio = max(image.size.width / max(image.size.height, 1), 1.6)
+                AnimatedImageView(image: image)
+                    .aspectRatio(ratio, contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .transition(.opacity)
+            } else {
+                Color.clear.frame(height: 120)
+            }
+        }
+        .task(id: url) {
+            if let c = AnimatedLoader.cached(url, 2400) { image = c; return }
+            if let img = await AnimatedLoader.load(url, maxPixel: 2400, referer: LibSite.current.referer) {
+                withAnimation(.easeOut(duration: 0.25)) { image = img }
+            }
+        }
+    }
+}
+
 struct ProfileImageViewer: View {
     struct Item: Identifiable { let url: URL; var id: String { url.absoluteString } }
     let item: Item
@@ -7826,79 +7853,94 @@ struct ProfileView: View {
     @State private var viewer: ProfileImageViewer.Item?
     @State private var pulse = false
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 14)]
-    private let coverHeight: CGFloat = 280
 
-    private var ringColors: [Color] {
-        let t = tint ?? Theme.accent
-        return [t, Theme.accent, Theme.accent2, t]
-    }
-
-    /// Сколько тайтлов в папке «Прочитано/Просмотрено», если она есть
-    private var doneCount: Int? {
+    /// Папка «Прочитано/Просмотрено», если она есть
+    private var doneFolder: BookmarkFolder? {
         vm.folders.first {
             let n = $0.name.lowercased()
             return n.contains("прочитан") || n.contains("просмотрен")
-        }?.count
+        }
     }
 
     // MARK: шапка профиля
+    /// Отступ сверху под часы и кнопку выхода — там видна только размытая подложка
+    private let headerTop: CGFloat = 104
+
     @ViewBuilder
     private func profileHeader(_ u: ProfileUser) -> some View {
         VStack(spacing: 0) {
-            // 1. Обложка во весь верх экрана: тянется при свайпе вниз, плавно растворяется в фоне
-            GeometryReader { g in
-                let y = g.frame(in: .named("profileScroll")).minY
-                let pull = max(0, y)
-                Group {
-                    if let c = u.cover {
-                        AnimatedRemoteImage(url: c, maxPixel: 1100)
-                    } else {
-                        LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+            // Вариант А: баннер в родных пропорциях (резкий, без растягивания),
+            // а вокруг — тот же баннер, размытый и увеличенный, как подложка в Apple Music.
+            VStack(spacing: 0) {
+                Color.clear.frame(height: headerTop)
+                if let c = u.cover {
+                    ProfileBanner(url: c)
+                        .mask(
+                            LinearGradient(stops: [.init(color: .black, location: 0),
+                                                   .init(color: .black, location: 0.8),
+                                                   .init(color: .black.opacity(0), location: 1)],
+                                           startPoint: .top, endPoint: .bottom)
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture { viewer = .init(url: c) }
+                } else {
+                    Color.clear.frame(height: 110)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .background(alignment: .top) {
+                GeometryReader { g in
+                    let y = g.frame(in: .named("profileScroll")).minY
+                    let pull = max(0, y)
+                    Group {
+                        if let c = u.cover {
+                            BlurredCover(url: c, radius: 26, scale: 1.25)
+                        } else {
+                            LinearGradient(colors: [Theme.accent.opacity(0.7), Theme.accent2.opacity(0.35)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                        }
                     }
+                    .overlay(alignment: .top) {
+                        LinearGradient(colors: [.black.opacity(0.4), .clear], startPoint: .top, endPoint: .bottom)
+                            .frame(height: 110)
+                    }
+                    // подложка уходит ниже баннера и растворяется в фоне за аватаркой
+                    .frame(width: g.size.width, height: g.size.height + 140 + pull)
+                    .mask(
+                        LinearGradient(stops: [.init(color: .black, location: 0),
+                                               .init(color: .black, location: 0.6),
+                                               .init(color: .black.opacity(0), location: 1)],
+                                       startPoint: .top, endPoint: .bottom)
+                    )
+                    .offset(y: y > 0 ? -y : -y * 0.4)
                 }
-                .frame(width: g.size.width, height: coverHeight + pull)
-                .clipped()
-                .overlay(alignment: .top) {
-                    // затемнение сверху, чтобы читались часы и кнопки
-                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 120)
-                }
-                .mask(
-                    LinearGradient(stops: [.init(color: .black, location: 0),
-                                           .init(color: .black, location: 0.55),
-                                           .init(color: .clear, location: 1)],
-                                   startPoint: .top, endPoint: .bottom)
-                )
-                .offset(y: y > 0 ? -y : -y * 0.4)
-                .contentShape(Rectangle())
-                .onTapGesture { if let c = u.cover { viewer = .init(url: c) } }
             }
-            .frame(height: coverHeight)
 
-            // 2. Крупная аватарка с градиентной обводкой в цветах обложки, заходит на обложку
+            // Аватарка: одно чёткое кольцо с ровным зазором, мягкое свечение вместо второго контура
+            let side: CGFloat = 106
+            let r: CGFloat = 28
+            let gap: CGFloat = 4
+            let line: CGFloat = 3
             ZStack {
-                // мягкая пульсация «в сети»
-                RoundedRectangle(cornerRadius: 40, style: .continuous)
-                    .stroke(AngularGradient(colors: ringColors, center: .center), lineWidth: 3)
-                    .frame(width: 136, height: 136)
-                    .scaleEffect(pulse ? 1.1 : 1)
-                    .opacity(pulse ? 0 : 0.7)
-                RoundedRectangle(cornerRadius: 38, style: .continuous)
-                    .stroke(AngularGradient(colors: ringColors, center: .center), lineWidth: 3.5)
-                    .frame(width: 132, height: 132)
-                    .shadow(color: (tint ?? Theme.accent).opacity(0.6), radius: 14)
+                RoundedRectangle(cornerRadius: r + gap + line / 2, style: .continuous)
+                    .stroke(LinearGradient(colors: [tint ?? Theme.accent, Theme.accent2],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                            lineWidth: line)
+                    .frame(width: side + 2 * gap + line, height: side + 2 * gap + line)
+                    .shadow(color: (tint ?? Theme.accent).opacity(pulse ? 0.65 : 0.25), radius: pulse ? 14 : 8)
+                RoundedRectangle(cornerRadius: r + gap, style: .continuous)
+                    .fill(Color.black.opacity(0.35))
+                    .frame(width: side + 2 * gap, height: side + 2 * gap)
                 AnimatedRemoteImage(url: u.avatar, maxPixel: 420)
-                    .frame(width: 118, height: 118)
-                    .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
+                    .frame(width: side, height: side)
+                    .clipShape(RoundedRectangle(cornerRadius: r, style: .continuous))
             }
-            .padding(.top, -96)
+            .padding(.top, -64)
             .onTapGesture { if let a = u.avatar { viewer = .init(url: a) } }
             .onAppear {
-                withAnimation(.easeOut(duration: 2.2).repeatForever(autoreverses: false)) { pulse = true }
+                withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { pulse = true }
             }
 
-            // 3. Имя прямо под аватаркой, без серой подложки
             HStack(spacing: 6) {
                 Text(u.username).font(.title.bold()).lineLimit(1).minimumScaleFactor(0.7)
                 if u.premium {
@@ -7908,48 +7950,43 @@ struct ProfileView: View {
             .padding(.top, 14)
             .padding(.horizontal, 20)
 
-            // 4. Одна стеклянная строка статистики
-            let items: [(String, Color, String)] = [
-                u.streak.map { ("flame.fill", Color.orange, "\($0) дн.") },
-                u.level.map { ("star.fill", Color.yellow, "ур. \($0)") },
-                vm.totalTitles > 0 ? ("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles)") : nil,
-                doneCount.map { ("checkmark.circle.fill", Color.green, "\($0)") }
+            // Статистика: цифра крупно, подпись под ней
+            let items: [(String, Color, String, String)] = [
+                u.streak.map { ("flame.fill", Color.orange, "\($0)", "дней подряд") },
+                u.level.map { ("star.fill", Color.yellow, "\($0)", "уровень") },
+                vm.totalTitles > 0 ? ("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles)", "тайтлов") : nil,
+                doneFolder.map { ("checkmark.circle.fill", Color.green, "\($0.count ?? 0)", $0.name.lowercased()) }
             ].compactMap { $0 }
             if !items.isEmpty {
                 HStack(spacing: 0) {
                     ForEach(Array(items.enumerated()), id: \.offset) { i, it in
                         if i > 0 {
-                            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 0.5, height: 18)
+                            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 0.5, height: 30)
                         }
-                        Label(it.2, systemImage: it.0)
-                            .font(.subheadline.weight(.semibold))
-                            .labelStyle(TintedIconLabel(tint: it.1))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .frame(maxWidth: .infinity)
+                        VStack(spacing: 3) {
+                            HStack(spacing: 5) {
+                                Image(systemName: it.0).foregroundStyle(it.1)
+                                Text(it.2).monospacedDigit()
+                            }
+                            .font(.headline)
+                            Text(it.3)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                 }
                 .padding(.vertical, 12)
-                .padding(.horizontal, 6)
-                .glassCapsule()
-                .padding(.horizontal, 28)
+                .padding(.horizontal, 8)
+                .glassShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .padding(.horizontal, 20)
                 .padding(.top, 12)
             }
         }
         .frame(maxWidth: .infinity)
         .task(id: u.cover ?? u.avatar) { tint = await CoverTint.color(u.cover ?? u.avatar) }
-    }
-
-    private func folderIcon(_ name: String) -> String {
-        let n = name.lowercased()
-        if n.contains("любим") { return "heart.fill" }
-        if n.contains("смотрю") || n.contains("читаю") { return "play.circle.fill" }
-        if n.contains("план") { return "calendar" }
-        if n.contains("просмотр") || n.contains("прочитан") { return "checkmark.circle.fill" }
-        if n.contains("брош") { return "xmark.circle.fill" }
-        if n.contains("отлож") { return "pause.circle.fill" }
-        if n.contains("не нрав") { return "hand.thumbsdown.fill" }
-        return "bookmark.fill"
     }
 
     private func stat(_ icon: String, _ tint: Color, _ text: String) -> some View {
@@ -7969,8 +8006,9 @@ struct ProfileView: View {
                 Image(systemName: folderIcon(f.name)).font(.system(size: 17, weight: .semibold)).frame(width: 24)
                 Text(f.name)
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .multilineTextAlignment(.leading)
                 Spacer(minLength: 4)
                 Text(f.count.map(String.init) ?? "")
                     .font(.title3.bold().monospacedDigit())
