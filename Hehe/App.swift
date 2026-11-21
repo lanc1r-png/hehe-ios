@@ -2446,6 +2446,7 @@ struct FavoritesView: View {
                 .padding(.top, 6)
             }
             .refreshable { await refresh(force: true) }
+            .statusBarBlur()
             .task { await refresh(force: false) }
             .background(AppBackground())
             .alert("Название папки", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
@@ -2604,7 +2605,7 @@ enum BackupManager {
         let fav = count(["favorites.v1", "favorites.novels.v1", "favorites.manga.v1", "favorites.hentai.v1"])
         let hist = count(["history.v1", "history.novels.v1", "history.manga.v1", "history.hentai.v1"])
         var s = "В копии: избранное \(fav), история \(hist)"
-        if let d = root["date"] as? Date { s += ", сохранена \(d.formatted(date: .abbreviated, time: .shortened))" }
+        if let d = root["date"] as? Date { s += ", сохранена \(ruDate(d))" }
         return s + "."
     }
 }
@@ -2786,6 +2787,40 @@ struct SiteLogView: View {
     }
 }
 
+private struct SectionTintKey: EnvironmentKey { static let defaultValue = Color(hex: "8E8E93") }
+extension EnvironmentValues {
+    var sectionTint: Color {
+        get { self[SectionTintKey.self] }
+        set { self[SectionTintKey.self] = newValue }
+    }
+}
+
+/// Значок строки в настройках: цвет задаёт раздел, а не случай
+struct SettingsIcon: View {
+    let name: String
+    @Environment(\.sectionTint) private var tint
+    var body: some View {
+        Image(systemName: name)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 30, height: 30)
+            .background(tint.gradient, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Цвета разделов настроек
+enum SettingsTint {
+    static let feel = Color(hex: "64D2FF")
+    static let reading = Color(hex: "FF9F0A")
+    static let playback = Color(hex: "FF375F")
+    static let downloads = Color(hex: "0A84FF")
+    static let data = Color(hex: "5E5CE6")
+    static let profile = Color(hex: "BF5AF2")
+    static let backup = Color(hex: "30D158")
+    static let dev = Color(hex: "8E8E93")
+    static let danger = Color(hex: "FF453A")
+}
+
 struct SettingsView: View {
     @State private var imageCacheBytes = 0
     @AppStorage("accent.hex") private var accentHex = Theme.defaultAccentHex
@@ -2821,6 +2856,8 @@ struct SettingsView: View {
     @State private var showFolderImporter = false
     @State private var backupInfo = ""
     @State private var confirmSignOut = false
+    @State private var confirmHistory = false
+    @State private var confirmFavorites = false
     @AppStorage("backup.sent") private var backupSent: Double = 0
 
     private func finishRestore(_ d: Data?, _ reason: String) {
@@ -2959,18 +2996,9 @@ struct SettingsView: View {
 
     // MARK: ряды в стиле «Настроек» iOS
 
-    private func iconBadge(_ name: String) -> some View {
-        let palette: [Color] = [Color(hex: "0A84FF"), Color(hex: "30D158"), Color(hex: "FF9F0A"), Color(hex: "BF5AF2"),
-                                Color(hex: "FF375F"), Color(hex: "64D2FF"), Color(hex: "5E5CE6"), Color(hex: "8E8E93")]
-        let h = name.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xFFFF }
-        return Image(systemName: name)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 30, height: 30)
-            .background(palette[h % palette.count].gradient, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
+    private func iconBadge(_ name: String) -> some View { SettingsIcon(name: name) }
 
-    private var rowDivider: some View { Divider().padding(.leading, 44) }
+    private var rowDivider: some View { Divider().padding(.leading, 42) }
 
     private func listCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 0) { content() }
@@ -2980,60 +3008,74 @@ struct SettingsView: View {
             .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
     }
 
-    private func section<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
+    private func section<C: View>(_ title: String, tint: Color = SettingsTint.dev, footer: String? = nil,
+                                  @ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase).padding(.horizontal, 18)
             listCard { content() }
+                .environment(\.sectionTint, tint)
             if let footer {
-                Text(footer).font(.footnote).foregroundStyle(.secondary)
+                Text(footer.noHyphens).font(.footnote).foregroundStyle(.secondary)
                     .padding(.horizontal, 18)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    private func toggleRow(_ icon: String, _ title: String, _ on: Binding<Bool>) -> some View {
-        HStack(spacing: 12) {
-            iconBadge(icon)
-            Toggle(title, isOn: on).tint(Theme.accent)
+    /// Короткое название в одну строку и, если нужно, серая подпись под ним
+    private func rowText(_ title: String, _ subtitle: String?, tint: Color = .primary) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.body).foregroundStyle(tint).lineLimit(1).minimumScaleFactor(0.85)
+            if let subtitle {
+                Text(subtitle.noHyphens).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+            }
         }
-        .font(.body)
-        .padding(.vertical, 9)
     }
 
-    private func actionRow(_ icon: String, _ title: String, tint: Color = .primary, _ run: @escaping () -> Void) -> some View {
+    private func toggleRow(_ icon: String, _ title: String, _ subtitle: String? = nil, _ on: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            iconBadge(icon)
+            rowText(title, subtitle)
+            Spacer(minLength: 8)
+            Toggle("", isOn: on).labelsHidden().tint(Theme.accent)
+        }
+        .padding(.vertical, subtitle == nil ? 9 : 8)
+    }
+
+    private func actionRow(_ icon: String, _ title: String, _ subtitle: String? = nil, tint: Color = .primary,
+                           _ run: @escaping () -> Void) -> some View {
         Button(action: run) {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).font(.body).foregroundStyle(tint)
+                rowText(title, subtitle, tint: tint)
                 Spacer(minLength: 0)
             }
-            .padding(.vertical, 12)
+            .padding(.vertical, subtitle == nil ? 12 : 9)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
     }
 
-    private func linkRow<D: View>(_ icon: String, _ title: String, value: String? = nil,
+    private func linkRow<D: View>(_ icon: String, _ title: String, _ subtitle: String? = nil, value: String? = nil,
                                   @ViewBuilder _ dest: @escaping () -> D) -> some View {
         NavigationLink {
             dest()
         } label: {
             HStack(spacing: 12) {
                 iconBadge(icon)
-                Text(title).font(.body).foregroundStyle(.primary)
+                rowText(title, subtitle)
                 Spacer(minLength: 8)
-                if let value { Text(value).font(.subheadline).foregroundStyle(.secondary) }
+                if let value { Text(value).font(.subheadline).foregroundStyle(.secondary).lineLimit(1) }
                 Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
             }
-            .padding(.vertical, 12)
+            .padding(.vertical, subtitle == nil ? 12 : 9)
             .contentShape(Rectangle())
         }
         .buttonStyle(.pressable)
     }
 
     private func textRow(_ t: String) -> some View {
-        Text(t).font(.subheadline).foregroundStyle(.secondary)
+        Text(t.noHyphens).font(.subheadline).foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.vertical, 12)
@@ -3098,7 +3140,7 @@ struct SettingsView: View {
             .padding(5)
             .background(Theme.card, in: RoundedRectangle(cornerRadius: 27, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 27, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
-            Text(platformHint)
+            Text(platformHint.noHyphens)
                 .font(.footnote).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
@@ -3151,17 +3193,17 @@ struct SettingsView: View {
     // MARK: чтение и просмотр
 
     private var feelBlock: some View {
-        section("Отклик") {
-            toggleRow("hand.tap.fill", "Вибрация при нажатиях", $haptics)
+        section("Отклик", tint: SettingsTint.feel) {
+            toggleRow("hand.tap.fill", "Вибрация", "при нажатиях", $haptics)
                 .onChange(of: haptics) { on in if on { Haptics.bump() } }
             rowDivider
-            toggleRow("sun.max.fill", "Не гасить экран при чтении", $keepAwake)
+            toggleRow("sun.max.fill", "Не гасить экран", "пока читаешь или смотришь", $keepAwake)
         }
     }
 
     private var ranobeBlock: some View {
-        section("Чтение ранобэ",
-                footer: "В режиме «Страницы» глава режется на страницы по размеру экрана. Размер шрифта и тему можно менять в самой читалке.") {
+        section("Чтение ранобэ", tint: SettingsTint.reading,
+                footer: "В режиме «Страницы» глава режется на страницы по размеру экрана. Шрифт и тему можно менять в самой читалке.") {
             segRow("Режим", $novelMode, [("pages", "Страницы"), ("scroll", "Прокрутка")])
             rowDivider
             segRow("Листание", $novelAnim, [("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")])
@@ -3169,58 +3211,60 @@ struct SettingsView: View {
     }
 
     private var mangaBlock: some View {
-        section("Чтение манги", footer: "Для каждого тайтла режим можно поменять прямо в читалке, он запомнится.") {
+        section("Чтение манги", tint: SettingsTint.reading,
+                footer: "Режим можно поменять для каждого тайтла прямо в читалке, он запомнится.") {
             segRow("Режим по умолчанию", $mangaMode, [("auto", "Авто"), ("pages", "Страницы"), ("scroll", "Лента")])
             rowDivider
             segRow("Листание", $mangaAnim, [("slide", "Сдвиг"), ("fade", "Плавно"), ("book", "Как в книге")])
             rowDivider
-            toggleRow("hand.point.up.left.fill", "Листать тапом по краям экрана", $tapZones)
+            toggleRow("hand.point.up.left.fill", "Тап по краям", "листает страницы", $tapZones)
             rowDivider
-            toggleRow("rectangle.inset.filled", "Фон под страницу (белый или чёрный по краям)", $mangaAutoBG)
+            toggleRow("rectangle.inset.filled", "Фон под страницу", "белый или чёрный по краям", $mangaAutoBG)
         }
     }
 
     private var playbackBlock: some View {
-        section("Воспроизведение",
-                footer: "Kodik открывается в веб-плеере: выбери качество и нажми «на весь экран», тогда включится родной плеер iOS. Если выключить первый пункт, весь экран останется внутри веб-плеера.") {
-            toggleRow("play.rectangle.fill", "Весь экран в родном плеере iOS", $autoNative)
+        section("Воспроизведение", tint: SettingsTint.playback,
+                footer: "Kodik открывается в веб-плеере: выбери качество и нажми «на весь экран» — включится родной плеер iOS.") {
+            toggleRow("play.rectangle.fill", "Родной плеер iOS", "на весь экран", $autoNative)
             rowDivider
-            toggleRow("bolt.fill", "Kodik: сразу родной плеер, без веб-плеера", $kodikDirect)
+            toggleRow("bolt.fill", "Kodik без веб-плеера", "сразу родной плеер", $kodikDirect)
             rowDivider
-            toggleRow("gobackward", "Продолжать с места остановки", $resume)
+            toggleRow("gobackward", "С места остановки", "продолжать серию, где закончил", $resume)
             rowDivider
-            toggleRow("forward.end.fill", "Следующая серия сама после конца", $autoNext)
+            toggleRow("forward.end.fill", "Автопереход", "следующая серия после конца", $autoNext)
         }
     }
 
     // MARK: данные
 
     private var downloadsBlock: some View {
-        section("Загрузки · ранобэ и манга") {
-            if platform != "anime" {
-                linkRow("arrow.down.circle.fill", "Скачанное",
-                        value: "\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))") { OfflineLibraryView() }
-            } else {
-                textRow("Скачанные главы доступны на платформах «Ранобэ» и «Манга».")
-            }
+        section("Загрузки", tint: SettingsTint.downloads) {
+            linkRow("arrow.down.circle.fill", "Скачанное",
+                    value: offline.allEntries.isEmpty ? "пусто" : "\(offline.allEntries.count) · \(fmtBytes(offline.totalBytes))") { OfflineLibraryView() }
             rowDivider
             HStack(spacing: 12) {
                 iconBadge("externaldrive.fill")
+                rowText("Лимит места", nil)
+                Spacer(minLength: 8)
                 Picker("Лимит места", selection: $offLimit) {
                     Text("Без лимита").tag(0)
                     ForEach([1, 2, 3, 5, 10, 20, 50], id: \.self) { Text("\($0) ГБ").tag($0) }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .tint(.secondary)
             }
             .padding(.vertical, 6)
             if offLimit > 0 {
                 rowDivider
                 segRow("При превышении", $offOverflow, [("refuse", "Отказаться"), ("purge", "Удалять прочитанное")])
-                textRow("Занято: \(fmtBytes(OfflineStore.usedBytes)) из \(offLimit) ГБ (ранобэ и манга вместе). «Отказаться»: загрузка останавливается на лимите. «Удалять прочитанное»: сначала стираются самые давние прочитанные главы.")
+                textRow("Занято \(fmtBytes(OfflineStore.usedBytes)) из \(offLimit) ГБ. «Отказаться» — загрузка встанет на лимите, «Удалять прочитанное» — сначала сотрутся самые давние прочитанные главы.")
             }
             rowDivider
-            toggleRow("wifi", "Скачивать только по Wi‑Fi", $offWifi)
+            toggleRow("wifi", "Только по Wi‑Fi", nil, $offWifi)
             rowDivider
-            toggleRow("arrow.down.to.line", "Докачивать 3 следующие главы при чтении", $offPrefetch)
+            toggleRow("arrow.down.to.line", "Докачивать вперёд", "3 следующие главы при чтении", $offPrefetch)
             if offline.totalBytes > 0 {
                 rowDivider
                 actionRow("trash.fill", "Удалить все загрузки", tint: .red) { confirmOffline = true }
@@ -3232,35 +3276,57 @@ struct SettingsView: View {
     }
 
     private var dataBlock: some View {
-        section("Данные", footer: info) {
-            actionRow("photo.stack.fill", "Очистить кэш картинок" + (imageCacheBytes > 0 ? " · " + fmtBytes(imageCacheBytes) : "")) {
-                ImageLoader.clearAllCaches()
-                imageCacheBytes = ImageLoader.cachesBytes
-                info = "Кэш обложек и просмотренных страниц очищен. Скачанные главы на месте."
+        section("Данные", tint: SettingsTint.data, footer: info) {
+            HStack(spacing: 12) {
+                iconBadge("photo.stack.fill")
+                rowText("Кэш картинок", "обложки и просмотренные страницы")
+                Spacer(minLength: 8)
+                Text(fmtBytes(imageCacheBytes)).font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+                Button("Очистить") {
+                    Haptics.tap()
+                    ImageLoader.clearAllCaches()
+                    imageCacheBytes = ImageLoader.cachesBytes
+                    info = "Кэш картинок очищен. Скачанные главы на месте."
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.accent)
+                .buttonStyle(.pressable)
+                .disabled(imageCacheBytes == 0)
             }
+            .padding(.vertical, 9)
             .onAppear { imageCacheBytes = ImageLoader.cachesBytes }
+        }
+    }
+
+    /// Шапка, аватарка и статистика — одним разделом
+    private var profileLookBlock: some View {
+        section("Профиль", tint: SettingsTint.profile) {
+            linkRow("paintbrush.fill", "Шапка и аватарка", "фото, GIF или видео — видны только тебе") { ProfileAppearanceView() }
             rowDivider
-            actionRow("clock.arrow.circlepath", "Сбросить историю просмотра") {
+            linkRow("chart.bar.xaxis", "Моя активность", "серия дней, сколько прочитано и просмотрено") { StatsView() }
+        }
+    }
+
+    /// Сбросы отдельно от обычных пунктов, каждый — с подтверждением
+    private var resetBlock: some View {
+        section("Сброс", tint: SettingsTint.danger,
+                footer: auth.user != nil ? "Тайтлы из твоих списков на сайте вернутся в «Избранное» при следующей синхронизации." : nil) {
+            actionRow("clock.arrow.circlepath", "Сбросить историю", "прогресс чтения и просмотра", tint: .red) { confirmHistory = true }
+            rowDivider
+            actionRow("heart.slash.fill", "Очистить избранное", "на всех платформах", tint: .red) { confirmFavorites = true }
+        }
+        .confirmationDialog("Сбросить историю просмотра и чтения?", isPresented: $confirmHistory, titleVisibility: .visible) {
+            Button("Сбросить", role: .destructive) {
                 ProgressStore.shared.clear(); HistoryStore.shared.clear()
                 HistoryStore.novels.clear(); HistoryStore.manga.clear(); HistoryStore.hentai.clear(); ReadStore.shared.clear(); ReadPosStore.shared.clear()
                 info = "История просмотра и чтения сброшена"
             }
-            rowDivider
-            actionRow("heart.slash.fill", "Очистить избранное", tint: .red) {
-                FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); FavoritesStore.hentai.clear(); info = "Избранное очищено"
+        }
+        .confirmationDialog("Очистить избранное?", isPresented: $confirmFavorites, titleVisibility: .visible) {
+            Button("Очистить", role: .destructive) {
+                FavoritesStore.shared.clear(); FavoritesStore.novels.clear(); FavoritesStore.manga.clear(); FavoritesStore.hentai.clear()
+                info = "Избранное очищено"
             }
-        }
-    }
-
-    private var profileLookBlock: some View {
-        section("Профиль", footer: "Своя шапка (фото, GIF или видео) и аватарка — видны только тебе.") {
-            linkRow("paintbrush.fill", "Шапка и аватарка") { ProfileAppearanceView() }
-        }
-    }
-
-    private var statsBlock: some View {
-        section("Статистика", footer: "Сколько просмотрено и прочитано, серия дней подряд.") {
-            linkRow("chart.bar.xaxis", "Моя активность") { StatsView() }
         }
     }
 
@@ -3283,7 +3349,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(days.map { "Копия не отправлялась \($0) дн." } ?? "Копия ещё не отправлялась")
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
-                        Text("Отправь файл в Telegram или Файлы: при переустановке данные не пропадут.")
+                        Text("Отправь файл в Telegram или Файлы: при переустановке данные не пропадут.".noHyphens)
                             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
                     }
                     Spacer(minLength: 0)
@@ -3297,38 +3363,31 @@ struct SettingsView: View {
         }
     }
 
+    /// Внутри только действия, пояснение — подписью под карточкой
     private var backupBlock: some View {
-        section("Резервная копия") {
-            textRow("Прогресс просмотра и чтения, избранное, история и настройки. Файл Yume-backup.plist сам создаётся и обновляется в папке приложения при каждом сворачивании.")
-            rowDivider
+        section("Резервная копия", tint: SettingsTint.backup,
+                footer: "Прогресс, избранное, история и настройки. Файл сам обновляется при каждом сворачивании. Перед удалением приложения скопируй его, а после установки положи в ту же папку — всё подхватится само.") {
             HStack(spacing: 12) {
                 iconBadge("folder.fill")
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Файлы → На iPhone → Yume").font(.footnote.weight(.semibold)).foregroundStyle(Theme.accent)
-                    if let d = BackupManager.lastAuto {
-                        Text("Обновлено: \(d.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
+                rowText("Файл копии",
+                        "Файлы → На iPhone → Yume" + (BackupManager.lastAuto.map { " · \(ruDate($0))" } ?? ""))
                 Spacer(minLength: 0)
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 9)
             rowDivider
-            textRow("Перед удалением приложения скопируй этот файл. После новой установки положи его в ту же папку и заново открой Yume: всё подхватится само.")
-            rowDivider
-            actionRow("arrow.down.doc.fill", "Загрузить из файла в папке приложения") {
+            actionRow("arrow.down.doc.fill", "Загрузить копию", "из папки приложения") {
                 let r = BackupManager.readAppFolderCopy()
                 BackupManager.acceptExternal()
                 finishRestore(r.0, r.1)
             }
             rowDivider
-            actionRow("square.and.arrow.up.fill", "Отправить копию (Telegram, Файлы…)") {
+            actionRow("square.and.arrow.up.fill", "Отправить копию", "в Telegram, Файлы и т. п.") {
                 if let u = BackupManager.shareURL() { backupSent = Date().timeIntervalSince1970; shareItem = ShareItem(url: u) }
                 else { backupInfo = "Не удалось подготовить файл." }
             }
             if restored {
                 rowDivider
-                actionRow("power", "Закрыть приложение, чтобы применить") { exit(0) }
+                actionRow("power", "Закрыть приложение", "чтобы применить копию") { exit(0) }
             }
             if !backupInfo.isEmpty {
                 rowDivider
@@ -3338,36 +3397,46 @@ struct SettingsView: View {
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 
-    private var miscBlock: some View {
-        section("Прочее") {
-            linkRow("waveform.path.ecg", "Журнал запросов сайта") { SiteLogView() }
-            rowDivider
-            textRow("Открывает сайт внутри приложения и записывает, какие запросы он отправляет, когда ты отмечаешь серию или главу. Нужен, чтобы настроить синхронизацию с сайтом.")
-            rowDivider
-            if let u = auth.user {
-                actionRow("rectangle.portrait.and.arrow.right", "Выйти из аккаунта · \(u.username)", tint: .red) {
-                    confirmSignOut = true
-                }
-            } else {
-                HStack(spacing: 12) {
-                    iconBadge("person.crop.circle.fill")
-                    Text("Вход выполняется во вкладке «Профиль».").font(.subheadline).foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                }
-                .padding(.vertical, 8)
-            }
-            rowDivider
-            HStack(spacing: 12) {
-                iconBadge("info.circle.fill")
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Yume · версия 1.0")
-                    Text("Данные: animelib.org. Приложение неофициальное.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.vertical, 10)
+    private var devBlock: some View {
+        section("Для разработчика", tint: SettingsTint.dev) {
+            linkRow("waveform.path.ecg", "Журнал запросов сайта", "чтобы настроить синхронизацию с сайтом") { SiteLogView() }
         }
+    }
+
+    @ViewBuilder
+    private var accountBlock: some View {
+        if let u = auth.user {
+            listCard {
+                Button { confirmSignOut = true } label: {
+                    Text("Выйти из аккаунта \(u.username)")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.pressable)
+            }
+        } else {
+            Text("Вход — во вкладке «Профиль».")
+                .font(.footnote).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var versionFooter: some View {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let host = URL(string: LibSite.current.origin)?.host ?? "animelib.org"
+        return VStack(spacing: 2) {
+            Text("Yume \(v)").font(.footnote.weight(.semibold))
+            Text("Данные: \(host) · неофициальное приложение")
+                .font(.caption)
+        }
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
     }
 
     var body: some View {
@@ -3387,17 +3456,20 @@ struct SettingsView: View {
                     feelBlock
                     if platform == "ranobe" { ranobeBlock }
                     if platform == "manga" || platform == "hentai" { mangaBlock }
-                    playbackBlock
-                    downloadsBlock
+                    // каждый раздел — только там, где он работает
+                    if platform == "anime" { playbackBlock } else { downloadsBlock }
                     dataBlock
                     profileLookBlock
-                    statsBlock
                     backupBlock
-                    miscBlock
+                    devBlock
+                    resetBlock
+                    accountBlock
+                    versionFooter
                 }
                 .padding(14)
                 .padding(.bottom, 90)
             }
+            .statusBarBlur()
             .background(AppBackground())
             .toolbar(.hidden, for: .navigationBar)
             .confirmationDialog("Выйти из аккаунта?", isPresented: $confirmSignOut, titleVisibility: .visible) {
@@ -3581,6 +3653,26 @@ final class HomeViewModel: ObservableObject {
             popularHasNext = r.hasNext && !r.items.isEmpty
         } else {
             popularHasNext = false
+        }
+    }
+}
+
+extension View {
+    /// Мягкое размытие под часами: содержимое уезжает под строку состояния, как в системных приложениях
+    func statusBarBlur() -> some View {
+        overlay(alignment: .top) {
+            GeometryReader { g in
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .frame(height: g.safeAreaInsets.top + 14)
+                    .mask(LinearGradient(stops: [
+                        .init(color: .black, location: 0),
+                        .init(color: .black, location: 0.75),
+                        .init(color: .clear, location: 1)
+                    ], startPoint: .top, endPoint: .bottom))
+            }
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
         }
     }
 }
@@ -4388,6 +4480,7 @@ struct HomeView: View {
                 }
                 .scrollDismissesKeyboard(.immediately)
                 .refreshable { await vm.load(force: true) }
+                .statusBarBlur()
             }
             .background {
                 ZStack(alignment: .top) {
@@ -4485,7 +4578,7 @@ struct RootView: View {
             if phase == .background { BackupManager.writeAuto() }
             if phase == .active { Task { await FavUpdater.refreshIfDue() } }
             if phase == .active, let d = BackupManager.externalCopyDate() {
-                foundText = d.formatted(date: .abbreviated, time: .shortened)
+                foundText = ruDate(d)
                 showFound = true
             }
         }
@@ -9832,9 +9925,27 @@ struct OfflineEntry: Codable {
     var updated: Date
 }
 
+/// Размер по-русски: «0 КБ», «820 КБ», «107,7 МБ», «1,25 ГБ» (системный формат давал «Zero KB»).
 func fmtBytes(_ n: Int) -> String {
-    ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    func num(_ v: Double, _ digits: Int) -> String {
+        String(format: "%.\(digits)f", v).replacingOccurrences(of: ".", with: ",")
+    }
+    if n <= 0 { return "0 КБ" }
+    let kb = Double(n) / 1000
+    if kb < 1000 { return "\(max(1, Int(kb.rounded()))) КБ" }
+    let mb = kb / 1000
+    if mb < 1000 { return num(mb, mb < 100 ? 1 : 0) + " МБ" }
+    return num(mb / 1000, 2) + " ГБ"
 }
+
+private let ruDateFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "ru_RU")
+    f.dateFormat = "d MMMM, HH:mm"
+    return f
+}()
+/// «21 ноября, 23:51»
+func ruDate(_ d: Date) -> String { ruDateFmt.string(from: d) }
 
 /// Скачанные главы лежат в Application Support/Offline/<id тайтла>/:
 /// <id главы>.json (ответ сайта как есть) и картинки <id главы>_<хэш>.img.
