@@ -8222,8 +8222,9 @@ struct ProfileAppearanceView: View {
                 card("Шапка профиля", footer: "Фото, GIF или видео. Видео — первые 15 секунд, без звука, крутится по кругу.") {
                     source($look.useHeader, hasOwn: look.header != nil)
                     Divider()
+                    let headerTitle = look.header == nil ? "Выбрать из галереи" : "Заменить"
                     PhotosPicker(selection: $headerItem, matching: .any(of: [.images, .videos])) {
-                        row("photo.on.rectangle.angled", look.header == nil ? "Выбрать из галереи" : "Заменить")
+                        row("photo.on.rectangle.angled", headerTitle)
                     }
                     if let h = look.header {
                         Divider()
@@ -8236,8 +8237,9 @@ struct ProfileAppearanceView: View {
                 card("Аватарка", footer: "Фото или GIF — GIF останется анимированной.") {
                     source($look.useAvatar, hasOwn: look.avatar != nil)
                     Divider()
+                    let avatarTitle = look.avatar == nil ? "Выбрать из галереи" : "Заменить"
                     PhotosPicker(selection: $avatarItem, matching: .images) {
-                        row("person.crop.square", look.avatar == nil ? "Выбрать из галереи" : "Заменить")
+                        row("person.crop.square", avatarTitle)
                     }
                     if let a = look.avatar {
                         Divider()
