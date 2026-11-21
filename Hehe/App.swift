@@ -6173,7 +6173,15 @@ final class CommentsViewModel: ObservableObject {
 
     func loadAll(max: Int = 10) async {
         var n = 0
-        while !finished && n < max { await loadMore(); n += 1 }
+        while !finished && n < max {
+            // страница уже грузится (например, предзагрузкой) — ждём её, а не пропускаем
+            if isLoading {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+                continue
+            }
+            await loadMore(); n += 1
+        }
     }
 
     func reload() async {
@@ -9592,6 +9600,7 @@ struct MangaPageView: View {
     var dim: CGFloat = 1
     var autoBG = false
     let onTap: (CGFloat) -> Void
+    var onSwipeUp: (() -> Void)? = nil
     @State private var image: UIImage?
     @State private var failed = false
     @State private var note = ""
@@ -9688,7 +9697,7 @@ struct MangaPageView: View {
                 }
                 .simultaneousGesture(SpatialTapGesture().onEnded { v in onTap(v.location.x / max(size.width, 1)) })
             } else {
-                ZoomableImageView(image: image, dim: dim, onTap: onTap)
+                ZoomableImageView(image: image, dim: dim, onTap: onTap, onSwipeUp: onSwipeUp)
                     .frame(width: size.width, height: size.height)
             }
         } else if failed {
@@ -9757,11 +9766,34 @@ struct ZoomableImageView: UIViewRepresentable {
     let image: UIImage
     var dim: CGFloat = 1
     let onTap: (CGFloat) -> Void
+    /// Свайп вверх по странице (только без зума) — открыть комментарии
+    var onSwipeUp: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator: NSObject, UIScrollViewDelegate {
+    final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         var onTap: ((CGFloat) -> Void)?
+        var onSwipeUp: (() -> Void)?
+
+        /// Начинаем, только если страница не увеличена и палец идёт явно вверх, а не вбок (листание).
+        func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+            guard let pan = g as? UIPanGestureRecognizer, let s = pan.view as? UIScrollView else { return true }
+            guard onSwipeUp != nil, s.zoomScale <= s.minimumZoomScale + 0.02 else { return false }
+            let v = pan.velocity(in: s)
+            return v.y < 0 && abs(v.y) > abs(v.x) * 2
+        }
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+        @objc func swipe(_ g: UIPanGestureRecognizer) {
+            guard g.state == .ended, let s = g.view else { return }
+            let t = g.translation(in: s)
+            let v = g.velocity(in: s)
+            // Длинный или быстрый свайп вверх; случайное касание при листании не сработает.
+            guard abs(t.y) > abs(t.x) * 1.8 else { return }
+            if t.y < -110 || (t.y < -60 && v.y < -900) { onSwipeUp?() }
+        }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { (scrollView as? FitScrollView)?.imageView }
         func scrollViewDidZoom(_ scrollView: UIScrollView) { scrollView.setNeedsLayout() }
@@ -9805,16 +9837,86 @@ struct ZoomableImageView: UIViewRepresentable {
         one.require(toFail: dbl)
         s.addGestureRecognizer(dbl)
         s.addGestureRecognizer(one)
+        let up = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.swipe(_:)))
+        up.delegate = context.coordinator
+        up.cancelsTouchesInView = false
+        s.addGestureRecognizer(up)
         return s
     }
 
     func updateUIView(_ s: FitScrollView, context: Context) {
         context.coordinator.onTap = onTap
+        context.coordinator.onSwipeUp = onSwipeUp
         if s.imageView.image !== image {
             s.imageView.image = image
             s.setNeedsLayout()
         }
         s.imageView.alpha = dim
+    }
+}
+
+/// Комментарии глав, загруженные заранее: открываются мгновенно, без ожидания сети.
+@MainActor
+final class ChapterCommentsCache {
+    private var vms: [Int: CommentsViewModel] = [:]
+
+    func vm(_ chapter: NovelChapter, novel: Anime) -> CommentsViewModel {
+        if let v = vms[chapter.id] { return v }
+        let v = CommentsViewModel(animeID: chapter.id, slug: novel.slugUrl ?? String(novel.id), postType: "chapter")
+        vms[chapter.id] = v
+        if vms.count > 6, let old = vms.keys.first(where: { $0 != chapter.id }) { vms[old] = nil }
+        return v
+    }
+
+    /// Тихо подгружает первую страницу комментариев главы.
+    func prefetch(_ chapter: NovelChapter, novel: Anime) {
+        let v = vm(chapter, novel: novel)
+        guard v.items.isEmpty, !v.isLoading else { return }
+        Task { await v.loadMore() }
+    }
+}
+
+/// Превью комментариев в конце главы (режим «Лента»): долистал — и видишь первые комментарии.
+struct ChapterCommentsPreview: View {
+    @ObservedObject var vm: CommentsViewModel
+    let open: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Комментарии", systemImage: "bubble.left.and.bubble.right.fill")
+                    .font(.headline)
+                Spacer()
+                if vm.isLoading && vm.items.isEmpty { ProgressView().tint(.white) }
+            }
+            if vm.items.isEmpty && !vm.isLoading {
+                Text("Комментариев пока нет — будь первым").font(.subheadline).foregroundStyle(.white.opacity(0.6))
+            }
+            ForEach(Array(vm.sorted.prefix(3))) { c in
+                HStack(alignment: .top, spacing: 10) {
+                    RemoteImage(url: c.avatar, maxPixel: 96)
+                        .frame(width: 32, height: 32)
+                        .clipShape(Circle())
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(c.username).font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.75))
+                        Text(c.text).font(.subheadline).lineLimit(4).foregroundStyle(.white)
+                    }
+                }
+            }
+            Button(action: open) {
+                Text(vm.items.count > 3 ? "Все комментарии (\(vm.items.count)\(vm.items.count >= 20 ? "+" : ""))" : "Открыть комментарии")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.white.opacity(0.1), in: Capsule())
+            }
+            .buttonStyle(.pressable)
+        }
+        .foregroundStyle(.white)
+        .padding(18)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(.horizontal, 14)
+        .padding(.bottom, 40)
     }
 }
 
@@ -9828,13 +9930,13 @@ struct ChapterCommentsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showCompose = false
 
-    init(novel: Anime, chapter: NovelChapter, page: Int = 1, pageCount: Int = 0) {
+    init(novel: Anime, chapter: NovelChapter, page: Int = 1, pageCount: Int = 0, vm ready: CommentsViewModel? = nil) {
         self.novel = novel
         self.chapter = chapter
         self.pageCount = pageCount
         _page = State(initialValue: max(page, 1))
-        _vm = StateObject(wrappedValue: CommentsViewModel(animeID: chapter.id, slug: novel.slugUrl ?? String(novel.id),
-                                                          postType: "chapter"))
+        _vm = StateObject(wrappedValue: ready ?? CommentsViewModel(animeID: chapter.id, slug: novel.slugUrl ?? String(novel.id),
+                                                                   postType: "chapter"))
     }
 
     private var hasPages: Bool { vm.items.contains { $0.page != nil } }
@@ -10623,6 +10725,8 @@ struct MangaReaderView: View {
     @State private var pendingPage: Int?
     @State private var jumpTick = 0
     @State private var showComments = false
+    /// Комментарии глав подгружаются заранее, чтобы открывались сразу
+    @State private var commentsCache = ChapterCommentsCache()
     @State private var preloadTask: Task<Void, Never>?
     @State private var titleMode: String
     @State private var prefs: MangaTitlePrefs
@@ -10832,7 +10936,7 @@ struct MangaReaderView: View {
                         .onTapGesture { handleTap(0.5) }
                     BookPager(count: pages.count + 1, current: $current) { i in
                         i < pages.count
-                            ? AnyView(MangaPageView(page: pages[i], dim: 0.9, autoBG: effAutoBG, onTap: handleTap))
+                            ? AnyView(MangaPageView(page: pages[i], dim: 0.9, autoBG: effAutoBG, onTap: handleTap, onSwipeUp: openComments))
                             : AnyView(endCard)
                     }
                     .frame(width: fitW, height: fitH)
@@ -10842,7 +10946,7 @@ struct MangaReaderView: View {
         case "fade":
             ZStack {
                 if current < pages.count {
-                    MangaPageView(page: pages[current], autoBG: effAutoBG, onTap: handleTap)
+                    MangaPageView(page: pages[current], autoBG: effAutoBG, onTap: handleTap, onSwipeUp: openComments)
                         .id(current)
                         .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 1.04)),
                                                 removal: .opacity))
@@ -10861,7 +10965,7 @@ struct MangaReaderView: View {
         default:
             TabView(selection: $current) {
                 ForEach(pages) { p in
-                    MangaPageView(page: p, autoBG: effAutoBG, onTap: handleTap).tag(p.id)
+                    MangaPageView(page: p, autoBG: effAutoBG, onTap: handleTap, onSwipeUp: openComments).tag(p.id)
                 }
                 endCard.tag(pages.count)
             }
@@ -11017,6 +11121,10 @@ struct MangaReaderView: View {
                                 }
                                 endCard.frame(height: 360).id(pages.count)
                                     .onAppear { reachedEnd = true }
+                                // Долистал до конца — ниже сразу комментарии к главе
+                                if let c = chapter {
+                                    ChapterCommentsPreview(vm: commentsCache.vm(c, novel: novel), open: openComments)
+                                }
                             }
                             .background(ScrollFinder { scroller.scrollView = $0 })
                         }
@@ -11124,8 +11232,17 @@ struct MangaReaderView: View {
         .sheet(isPresented: $showComments) {
             if let c = chapter {
                 ChapterCommentsView(novel: novel, chapter: c,
-                                    page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count)
+                                    page: min(shown + 1, max(pages.count, 1)), pageCount: pages.count,
+                                    vm: commentsCache.vm(c, novel: novel))
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
             }
+        }
+        .task(id: index) {
+            // Пока читаешь начало главы, тихо подгружаем первые комментарии к ней.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled, let c = chapter else { return }
+            commentsCache.prefetch(c, novel: novel)
         }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = Settings.bool("set.keepAwake", true) }
         .onDisappear {
@@ -11136,6 +11253,13 @@ struct MangaReaderView: View {
             scroller.stop()
             scroller.detach()
         }
+    }
+
+    /// Открыть комментарии (свайп вверх по странице, кнопка или превью в конце главы).
+    private func openComments() {
+        guard chapter != nil, !showComments else { return }
+        Haptics.tap()
+        showComments = true
     }
 
     private func scheduleHistory(_ ch: NovelChapter) {
