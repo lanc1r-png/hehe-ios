@@ -2993,12 +2993,27 @@ struct SiteWebView: UIViewRepresentable {
         return /cdnlibs\\.org|\\/api\\//i.test(String(u));
       }
       function host(){ try { return location.host; } catch (e) { return ''; } }
-      function send(m, u, b, s){
+      function send(m, u, b, s, r){
         try {
           window.webkit.messageHandlers.hlog.postMessage(JSON.stringify({
-            m: m, u: String(u), b: b ? String(b).slice(0, 400) : '', s: s || 0, f: host()
+            m: m, u: String(u), b: b ? String(b).slice(0, 400) : '', s: s || 0, f: host(), r: r || ''
           }));
         } catch (e) {}
+      }
+      // ответы пишем только для «любого сайта», без рекламы, картинок и кусков видео
+      var noBody = /alloviewroll|prestreamnos|s2517\\.com|google|yandex|gnezdo|sape\\.ru|hybrid\\.ai|kimberlite|skcrtxr|kdmttk|cdn-cgi|\\.(m4s|ts|mp4|aac|jpe?g|png|webp|gif|woff2?)(\\?|#|$)/i;
+      function wantBody(u){ return EVERY && !noBody.test(String(u)); }
+      function cut(t){ t = String(t || ''); return t.length > 6000 ? t.slice(0, 6000) + ' …[обрезано, всего ' + t.length + ']' : t; }
+      if (EVERY) {
+        // HTML страницы и встроенных окон (в плеере обычно лежит список серий и озвучек)
+        document.addEventListener('DOMContentLoaded', function(){
+          try {
+            var top = (window === window.top);
+            var h = document.documentElement ? document.documentElement.outerHTML : '';
+            var lim = top ? 30000 : 60000;
+            send(top ? 'HTML' : 'FRAME-HTML', location.href, '', 0, h.length > lim ? h.slice(0, lim) + ' …[обрезано, всего ' + h.length + ']' : h);
+          } catch (e) {}
+        });
       }
       if (EVERY) {
         var skip = /\\.(png|jpe?g|webp|gif|svg|ico|avif|woff2?|ttf|otf|css|ts|m4s|aac)(\\?|#|$)/i;
@@ -3036,14 +3051,25 @@ struct SiteWebView: UIViewRepresentable {
         var m = ((o && o.method) || (a && a.method) || 'GET').toUpperCase();
         var b = o && o.body;
         var p = of.apply(this, arguments);
-        p.then(function(r){ if (want(m, u)) send(m, u, b, r.status); }).catch(function(){});
+        p.then(function(r){
+          if (!want(m, u)) return;
+          if (wantBody(u)) {
+            try { r.clone().text().then(function(t){ send(m, u, b, r.status, cut(t)); }).catch(function(){ send(m, u, b, r.status); }); }
+            catch (e) { send(m, u, b, r.status); }
+          } else { send(m, u, b, r.status); }
+        }).catch(function(){});
         return p;
       };
       var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(m, u){ this.__m = String(m).toUpperCase(); this.__u = u; return oo.apply(this, arguments); };
       XMLHttpRequest.prototype.send = function(b){
         var x = this;
-        this.addEventListener('loadend', function(){ if (want(x.__m, x.__u)) send(x.__m, x.__u, b, x.status); });
+        this.addEventListener('loadend', function(){
+          if (!want(x.__m, x.__u)) return;
+          var t = '';
+          try { if (wantBody(x.__u) && (x.responseType === '' || x.responseType === 'text')) t = cut(x.responseText); } catch (e) {}
+          send(x.__m, x.__u, b, x.status, t);
+        });
         return os.apply(this, arguments);
       };
     })();
@@ -3066,9 +3092,11 @@ struct SiteWebView: UIViewRepresentable {
             let line = "\(method) \(u)" + (status != 0 || !method.hasPrefix("RES") && method != "IFRAME" && method != "VIDEO" ? " [\(status)]" : "")
                 + (everything ? (frame.map { "  ← \($0)" } ?? "") : "")
                 + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + SiteWebView.mask($0) } ?? "")
-            let once = method.hasPrefix("RES") || method == "IFRAME" || method == "VIDEO"
+            let resp = (o["r"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let full = line + (resp.map { "\n    ответ: " + SiteWebView.mask($0) } ?? "")
+            let once = method.hasPrefix("RES") || method == "IFRAME" || method == "VIDEO" || method.hasSuffix("HTML")
             Task { @MainActor in
-                if once { self.log.addOnce(method + u, line) } else { self.log.add(line) }
+                if once { self.log.addOnce(method + u, full) } else { self.log.add(full) }
             }
         }
 
