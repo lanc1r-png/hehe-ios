@@ -581,13 +581,32 @@ enum KinoAPI {
         guard let pageURL = c.url, let host = pageURL.host else { throw KinoError.player("нет адреса") }
         let origin = "\(pageURL.scheme ?? "https")://\(host)"
         let token = items.first { $0.name == "token" }?.value ?? ""
+        var note = ""
+        if let s = try? await direct(pageURL: pageURL, origin: origin, token: token, note: &note) { return s }
+        // прямой путь не сработал — открываем плеер браузером и берём его собственный ответ
+        let sniffed: String
+        do { sniffed = try await KinoSniffer.capture(pageURL) } catch {
+            throw KinoError.player(note.isEmpty ? "плеер не ответил" : note)
+        }
+        if sniffed.hasPrefix("M3U8 "), let u = URL(string: String(sniffed.dropFirst(5))) {
+            return KinoStream(tracks: [.init(label: source.translation ?? "Озвучка", qualities: [(720, [u])])],
+                              skip: nil, origin: origin, referer: pageURL.absoluteString)
+        }
+        do {
+            return try parseStream(Data(sniffed.utf8), origin: origin, referer: pageURL.absoluteString)
+        } catch {
+            throw KinoError.player("нет ссылок на видео (\(note.isEmpty ? String(sniffed.prefix(160)) : note))")
+        }
+    }
 
+    private static func direct(pageURL: URL, origin: String, token: String, note: inout String) async throws -> KinoStream {
         var r = URLRequest(url: pageURL)
         r.setValue(KinoNet.base + "/", forHTTPHeaderField: "Referer")
         r.setValue("text/html,*/*", forHTTPHeaderField: "Accept")
         let (d, _) = try await KinoNet.shared.session.data(for: r)
         let html = String(data: d, encoding: .utf8) ?? ""
-        guard let lit = KinoParse.first(#"fileList\s*=\s*JSON\.parse\('(.*?)'\)\s*;"#, html) else {
+        guard let lit = KinoParse.first(#"fileList\s*=\s*JSON\.parse\(\s*['"](.*?)['"]\s*\)"#, html) else {
+            note = "страница плеера: " + String(KinoParse.strip(html).prefix(120))
             throw KinoError.player("не нашёл список файлов")
         }
         let json = KinoParse.jsUnescape(lit)
@@ -608,14 +627,9 @@ enum KinoAPI {
         post.setValue(origin, forHTTPHeaderField: "Origin")
         post.setValue("application/json, */*", forHTTPHeaderField: "Accept")
         let (pd, _) = try await KinoNet.shared.session.data(for: post)
-        if let s = try? parseStream(pd, origin: origin, referer: pageURL.absoluteString) { return s }
-        // прямой запрос не дал ссылок — открываем плеер браузером и берём его собственный ответ
-        let sniffed = try await KinoSniffer.capture(pageURL)
-        do {
-            return try parseStream(Data(sniffed.utf8), origin: origin, referer: pageURL.absoluteString)
-        } catch {
-            let direct = String(data: pd.prefix(160), encoding: .utf8) ?? ""
-            throw KinoError.player("нет ссылок на видео (ответ: \(direct)…)")
+        do { return try parseStream(pd, origin: origin, referer: pageURL.absoluteString) } catch {
+            note = "ответ: " + (String(data: pd.prefix(120), encoding: .utf8) ?? "")
+            throw error
         }
     }
 
@@ -2087,15 +2101,17 @@ final class KinoSniffer: NSObject, WKScriptMessageHandler, WKNavigationDelegate 
       if (window.__kinoSniff) return; window.__kinoSniff = true;
       function hit(u){ return /\\/bnsi\\/movies\\//.test(String(u)); }
       function post(t){ try { window.webkit.messageHandlers.kinosniff.postMessage(String(t)); } catch (e) {} }
+      function m3(u){ u = String(u || ''); if (/\\.m3u8/.test(u)) post('M3U8 ' + new URL(u, location.href).href); }
       var of = window.fetch;
       if (of) window.fetch = function(a, o){
         var u = typeof a === 'string' ? a : (a && a.url);
+        m3(u);
         var p = of.apply(this, arguments);
         if (hit(u)) p.then(function(r){ r.clone().text().then(post); }).catch(function(){});
         return p;
       };
       var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; return oo.apply(this, arguments); };
+      XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; m3(u); return oo.apply(this, arguments); };
       XMLHttpRequest.prototype.send = function(b){
         var x = this;
         if (hit(x.__u)) this.addEventListener('loadend', function(){ try { post(x.responseText); } catch (e) {} });
