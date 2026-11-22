@@ -2166,12 +2166,10 @@ final class KinoSniffer: NSObject, WKScriptMessageHandler, WKNavigationDelegate 
         if let c = cont { cont = nil; c.resume(throwing: KinoError.player("плеер не ответил")) }
     }
 
-    nonisolated func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         let body = m.body as? String ?? ""
-        Task { @MainActor in
-            guard body.contains("hlsSource") || body.contains("m3u8"), let c = self.cont else { return }
-            self.cont = nil
-            c.resume(returning: body)
-        }
+        guard body.contains("hlsSource") || body.contains("m3u8"), let c = cont else { return }
+        cont = nil
+        c.resume(returning: body)
     }
 }
