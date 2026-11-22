@@ -3017,14 +3017,28 @@ struct SiteWebView: UIViewRepresentable {
       function cut(t){ t = String(t || ''); return t.length > 6000 ? t.slice(0, 6000) + ' …[обрезано, всего ' + t.length + ']' : t; }
       if (EVERY) {
         // HTML страницы и встроенных окон (в плеере обычно лежит список серий и озвучек)
-        document.addEventListener('DOMContentLoaded', function(){
+        // страница без стилей, svg и больших скриптов — чтобы содержимое (карточки, подборки) влезло целиком;
+        // маленькие встроенные скрипты оставляем: в них часто лежат данные (как fileList у плеера)
+        function cleanHTML(){
+          var d = document.documentElement.cloneNode(true);
+          d.querySelectorAll('style, svg, noscript, link[rel="stylesheet"]').forEach(function(n){ n.remove(); });
+          d.querySelectorAll('script').forEach(function(n){
+            if (n.src || (n.textContent || '').length > 20000) n.remove();
+          });
+          d.querySelectorAll('[style]').forEach(function(n){ n.removeAttribute('style'); });
+          return d.outerHTML.replace(/\\s{2,}/g, ' ');
+        }
+        function dumpHTML(tag){
           try {
             var top = (window === window.top);
-            var h = document.documentElement ? document.documentElement.outerHTML : '';
-            var lim = top ? 30000 : 60000;
-            send(top ? 'HTML' : 'FRAME-HTML', location.href, '', 0, h.length > lim ? h.slice(0, lim) + ' …[обрезано, всего ' + h.length + ']' : h);
+            var h = cleanHTML();
+            var lim = 200000;
+            send((top ? 'HTML' : 'FRAME-HTML') + (tag || ''), location.href, '', 0, h.length > lim ? h.slice(0, lim) + ' …[обрезано, всего ' + h.length + ']' : h);
           } catch (e) {}
-        });
+        }
+        document.addEventListener('DOMContentLoaded', function(){ dumpHTML(''); });
+        // и ещё раз после догрузки (подборки, ленивые карточки)
+        window.addEventListener('load', function(){ setTimeout(function(){ dumpHTML('-LOADED'); }, 2500); });
       }
       if (EVERY) {
         var skip = /\\.(png|jpe?g|webp|gif|svg|ico|avif|woff2?|ttf|otf|css|ts|m4s|aac)(\\?|#|$)/i;
