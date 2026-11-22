@@ -112,8 +112,8 @@ enum KinoError: LocalizedError {
 @MainActor
 final class KinoNet: NSObject, WKNavigationDelegate {
     static let shared = KinoNet()
-    static let base = "https://kinomig.tv"
-    static let ua = Kodik.ua
+    nonisolated static let base = "https://kinomig.tv"
+    nonisolated static let ua = Kodik.ua
 
     let session: URLSession = {
         let c = URLSessionConfiguration.default
