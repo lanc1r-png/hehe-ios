@@ -765,8 +765,129 @@ struct CatalogFilter: Equatable {
     }
 }
 
+/// Общая очередь запросов к сайту: не больше 4 одновременно; фоновые (проверка обновлений, синхронизация,
+/// подписи, жанры) идут по одному и пропускают вперёд то, что нужно экрану. На 429 все ждут, сколько просит сайт.
+actor RequestGate {
+    static let shared = RequestGate()
+    @TaskLocal static var background = false
+
+    private var fg = 0
+    private var bg = 0
+    private var fgWaiting = 0
+    private var cooldownUntil = Date.distantPast
+    private var lastBG = Date.distantPast
+
+    func acquire(background: Bool) async {
+        if !background { fgWaiting += 1 }
+        defer { if !background { fgWaiting -= 1 } }
+        while true {
+            if Task.isCancelled { if background { bg += 1 } else { fg += 1 }; return }
+            let now = Date()
+            let wait = cooldownUntil.timeIntervalSince(now)
+            if wait > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(min(wait, 1) * 1_000_000_000))
+                continue
+            }
+            if background {
+                if fgWaiting == 0, fg < 3, bg < 1, now.timeIntervalSince(lastBG) > 0.35 {
+                    bg += 1; lastBG = now; return
+                }
+            } else if fg + bg < 4 {
+                fg += 1; return
+            }
+            try? await Task.sleep(nanoseconds: 60_000_000)
+        }
+    }
+
+    func release(background: Bool) {
+        if background { bg = max(0, bg - 1) } else { fg = max(0, fg - 1) }
+    }
+
+    /// Сайт ответил 429: пауза для всех запросов
+    func tooMany(retryAfter: Double?) {
+        let until = Date().addingTimeInterval(min(max(retryAfter ?? 15, 3), 90))
+        guard until > cooldownUntil else { return }
+        cooldownUntil = until
+        Task { @MainActor in RateLimitState.shared.pause(until: until) }
+    }
+
+    /// Запуск фоновой работы: её запросы встают в конец очереди
+    static func inBackground<T>(_ work: () async throws -> T) async rethrows -> T {
+        try await $background.withValue(true) { try await work() }
+    }
+}
+
+/// Для экрана: сайт попросил подождать (показываем плашку с отсчётом, по окончании экраны сами повторяют загрузку)
+@MainActor
+final class RateLimitState: ObservableObject {
+    static let shared = RateLimitState()
+    @Published private(set) var until: Date?
+    /// Меняется, когда пауза закончилась — по нему экраны перезагружаются
+    @Published private(set) var resumed = 0
+
+    func pause(until d: Date) {
+        until = d
+        Task { @MainActor in
+            while let u = self.until, u > Date() {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            if self.until != nil {
+                self.until = nil
+                self.resumed += 1
+            }
+        }
+    }
+}
+
+struct RateLimitBanner: View {
+    @ObservedObject private var state = RateLimitState.shared
+    var body: some View {
+        if let u = state.until {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                let left = max(0, Int(u.timeIntervalSince(ctx.date).rounded(.up)))
+                HStack(spacing: 8) {
+                    Image(systemName: "hourglass").font(.footnote.weight(.semibold))
+                    Text("Сайт просит подождать · повтор через \(left) с")
+                        .font(.footnote.weight(.semibold).monospacedDigit())
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(Capsule().fill(Color.black.opacity(0.75)))
+                .glassCapsule()
+                .shadow(color: .black.opacity(0.2), radius: 8, y: 3)
+            }
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .padding(.top, 6)
+            .allowsHitTesting(false)
+        }
+    }
+}
+
 actor AnimelibAPI {
     static let shared = AnimelibAPI()
+
+    /// Все запросы к API — через общую очередь; на 429 ждём и повторяем (экранные — до 2 раз, фоновые — 1)
+    private func send(_ req: URLRequest) async throws -> (Data, URLResponse) {
+        let bg = RequestGate.background
+        var attempt = 0
+        while true {
+            await RequestGate.shared.acquire(background: bg)
+            let r: (Data, URLResponse)
+            do {
+                r = try await session.data(for: req)
+            } catch {
+                await RequestGate.shared.release(background: bg)
+                throw error
+            }
+            await RequestGate.shared.release(background: bg)
+            if let h = r.1 as? HTTPURLResponse, h.statusCode == 429 {
+                let ra = h.value(forHTTPHeaderField: "Retry-After").flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                await RequestGate.shared.tooMany(retryAfter: ra)
+                if attempt < (bg ? 1 : 2) { attempt += 1; continue }
+            }
+            return r
+        }
+    }
 
     private let apiURL = "https://api.cdnlibs.org/api"
     private let session: URLSession
@@ -799,10 +920,10 @@ actor AnimelibAPI {
         // вошедшему пользователю сайт показывает и тайтлы 18+ (гостям они скрыты)
         let tok = Keychain.get("lib.token")
         if let t = tok { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
-        var (data, resp) = try await session.data(for: req)
+        var (data, resp) = try await send(req)
         if tok != nil, let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
             req.setValue(nil, forHTTPHeaderField: "Authorization")   // токен устарел: пробуем как гость
-            (data, resp) = try await session.data(for: req)
+            (data, resp) = try await send(req)
         }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let body = String(data: data.prefix(1500), encoding: .utf8) ?? ""
@@ -1079,10 +1200,10 @@ actor AnimelibAPI {
             req.httpBody = try JSONSerialization.data(withJSONObject: j)
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        var (data, resp) = try await session.data(for: req)
+        var (data, resp) = try await send(req)
         if token == nil, auth != nil, let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
             req.setValue(nil, forHTTPHeaderField: "Authorization")
-            (data, resp) = try await session.data(for: req)
+            (data, resp) = try await send(req)
         }
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw APIError.http(http.statusCode, String(data: data.prefix(1500), encoding: .utf8) ?? "")
@@ -1099,7 +1220,7 @@ actor AnimelibAPI {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let t = token { req.setValue("Bearer " + t, forHTTPHeaderField: "Authorization") }
         do {
-            let (data, resp) = try await session.data(for: req)
+            let (data, resp) = try await send(req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             return "HTTP \(code)\n" + (String(data: data.prefix(1800), encoding: .utf8) ?? "")
         } catch {
@@ -1574,8 +1695,9 @@ final class FavoritesStore: ObservableObject {
     static let novels = FavoritesStore(key: "favorites.novels.v1")
     static let manga = FavoritesStore(key: "favorites.manga.v1")
     static let hentai = FavoritesStore(key: "favorites.hentai.v1")
-    static var current: FavoritesStore {
-        let site = LibSite.current
+    static var current: FavoritesStore { store(for: LibSite.current) }
+
+    static func store(for site: LibSite) -> FavoritesStore {
         if site.isHentai { return hentai }
         return site.isManga ? manga : (site.isRanobe ? novels : shared)
     }
@@ -1861,11 +1983,11 @@ final class FavMetaStore: ObservableObject {
         save()
     }
 
-    func applySiteStatuses(_ list: [(Anime, ListStatus?)]) {
+    func applySiteStatuses(_ list: [(Anime, ListStatus?)], site: String) {
         var all = items
         var changed = false
         for (a, st) in list {
-            let k = Self.key(a)
+            let k = "\(site)-\(a.id)"
             var m = all[k] ?? FavMeta()
             let s = st?.rawValue
             guard m.site != s else { continue }
@@ -1968,8 +2090,10 @@ final class UserGenreStats: ObservableObject {
         let site = LibSite.current.key
         if let t = loadedAt[site], Date().timeIntervalSince(t) < 1800 { return }
         loadedAt[site] = Date()
-        guard let data = try? await AnimelibAPI.shared.rawData("/user/\(userID)/stats", token: token),
-              let root = J.obj(data) else { return }
+        guard let data = try? await RequestGate.inBackground({
+                  try await AnimelibAPI.shared.rawData("/user/\(userID)/stats", token: token)
+              }),
+              let root = J.obj(data) else { loadedAt[site] = nil; return }
         guard LibSite.current.key == site else { return }
         let list = Self.parse(root)
         if list.isEmpty {
@@ -2055,19 +2179,28 @@ final class SiteFolders: ObservableObject {
 /// Списки на сайте → «Избранное» и значки статусов в «Каталоге». Не чаще раза в полчаса (по свайпу — сразу).
 @MainActor
 enum SiteListSync {
-    private static var running = false
+    private static var running = Set<String>()
+    /// Последняя ошибка синхронизации по платформе — покажем в «Избранном»
+    static var lastError: [String: String] = [:]
 
     static func syncIfDue(force: Bool = false) async {
+        await RequestGate.inBackground { await sync(LibSite.current, force: force) }
+    }
+
+    /// Синхронизация конкретной платформы: результат пишется в её хранилища, даже если ты уже переключился
+    private static func sync(_ site: LibSite, force: Bool) async {
         let auth = AuthStore.shared
-        guard !running, let t = auth.token, let uid = auth.user?.id else { return }
-        let site = LibSite.current.key
-        let lastKey = "sitelists.last.\(site)"
+        guard let t = auth.token, let uid = auth.user?.id, !running.contains(site.key) else { return }
+        let lastKey = "sitelists.last.\(site.key)"
         if !force, let d = UserDefaults.standard.object(forKey: lastKey) as? Date, Date().timeIntervalSince(d) < 1800 { return }
-        running = true
-        defer { running = false }
-        guard let data = try? await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t),
-              let root = J.obj(data) as? [String: Any],
-              let arr = root["data"] as? [[String: Any]] else { return }
+        running.insert(site.key)
+        defer { running.remove(site.key) }
+        func fail(_ e: Error?) { lastError[site.key] = e.map { "\($0.localizedDescription)" } ?? "неожиданный ответ сайта" }
+        let data: Data
+        do { data = try await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t, site: site) }
+        catch { fail(error); return }
+        guard let root = J.obj(data) as? [String: Any],
+              let arr = root["data"] as? [[String: Any]] else { fail(nil); return }
         let folders: [(Int, String)] = arr.compactMap { d in
             guard let id = J.int(d["id"]) else { return nil }
             return (id, J.str(d["name"]) ?? J.str(d["title"]) ?? "")
@@ -2086,9 +2219,11 @@ enum SiteListSync {
                          URLQueryItem(name: "page", value: String(page)),
                          URLQueryItem(name: "status", value: String(fid))]
                 // ошибка посреди — ничего не меняем, чтобы не убрать лишнего
-                guard let d = try? await AnimelibAPI.shared.rawData("/bookmarks", query: q, token: t),
-                      let r = J.obj(d) as? [String: Any],
-                      let list = r["data"] as? [[String: Any]] else { return }
+                let d: Data
+                do { d = try await AnimelibAPI.shared.rawData("/bookmarks", query: q, token: t, site: site) }
+                catch { fail(error); return }
+                guard let r = J.obj(d) as? [String: Any],
+                      let list = r["data"] as? [[String: Any]] else { fail(nil); return }
                 let got = list.compactMap { ProfileViewModel.anime(from: $0) }.filter { seen.insert($0.id).inserted }
                 if got.isEmpty { break }
                 for a in got {
@@ -2100,10 +2235,11 @@ enum SiteListSync {
             }
             if st == nil { custom.append(.init(id: fid, name: name, ids: members)) }
         }
-        guard LibSite.current.key == site, !folders.isEmpty else { return }
-        FavoritesStore.current.mergeFromSite(titles, siteKey: site)
-        FavMetaStore.shared.applySiteStatuses(titles.map { ($0, status[$0.id]) })
-        SiteFolders.shared.set(custom, site: site)
+        guard !folders.isEmpty else { return }
+        FavoritesStore.store(for: site).mergeFromSite(titles, siteKey: site.key)
+        FavMetaStore.shared.applySiteStatuses(titles.map { ($0, status[$0.id]) }, site: site.key)
+        SiteFolders.shared.set(custom, site: site.key)
+        lastError[site.key] = nil
         UserDefaults.standard.set(Date(), forKey: lastKey)
     }
 }
@@ -2114,7 +2250,11 @@ enum FavUpdater {
     static func refresh(_ list: [Anime], force: Bool) async {
         let meta = FavMetaStore.shared
         let site = LibSite.current.key
-        let todo = Array(list.prefix(80)).filter { force || meta.needsCheck($0) }
+        // только то, что читаешь (и добавленное без статуса): «В планах», «Брошено», «Прочитано» не проверяем
+        let todo = list.filter { a in
+            let st = meta.status(a)
+            return (st == nil || st == .active) && (force || meta.needsCheck(a))
+        }.prefix(80).map { $0 }
         var results: [(Anime, Int?, String?)] = []
         var i = 0
         while i < todo.count {
@@ -2122,7 +2262,7 @@ enum FavUpdater {
             await withTaskGroup(of: (Anime, Int?, String?).self) { group in
                 for a in chunk {
                     group.addTask {
-                        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
+                        let r = await RequestGate.inBackground { await AnimelibAPI.shared.updateInfo(slug: a.slugUrl) }
                         return (a, r.count, r.date)
                     }
                 }
@@ -2562,6 +2702,12 @@ struct FavoritesView: View {
                 VStack(spacing: 12) {
                     header
                     if !favorites.items.isEmpty { chips }
+                    if let e = SiteListSync.lastError[LibSite.current.key], !refreshing {
+                        Label("Списки с сайта не подтянулись: \(e). Потяни вниз, чтобы повторить.", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 18)
+                    }
                     if sort == .updated, !favorites.items.isEmpty,
                        favorites.items.allSatisfy({ meta.updateDate($0) == nil }) {
                         Text(refreshing ? "Проверяю обновления…"
@@ -3958,7 +4104,21 @@ final class HomeViewModel: ObservableObject {
         var f = CatalogFilter()
         f.sortBy = sort
         if sort == .rating {
-            guard let r = try? await AnimelibAPI.shared.catalogRated(filter: f, startPage: page) else { return nil }
+            // «Лучшее» меняется редко: сутки берём из памяти телефона, а обновляем в фоне
+            let key = "home.top.\(LibSite.current.key)"
+            if page == 1, let d = UserDefaults.standard.object(forKey: key + ".at") as? Date,
+               Date().timeIntervalSince(d) < 86400,
+               let data = UserDefaults.standard.data(forKey: key),
+               let list = try? JSONDecoder().decode([Anime].self, from: data), !list.isEmpty {
+                return (list, true)
+            }
+            guard let r = try? await RequestGate.inBackground({
+                try await AnimelibAPI.shared.catalogRated(filter: f, startPage: page)
+            }) else { return nil }
+            if page == 1, !r.items.isEmpty, let data = try? JSONEncoder().encode(r.items) {
+                UserDefaults.standard.set(data, forKey: key)
+                UserDefaults.standard.set(Date(), forKey: key + ".at")
+            }
             return (r.items, r.hasNext)
         }
         return try? await AnimelibAPI.shared.catalog(filter: f, page: page)
@@ -4003,7 +4163,9 @@ final class HomeViewModel: ObservableObject {
                 }
             }
         }
-        error = gotAny ? nil : "Не удалось загрузить данные. Проверьте соединение."
+        error = gotAny ? nil : (RateLimitState.shared.until != nil
+                                ? "Сайт просит подождать. Загрузка повторится сама."
+                                : "Не удалось загрузить данные. Проверьте соединение.")
     }
 
     func morePopular() async {
@@ -4136,13 +4298,29 @@ final class FreshInfo: ObservableObject {
     private var loading = Set<String>()
     private func key(_ a: Anime) -> String { "\(LibSite.current.key)-\(a.id)" }
     func get(_ a: Anime) -> (count: Int?, date: Date?)? { items[key(a)] }
+    private struct Saved: Codable { var count: Int?; var date: Date?; var at: Date }
+    private var disk: [String: Saved] = {
+        guard let d = UserDefaults.standard.data(forKey: "freshinfo.v1"),
+              let v = try? JSONDecoder().decode([String: Saved].self, from: d) else { return [:] }
+        return v.filter { Date().timeIntervalSince($0.value.at) < 86400 }
+    }()
+
     func load(_ a: Anime) async {
         let k = key(a)
         guard items[k] == nil, !loading.contains(k) else { return }
+        if let s = disk[k], Date().timeIntervalSince(s.at) < 86400 {
+            items[k] = (s.count, s.date)
+            return
+        }
         loading.insert(k)
-        let r = await AnimelibAPI.shared.updateInfo(slug: a.slugUrl)
+        let r = await RequestGate.inBackground { await AnimelibAPI.shared.updateInfo(slug: a.slugUrl) }
         loading.remove(k)
-        items[k] = (r.count, r.date.flatMap(parseLibDate))
+        let v = (count: r.count, date: r.date.flatMap(parseLibDate))
+        items[k] = v
+        if v.count != nil || v.date != nil {
+            disk[k] = Saved(count: v.count, date: v.date, at: Date())
+            if let d = try? JSONEncoder().encode(disk) { UserDefaults.standard.set(d, forKey: "freshinfo.v1") }
+        }
     }
 }
 
@@ -4908,6 +5086,10 @@ struct HomeView: View {
                 .scrollDismissesKeyboard(.immediately)
                 .refreshable { await vm.load(force: true) }
                 .statusBarBlur()
+                // сайт просил подождать — как только пауза кончилась, догружаем
+                .onReceive(RateLimitState.shared.$resumed.dropFirst()) { _ in
+                    if vm.error != nil || vm.fresh.isEmpty { Task { await vm.load(force: true) } }
+                }
             }
             .background {
                 ZStack(alignment: .top) {
@@ -4996,6 +5178,7 @@ struct RootView: View {
         }
         .id(accentHex + platform)
         .modifier(TabBarMinimize())
+        .overlay(alignment: .top) { RateLimitBanner() }
         .transition(.opacity)
         .tint(Color(hex: accentHex))
         .preferredColorScheme(scheme)
@@ -5440,6 +5623,9 @@ struct CatalogView: View {
             .sheet(isPresented: $showFilters) { FilterSheet(vm: vm) }
             .task { if vm.items.isEmpty { await vm.reload() } }
             .task { await SiteListSync.syncIfDue() }
+            .onReceive(RateLimitState.shared.$resumed.dropFirst()) { _ in
+                if vm.error != nil || vm.items.isEmpty { Task { await vm.reload() } }
+            }
             .task(id: vm.filter.query) {
                 // живой поиск: ждём, пока вы закончите печатать
                 guard vm.filter.query != vm.loadedQuery else { return }
@@ -7644,7 +7830,7 @@ struct LoginSheet: View {
     }
 }
 
-struct BookmarkFolder: Identifiable, Hashable {
+struct BookmarkFolder: Identifiable, Hashable, Codable {
     let id: Int
     let name: String
     let count: Int?
@@ -7672,8 +7858,18 @@ final class ProfileViewModel: ObservableObject {
         self.token = token
     }
 
+    private var foldersCacheKey: String { "profile.folders.\(LibSite.current.key)" }
+
+    /// Прошлые списки из памяти телефона: при ошибке сайта профиль не пустеет
+    func restoreCachedFolders() {
+        guard folders.isEmpty, let d = UserDefaults.standard.data(forKey: foldersCacheKey),
+              let v = try? JSONDecoder().decode([BookmarkFolder].self, from: d) else { return }
+        folders = v
+    }
+
     func loadFolders() async {
         guard let uid = userID, let t = token else { return }
+        restoreCachedFolders()
         do {
             let data = try await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t)
             guard let root = J.obj(data) as? [String: Any],
@@ -7690,13 +7886,18 @@ final class ProfileViewModel: ObservableObject {
             }
             let nonEmpty = folders.filter { ($0.count ?? 1) > 0 }
             if !nonEmpty.isEmpty { folders = nonEmpty }
+            if let d = try? JSONEncoder().encode(folders) { UserDefaults.standard.set(d, forKey: foldersCacheKey) }
             if selected == nil || !folders.contains(where: { $0.id == selected }) {
                 selected = folders.first?.id
             }
             error = nil
             if loadItems { await reload() }
         } catch {
-            self.error = error.localizedDescription
+            if case APIError.http(let code, _) = error, code == 429 {
+                self.error = folders.isEmpty ? "Сайт просит подождать — списки загрузятся чуть позже" : nil
+            } else {
+                self.error = folders.isEmpty ? error.localizedDescription : nil
+            }
         }
     }
 
@@ -10269,6 +10470,9 @@ struct ProfileView: View {
             // в профиле своя панель кнопок (нейтральное стекло), системная скрыта
             .toolbar(auth.user != nil ? .hidden : .visible, for: .navigationBar)
             .onPreferenceChange(ProfileScrollKey.self) { scrollY = $0 }
+            .onReceive(RateLimitState.shared.$resumed.dropFirst()) { _ in
+                if vm.error != nil { Task { await vm.loadFolders() } }
+            }
             .statusBarBlur(opacity: auth.user == nil ? 1 : Double(min(1, max(0, (-scrollY - 110) / 50))))
             .navigationTitle(auth.user != nil ? "" : "Профиль")
             .navigationBarTitleDisplayMode(.inline)
