@@ -589,7 +589,7 @@ enum KinoAPI {
             throw KinoError.player(note.isEmpty ? "плеер не ответил" : note)
         }
         if sniffed.hasPrefix("M3U8 "), let u = URL(string: String(sniffed.dropFirst(5))) {
-            return KinoStream(tracks: [.init(label: source.translation ?? "Озвучка", qualities: [(720, [u])])],
+            return KinoStream(tracks: [.init(label: source.translation.isEmpty ? "Озвучка" : source.translation, qualities: [(720, [u])])],
                               skip: nil, origin: origin, referer: pageURL.absoluteString)
         }
         do {
