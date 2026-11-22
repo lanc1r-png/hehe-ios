@@ -2805,30 +2805,85 @@ struct ShareSheet: UIViewControllerRepresentable {
 final class SiteLog: ObservableObject {
     @Published var lines: [String] = []
 
+    private var seen = Set<String>()
+
     func add(_ s: String) {
-        if lines.count > 400 { lines.removeFirst(100) }
+        if lines.count > 1500 { lines.removeFirst(300) }
         lines.append(s)
     }
+
+    /// Ресурсы страницы (скрипты, плееры, видео) — каждый адрес один раз
+    func addOnce(_ key: String, _ s: String) {
+        guard seen.insert(key).inserted else { return }
+        add(s)
+    }
+
+    func clear() { lines = []; seen = [] }
+}
+
+/// Управление встроенным браузером журнала: адрес, назад/вперёд
+@MainActor
+final class WebBox: ObservableObject {
+    weak var view: WKWebView?
+    @Published var url = ""
+    @Published var canBack = false
+    @Published var canForward = false
 }
 
 struct SiteWebView: UIViewRepresentable {
     let url: URL
     let log: SiteLog
+    /// Любой сайт: пишем все запросы, iframe-ы, видео и переходы, а не только API Lib-сайтов
+    var everything = false
+    var box: WebBox? = nil
 
-    static let script = """
+    static func script(everything: Bool) -> String { """
     (function(){
       if (window.__heheLog) return; window.__heheLog = true;
+      var EVERY = \(everything ? "true" : "false");
       function want(m, u){
+        if (EVERY) return true;
         if (m !== 'GET') return true;
         return /cdnlibs\\.org|\\/api\\//i.test(String(u));
       }
+      function host(){ try { return location.host; } catch (e) { return ''; } }
       function send(m, u, b, s){
         try {
           window.webkit.messageHandlers.hlog.postMessage(JSON.stringify({
-            m: m, u: String(u), b: b ? String(b).slice(0, 400) : '', s: s || 0
+            m: m, u: String(u), b: b ? String(b).slice(0, 400) : '', s: s || 0, f: host()
           }));
         } catch (e) {}
       }
+      if (EVERY) {
+        var skip = /\\.(png|jpe?g|webp|gif|svg|ico|avif|woff2?|ttf|otf|css|ts|m4s|aac)(\\?|#|$)/i;
+        try {
+          new PerformanceObserver(function(l){
+            l.getEntries().forEach(function(e){
+              if (e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest') return;
+              if (skip.test(e.name)) return;
+              send('RES:' + e.initiatorType, e.name, '', 0);
+            });
+          }).observe({ type: 'resource', buffered: true });
+        } catch (e) {}
+        function frames(root){
+          try { root.querySelectorAll('iframe').forEach(function(f){
+            send('IFRAME', f.src || f.getAttribute('data-src') || f.getAttribute('data-lazy-src') || '(пусто)', '', 0);
+          }); } catch (e) {}
+        }
+        document.addEventListener('DOMContentLoaded', function(){ frames(document); });
+        try {
+          new MutationObserver(function(ms){ ms.forEach(function(m){ m.addedNodes.forEach(function(n){
+            if (n.tagName === 'IFRAME') send('IFRAME', n.src || n.getAttribute('data-src') || '(пусто)', '', 0);
+            else if (n.querySelectorAll) frames(n);
+          }); }); }).observe(document.documentElement, { childList: true, subtree: true });
+        } catch (e) {}
+        document.addEventListener('play', function(ev){
+          var v = ev.target; if (v && (v.currentSrc || v.src)) send('VIDEO', v.currentSrc || v.src, '', 0);
+        }, true);
+      }
+    """ + scriptTail }
+
+    private static let scriptTail = """
       var of = window.fetch;
       if (of) window.fetch = function(a, o){
         var u = typeof a === 'string' ? a : (a && a.url);
@@ -2848,20 +2903,58 @@ struct SiteWebView: UIViewRepresentable {
     })();
     """
 
-    final class Coordinator: NSObject, WKScriptMessageHandler {
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
         let log: SiteLog
-        init(_ l: SiteLog) { log = l }
+        let everything: Bool
+        let box: WebBox?
+        init(_ l: SiteLog, everything: Bool, box: WebBox?) { log = l; self.everything = everything; self.box = box }
+
         func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
             guard let t = m.body as? String,
                   let d = t.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
-            let line = "\(o["m"] as? String ?? "?") \(o["u"] as? String ?? "") [\(o["s"] as? Int ?? 0)]"
+            let method = o["m"] as? String ?? "?"
+            let u = o["u"] as? String ?? ""
+            let frame = (o["f"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let status = o["s"] as? Int ?? 0
+            let line = "\(method) \(u)" + (status != 0 || !method.hasPrefix("RES") && method != "IFRAME" && method != "VIDEO" ? " [\(status)]" : "")
+                + (everything ? (frame.map { "  ← \($0)" } ?? "") : "")
                 + ((o["b"] as? String).flatMap { $0.isEmpty ? nil : "\n    тело: " + SiteWebView.mask($0) } ?? "")
-            Task { @MainActor in self.log.add(line) }
+            let once = method.hasPrefix("RES") || method == "IFRAME" || method == "VIDEO"
+            Task { @MainActor in
+                if once { self.log.addOnce(method + u, line) } else { self.log.add(line) }
+            }
+        }
+
+        // переходы страницы и встроенных окон (iframe)
+        func webView(_ v: WKWebView, decidePolicyFor a: WKNavigationAction,
+                     decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+            if everything, let u = a.request.url?.absoluteString, u != "about:blank" {
+                let main = a.targetFrame?.isMainFrame ?? true
+                Task { @MainActor in self.log.addOnce((main ? "PAGE" : "FRAME") + u, (main ? "PAGE " : "FRAME ") + u) }
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(_ v: WKWebView, didFinish n: WKNavigation!) {
+            Task { @MainActor in
+                self.box?.url = v.url?.absoluteString ?? ""
+                self.box?.canBack = v.canGoBack
+                self.box?.canForward = v.canGoForward
+            }
+        }
+
+        // всплывающие окна (часто реклама) не открываем, только записываем
+        func webView(_ v: WKWebView, createWebViewWith c: WKWebViewConfiguration, for a: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if let u = a.request.url?.absoluteString {
+                Task { @MainActor in self.log.add("POPUP " + u + " (не открыто)") }
+            }
+            return nil
         }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(log) }
+    func makeCoordinator() -> Coordinator { Coordinator(log, everything: everything, box: box) }
 
     /// Прячет секреты входа в теле запроса, чтобы журнал можно было спокойно пересылать.
     nonisolated static func mask(_ s: String) -> String {
@@ -2875,9 +2968,13 @@ struct SiteWebView: UIViewRepresentable {
         cfg.allowsInlineMediaPlayback = true
         cfg.userContentController.add(context.coordinator, name: "hlog")
         cfg.userContentController.addUserScript(
-            WKUserScript(source: Self.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            WKUserScript(source: Self.script(everything: everything), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let v = WKWebView(frame: .zero, configuration: cfg)
         v.customUserAgent = Kodik.ua
+        v.navigationDelegate = context.coordinator
+        v.uiDelegate = context.coordinator
+        v.allowsBackForwardNavigationGestures = true
+        box?.view = v
         v.load(URLRequest(url: url))
         return v
     }
@@ -2937,7 +3034,103 @@ struct SiteLogView: View {
                     ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { showLog = false } }
                     ToolbarItem(placement: .topBarTrailing) {
                         HStack {
-                            Button("Очистить") { log.lines = [] }
+                            Button("Очистить") { log.clear() }
+                            Button("Копировать") { UIPasteboard.general.string = log.lines.joined(separator: "\n") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Журнал запросов для любого сайта: адресная строка, назад/вперёд, все запросы, iframe-ы плееров и видео
+struct AnySiteLogView: View {
+    @AppStorage("sitelog.lastURL") private var lastURL = "https://kinomig.tv/"
+    @StateObject private var log = SiteLog()
+    @StateObject private var box = WebBox()
+    @State private var address = ""
+    @State private var showLog = false
+    @State private var started: URL?
+    @FocusState private var editing: Bool
+
+    private func normalized(_ t: String) -> URL? {
+        var s = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        if !s.contains("://") { s = "https://" + s }
+        return URL(string: s)
+    }
+
+    private func go() {
+        guard let u = normalized(address) else { return }
+        lastURL = u.absoluteString
+        editing = false
+        if let v = box.view { v.load(URLRequest(url: u)) } else { started = u }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button { box.view?.goBack() } label: { Image(systemName: "chevron.left") }
+                    .disabled(!box.canBack)
+                Button { box.view?.goForward() } label: { Image(systemName: "chevron.right") }
+                    .disabled(!box.canForward)
+                TextField("Адрес сайта", text: $address)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .submitLabel(.go)
+                    .focused($editing)
+                    .onSubmit { go() }
+                    .font(.subheadline)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Theme.chip, in: Capsule())
+                Button { box.view?.reload() } label: { Image(systemName: "arrow.clockwise") }
+            }
+            .font(.headline)
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            if let u = started {
+                SiteWebView(url: u, log: log, everything: true, box: box)
+            } else {
+                Spacer()
+            }
+            Button { showLog = true } label: {
+                Label("Журнал запросов: \(log.lines.count)", systemImage: "list.bullet.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Theme.accent, in: RoundedRectangle(cornerRadius: 12))
+                    .foregroundStyle(.white)
+                    .padding(12)
+            }
+        }
+        .navigationTitle("Любой сайт")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if started == nil {
+                address = lastURL
+                started = normalized(lastURL)
+            }
+        }
+        .onChange(of: box.url) { u in if !editing, !u.isEmpty { address = u; lastURL = u } }
+        .sheet(isPresented: $showLog) {
+            NavigationStack {
+                ScrollView {
+                    Text(log.lines.isEmpty
+                         ? "Пока пусто. Открой страницу, запусти видео, покликай по сайту и вернись сюда."
+                         : log.lines.joined(separator: "\n"))
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                .navigationTitle("Журнал")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("Закрыть") { showLog = false } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        HStack {
+                            Button("Очистить") { log.clear() }
                             Button("Копировать") { UIPasteboard.general.string = log.lines.joined(separator: "\n") }
                         }
                     }
@@ -3560,6 +3753,8 @@ struct SettingsView: View {
     private var devBlock: some View {
         section("Для разработчика", tint: SettingsTint.dev) {
             linkRow("waveform.path.ecg", "Журнал запросов сайта", "чтобы настроить синхронизацию с сайтом") { SiteLogView() }
+            rowDivider
+            linkRow("globe", "Любой сайт", "открыть адрес и записать все его запросы") { AnySiteLogView() }
         }
     }
 
