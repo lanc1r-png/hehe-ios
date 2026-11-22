@@ -54,6 +54,9 @@ struct KinoItem: Codable, Hashable, Identifiable {
 
 /// Источник плеера на странице (одна озвучка)
 struct KinoSource: Hashable {
+    /// alloha — родной плеер; остальные (collaps…) — веб-плеер сайта
+    var balancer: String = "alloha"
+    var isNative: Bool { balancer == "alloha" }
     let translation: String
     let url: URL
     let quality: String?
@@ -70,8 +73,10 @@ struct KinoDetail {
     var sources: [KinoSource] = []
     /// сезон → серия → дата выхода
     var dates: [Int: [Int: String]] = [:]
+    /// Что нашли на странице про плееры — показываем, если смотреть не получается
+    var playersNote: String?
 
-    var isSerial: Bool { sources.contains { !$0.seasons.isEmpty } }
+    var isSerial: Bool { sources.contains { $0.isNative && !$0.seasons.isEmpty } }
     var seasons: [Int] {
         Array(Set(sources.flatMap { $0.seasons.keys })).sorted()
     }
@@ -216,11 +221,30 @@ final class KinoNet: NSObject, WKNavigationDelegate {
         var r = URLRequest(url: url)
         r.setValue(Self.base + "/", forHTTPHeaderField: "Referer")
         r.setValue("image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        guard let (d, resp) = try? await session.data(for: r),
-              ((resp as? HTTPURLResponse)?.statusCode ?? 200) < 300 else { return nil }
         let px = maxPixel
-        return await Task.detached { ImageLoader.downsample(d, maxPixel: px) }.value
+        if !webImages, let (d, resp) = try? await session.data(for: r),
+           ((resp as? HTTPURLResponse)?.statusCode ?? 200) < 300,
+           let img = await Task.detached(priority: .userInitiated, operation: { ImageLoader.downsample(d, maxPixel: px) }).value {
+            return img
+        }
+        // Cloudflare не отдал картинку обычному запросу: берём её браузером, который прошёл проверку
+        webImages = true
+        await warmUp()
+        guard let v = web else { return nil }
+        let js = """
+        const r = await fetch(u, { credentials: 'include' });
+        if (!r.ok) return '';
+        const b = await r.blob();
+        return await new Promise(res => { const f = new FileReader(); f.onloadend = () => res(String(f.result || '')); f.readAsDataURL(b); });
+        """
+        guard let res = try? await v.callAsyncJavaScript(js, arguments: ["u": url.absoluteString], contentWorld: .page) as? String,
+              let comma = res.firstIndex(of: ","),
+              let data = Data(base64Encoded: String(res[res.index(after: comma)...])) else { return nil }
+        return await Task.detached(priority: .userInitiated, operation: { ImageLoader.downsample(data, maxPixel: px) }).value
     }
+
+    /// Картинки обычными запросами не идут — сразу через браузер
+    private var webImages = false
 }
 
 // MARK: - Разбор страниц сайта
@@ -389,15 +413,27 @@ enum KinoParse {
         }
         // источники плеера (берём Alloha — его поток умеем открывать в родном плеере)
         if let arr = attrJSON("data-players", html) as? [[String: Any]] {
-            for p in arr {
-                guard (p["balancer"] as? String ?? "") == "alloha",
-                      let u = (p["url"] as? String).flatMap({ URL(string: $0) }) else { continue }
+            let names = arr.compactMap { $0["balancer"] as? String }
+            d.playersNote = names.isEmpty ? "на странице пустой список плееров" : "плееры на странице: " + names.joined(separator: ", ")
+            // сначала Alloha (родной плеер), потом остальные (веб-плеер)
+            let sorted = arr.filter { ($0["balancer"] as? String) == "alloha" } + arr.filter { ($0["balancer"] as? String) != "alloha" }
+            for p in sorted {
+                let bal = (p["balancer"] as? String) ?? "web"
+                guard let u = (p["url"] as? String).flatMap({ URL(string: $0.hasPrefix("//") ? "https:" + $0 : $0) }) else { continue }
                 var seasons: [Int: [Int]] = [:]
                 if let s = p["seasons"] as? [String: Any] {
                     for (k, v) in s { if let n = Int(k) { seasons[n] = (v as? [Any])?.compactMap { ($0 as? Int) ?? Int("\($0)") } ?? [] } }
                 }
-                d.sources.append(KinoSource(translation: (p["translation"] as? String) ?? "Озвучка", url: u,
-                                            quality: p["quality"] as? String, seasons: seasons))
+                var name = (p["translation"] as? String) ?? "Озвучка"
+                if bal != "alloha" { name += " (\(bal.capitalized), веб-плеер)" }
+                d.sources.append(KinoSource(balancer: bal, translation: name, url: u,
+                                            quality: p["quality"] as? String, seasons: bal == "alloha" ? seasons : [:]))
+            }
+        } else {
+            d.playersNote = html.contains("data-players") ? "не разобрал список плееров" : "на странице нет списка плееров"
+            // запасной вариант: любой iframe плеера на странице
+            if let src = first(#"<iframe[^>]+src="([^"]+)""#, html), let u = URL(string: src.hasPrefix("//") ? "https:" + src : src) {
+                d.sources.append(KinoSource(balancer: "web", translation: "Плеер сайта", url: u, quality: nil, seasons: [:]))
             }
         }
         if let eps = attrJSON("data-episodes", html) as? [String: [String: Any]] {
@@ -1357,6 +1393,7 @@ struct KinoDetailView: View {
     @State private var season = 1
     @State private var sourceIndex = 0
     @State private var playing: KinoPlayRequest?
+    @State private var webPlayer: KinoWebTarget?
     @State private var showAllInfo = false
     @AppStorage("kino.pref.translation") private var prefTranslation = ""
 
@@ -1400,6 +1437,7 @@ struct KinoDetailView: View {
             }
         }
         .fullScreenCover(item: $playing) { req in KinoPlayerScreen(request: req) }
+        .fullScreenCover(item: $webPlayer) { t in KinoWebPlayerScreen(url: t.url, title: shown.title) }
         .task { if detail == nil { await load() } }
     }
 
@@ -1455,11 +1493,22 @@ struct KinoDetailView: View {
     private func playBlock(_ d: KinoDetail) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             if d.sources.isEmpty {
-                Text("Для этого тайтла плеер пока не поддерживается.").font(.footnote).foregroundStyle(.secondary)
+                Text("Плеер не найден" + (d.playersNote.map { ": " + $0 } ?? "") + ".")
+                    .font(.footnote).foregroundStyle(.secondary)
+                if let u = shown.pageURL {
+                    Button { webPlayer = KinoWebTarget(url: u) } label: {
+                        Label("Открыть страницу сайта", systemImage: "safari")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.accent)
+                    }
+                }
             } else {
                 let w = store.watch(shown)
                 let s = d.isSerial ? (w?.season ?? startSeason ?? d.seasons.first) : nil
                 let e = d.isSerial ? (w?.episode ?? startEpisode ?? d.episodes(s ?? 1, source: source).first) : nil
+                if let src = source, !src.isNative {
+                    Text("Этот плеер откроется как на сайте: озвучку и серии выбирай внутри него.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Button {
                     play(d, season: startSeason ?? s, episode: startEpisode ?? e)
                 } label: {
@@ -1612,6 +1661,11 @@ struct KinoDetailView: View {
     private func play(_ d: KinoDetail, season: Int?, episode: Int?) {
         guard let src = source else { return }
         Haptics.tap()
+        if !src.isNative {
+            store.record(shown, season: nil, episode: nil, translation: src.translation)
+            webPlayer = KinoWebTarget(url: src.url)
+            return
+        }
         var eps: [(Int, Int)] = []
         if d.isSerial {
             for s in d.seasons { for e in d.episodes(s, source: src) { eps.append((s, e)) } }
@@ -1920,4 +1974,76 @@ struct KinoPlayerScreen: View {
         store.record(request.item, season: request.season, episode: request.episode, translation: source.translation)
         await vm.load(source, item: request.item, season: request.season, episode: request.episode, keepTrack: keep)
     }
+}
+
+
+// MARK: - Веб-плеер (для плееров, которые не открываются в родном)
+
+struct KinoWebTarget: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+struct KinoWebPlayerScreen: View {
+    let url: URL
+    let title: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.headline).foregroundStyle(.white)
+                        .frame(width: 40, height: 40).background(Color.white.opacity(0.12), in: Circle())
+                }
+                Text(title).font(.headline).foregroundStyle(.white).lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            KinoWebPlayer(url: url)
+        }
+        .background(Color.black.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct KinoWebPlayer: UIViewRepresentable {
+    let url: URL
+
+    final class Coordinator: NSObject, WKUIDelegate {
+        // реклама любит открывать новые окна — не пускаем
+        func webView(_ v: WKWebView, createWebViewWith c: WKWebViewConfiguration, for a: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? { nil }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let cfg = WKWebViewConfiguration()
+        cfg.allowsInlineMediaPlayback = true
+        cfg.mediaTypesRequiringUserActionForPlayback = []
+        cfg.allowsPictureInPictureMediaPlayback = true
+        let v = WKWebView(frame: .zero, configuration: cfg)
+        v.customUserAgent = KinoNet.ua
+        v.uiDelegate = context.coordinator
+        v.isOpaque = false
+        v.backgroundColor = .black
+        v.scrollView.isScrollEnabled = url.host?.contains("kinomig") == true
+        if url.host?.contains("kinomig") == true {
+            v.load(URLRequest(url: url))
+        } else {
+            let html = """
+            <!doctype html><html><head>
+            <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+            <style>html,body{margin:0;height:100%;background:#000}
+            iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}</style>
+            </head><body>
+            <iframe src="\(url.absoluteString)" allow="autoplay; fullscreen; picture-in-picture; encrypted-media" allowfullscreen referrerpolicy="origin"></iframe>
+            </body></html>
+            """
+            v.loadHTMLString(html, baseURL: URL(string: KinoNet.base + "/"))
+        }
+        return v
+    }
+
+    func updateUIView(_ v: WKWebView, context: Context) {}
 }
