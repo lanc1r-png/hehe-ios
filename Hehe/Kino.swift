@@ -608,6 +608,18 @@ enum KinoAPI {
         post.setValue(origin, forHTTPHeaderField: "Origin")
         post.setValue("application/json, */*", forHTTPHeaderField: "Accept")
         let (pd, _) = try await KinoNet.shared.session.data(for: post)
+        if let s = try? parseStream(pd, origin: origin, referer: pageURL.absoluteString) { return s }
+        // прямой запрос не дал ссылок — открываем плеер браузером и берём его собственный ответ
+        let sniffed = try await KinoSniffer.capture(pageURL)
+        do {
+            return try parseStream(Data(sniffed.utf8), origin: origin, referer: pageURL.absoluteString)
+        } catch {
+            let direct = String(data: pd.prefix(160), encoding: .utf8) ?? ""
+            throw KinoError.player("нет ссылок на видео (ответ: \(direct)…)")
+        }
+    }
+
+    static func parseStream(_ pd: Data, origin: String, referer: String) throws -> KinoStream {
         guard let o = try? JSONSerialization.jsonObject(with: pd) as? [String: Any] else {
             throw KinoError.player("непонятный ответ")
         }
@@ -615,11 +627,20 @@ enum KinoAPI {
         for s in (o["hlsSource"] as? [[String: Any]]) ?? [] {
             let label = (s["label"] as? String) ?? "Озвучка"
             var qs: [(Int, [URL])] = []
-            for (k, v) in (s["quality"] as? [String: Any]) ?? [:] {
-                guard let qn = Int(k.filter(\.isNumber)), let str = v as? String else { continue }
-                let urls = str.components(separatedBy: " or ").compactMap { URL(string: $0.trimmingCharacters(in: .whitespaces)) }
-                if !urls.isEmpty { qs.append((qn, urls)) }
+            func urls(_ v: Any) -> [URL] {
+                if let str = v as? String {
+                    return str.components(separatedBy: " or ").compactMap { URL(string: $0.trimmingCharacters(in: .whitespaces)) }
+                }
+                if let arr = v as? [Any] { return arr.flatMap(urls) }
+                if let d = v as? [String: Any] { return ["url", "file", "src", "hls"].compactMap { d[$0] }.flatMap(urls) }
+                return []
             }
+            for (k, v) in (s["quality"] as? [String: Any]) ?? [:] {
+                guard let qn = Int(k.filter(\.isNumber)) else { continue }
+                let u = urls(v)
+                if !u.isEmpty { qs.append((qn, u)) }
+            }
+            if qs.isEmpty, let one = (s["file"] ?? s["url"] ?? s["src"]) { let u = urls(one); if !u.isEmpty { qs.append((720, u)) } }
             qs.sort { $0.0 > $1.0 }
             if !qs.isEmpty { tracks.append(.init(label: label, qualities: qs)) }
         }
@@ -629,7 +650,7 @@ enum KinoAPI {
             let p = st.split(separator: "-").compactMap { Double($0) }
             if p.count == 2, p[1] > p[0] { skip = p[0]...p[1] }
         }
-        return KinoStream(tracks: tracks, skip: skip, origin: origin, referer: pageURL.absoluteString)
+        return KinoStream(tracks: tracks, skip: skip, origin: origin, referer: referer)
     }
 }
 
@@ -2060,4 +2081,97 @@ struct KinoWebPlayer: UIViewRepresentable {
     }
 
     func updateUIView(_ v: WKWebView, context: Context) {}
+}
+
+
+// MARK: - Перехват ответа плеера в невидимом браузере
+
+@MainActor
+final class KinoSniffer: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    private var cont: CheckedContinuation<String, Error>?
+    private var web: WKWebView?
+    private static var live: KinoSniffer?
+
+    static let script = """
+    (function(){
+      if (window.__kinoSniff) return; window.__kinoSniff = true;
+      function hit(u){ return /\\/bnsi\\/movies\\//.test(String(u)); }
+      function post(t){ try { window.webkit.messageHandlers.kinosniff.postMessage(String(t)); } catch (e) {} }
+      var of = window.fetch;
+      if (of) window.fetch = function(a, o){
+        var u = typeof a === 'string' ? a : (a && a.url);
+        var p = of.apply(this, arguments);
+        if (hit(u)) p.then(function(r){ r.clone().text().then(post); }).catch(function(){});
+        return p;
+      };
+      var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; return oo.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function(b){
+        var x = this;
+        if (hit(x.__u)) this.addEventListener('loadend', function(){ try { post(x.responseText); } catch (e) {} });
+        return os.apply(this, arguments);
+      };
+    })();
+    """
+
+    /// Открывает страницу плеера и ждёт его ответ со ссылками (до 25 с)
+    static func capture(_ url: URL) async throws -> String {
+        let s = KinoSniffer()
+        live = s
+        defer { live = nil }
+        return try await s.run(url)
+    }
+
+    private func run(_ url: URL) async throws -> String {
+        let cfg = WKWebViewConfiguration()
+        cfg.allowsInlineMediaPlayback = true
+        cfg.mediaTypesRequiringUserActionForPlayback = []
+        cfg.userContentController.add(self, name: "kinosniff")
+        cfg.userContentController.addUserScript(WKUserScript(source: Self.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        let v = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: cfg)
+        v.customUserAgent = KinoNet.ua
+        v.navigationDelegate = self
+        v.alpha = 0.01
+        v.isUserInteractionEnabled = false
+        if let w = UIApplication.shared.connectedScenes.compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first { w.addSubview(v) }
+        web = v
+        // плеер открываем внутри страницы с адресом kinomig — как на сайте
+        let html = """
+        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="margin:0;background:#000">
+        <iframe src="\(url.absoluteString)" style="border:0;width:100%;height:100%;position:absolute" allow="autoplay; fullscreen"></iframe>
+        </body></html>
+        """
+        v.loadHTMLString(html, baseURL: URL(string: KinoNet.base + "/"))
+        defer { cleanup() }
+        return try await withThrowingTaskGroup(of: String.self) { g in
+            g.addTask { @MainActor in
+                try await withCheckedThrowingContinuation { c in self.cont = c }
+            }
+            g.addTask {
+                try await Task.sleep(nanoseconds: 25_000_000_000)
+                throw KinoError.player("плеер не ответил")
+            }
+            let r = try await g.next()!
+            g.cancelAll()
+            return r
+        }
+    }
+
+    private func cleanup() {
+        web?.configuration.userContentController.removeScriptMessageHandler(forName: "kinosniff")
+        web?.stopLoading()
+        web?.removeFromSuperview()
+        web = nil
+        if let c = cont { cont = nil; c.resume(throwing: KinoError.player("плеер не ответил")) }
+    }
+
+    nonisolated func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        let body = m.body as? String ?? ""
+        Task { @MainActor in
+            guard body.contains("hlsSource") || body.contains("m3u8"), let c = self.cont else { return }
+            self.cont = nil
+            c.resume(returning: body)
+        }
+    }
 }
