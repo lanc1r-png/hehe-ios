@@ -3436,7 +3436,8 @@ struct SettingsView: View {
         ("anime", "Аниме", "AnimeLib", true),
         ("ranobe", "Ранобэ", "RanobeLib", true),
         ("manga", "Манга", "MangaLib", true),
-        ("hentai", "Хентай", "HentaiLib", true)
+        ("hentai", "Хентай", "HentaiLib", true),
+        ("kino", "Кино", "Kinomig", true)
     ]
 
     private func platformIcon(_ id: String) -> String {
@@ -3444,6 +3445,7 @@ struct SettingsView: View {
         case "ranobe": return "text.book.closed.fill"
         case "manga": return "books.vertical.fill"
         case "hentai": return "flame.fill"
+        case "kino": return "film.stack.fill"
         default: return "play.rectangle.fill"
         }
     }
@@ -3453,6 +3455,7 @@ struct SettingsView: View {
         case "ranobe": return "Ранобэ: читалка с темами и шрифтами, скачивание глав для чтения без сети."
         case "manga": return "Манга: страницы или лента, комментарии к главам, прогресс чтения."
         case "hentai": return "HentaiLib (18+): та же читалка, что у манги; избранное и история отдельные."
+        case "kino": return "Кино: фильмы, сериалы, мультфильмы и аниме с kinomig.tv — родной плеер без рекламы, выбор озвучки, своё избранное."
         default: return "Аниме: плеер с озвучкой и субтитрами, комментарии к сериям, автопереход."
         }
     }
@@ -3981,7 +3984,7 @@ struct SettingsView: View {
 
     private var versionFooter: some View {
         let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
-        let host = URL(string: LibSite.current.origin)?.host ?? "animelib.org"
+        let host = platform == "kino" ? "kinomig.tv" : (URL(string: LibSite.current.origin)?.host ?? "animelib.org")
         return VStack(spacing: 2) {
             Text("Yume \(v)").font(.footnote.weight(.semibold))
             Text("Данные: \(host) · неофициальное приложение")
@@ -4011,7 +4014,7 @@ struct SettingsView: View {
                     if platform == "ranobe" { ranobeBlock }
                     if platform == "manga" || platform == "hentai" { mangaBlock }
                     // каждый раздел — только там, где он работает
-                    if platform == "anime" { playbackBlock } else { downloadsBlock }
+                    if platform == "anime" || platform == "kino" { playbackBlock } else { downloadsBlock }
                     dataBlock
                     profileLookBlock
                     backupBlock
@@ -5212,22 +5215,38 @@ struct RootView: View {
 
     var body: some View {
         TabView(selection: $router.tab) {
-            HomeView()
-                .tabItem { Label("Главная", systemImage: "house.fill") }
-                .tag(0)
-            CatalogView()
-                .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
-                .tag(1)
-            FavoritesView()
-                .badge(newBadge)
-                .tabItem { Label("Избранное", systemImage: "heart") }
-                .tag(2)
-            ProfileView()
-                .tabItem { Label("Профиль", systemImage: "person.crop.circle") }
-                .tag(3)
-            SettingsView()
-                .tabItem { Label("Настройки", systemImage: "gearshape") }
-                .tag(4)
+            if platform == "kino" {
+                // Кино (kinomig.tv): свои экраны, без профиля — у сайта нет аккаунта
+                KinoHomeView()
+                    .tabItem { Label("Главная", systemImage: "house.fill") }
+                    .tag(0)
+                KinoCatalogView()
+                    .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
+                    .tag(1)
+                KinoFavoritesView()
+                    .tabItem { Label("Избранное", systemImage: "heart") }
+                    .tag(2)
+                SettingsView()
+                    .tabItem { Label("Настройки", systemImage: "gearshape") }
+                    .tag(4)
+            } else {
+                HomeView()
+                    .tabItem { Label("Главная", systemImage: "house.fill") }
+                    .tag(0)
+                CatalogView()
+                    .tabItem { Label("Каталог", systemImage: "square.grid.2x2") }
+                    .tag(1)
+                FavoritesView()
+                    .badge(newBadge)
+                    .tabItem { Label("Избранное", systemImage: "heart") }
+                    .tag(2)
+                ProfileView()
+                    .tabItem { Label("Профиль", systemImage: "person.crop.circle") }
+                    .tag(3)
+                SettingsView()
+                    .tabItem { Label("Настройки", systemImage: "gearshape") }
+                    .tag(4)
+            }
         }
         .id(accentHex + platform)
         .modifier(TabBarMinimize())
