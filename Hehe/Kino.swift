@@ -372,10 +372,19 @@ enum KinoParse {
         }
     }
 
+    /// Значение атрибута: сайт пишет его и в "двойных" (&quot; внутри), и в 'одинарных' кавычках (сырой JSON)
+    static func attr(_ name: String, _ html: String) -> String? {
+        if let v = first(name + #"\s*=\s*"([^"]*)""#, html) { return v }
+        if let v = first(name + #"\s*=\s*'([^']*)'"#, html) { return v }
+        return nil
+    }
+
     static func attrJSON(_ name: String, _ html: String) -> Any? {
-        guard let raw = first(name + #"="([^"]*)""#, html) else { return nil }
-        let json = unescapeHTML(raw)
-        return try? JSONSerialization.jsonObject(with: Data(json.utf8))
+        guard let raw = attr(name, html) else { return nil }
+        for candidate in [raw, unescapeHTML(raw)] {
+            if let o = try? JSONSerialization.jsonObject(with: Data(candidate.utf8)) { return o }
+        }
+        return nil
     }
 
     /// Страница фильма или сериала
@@ -383,7 +392,7 @@ enum KinoParse {
         var it = base
         if let h1 = first(#"<h1[^>]*>(.*?)</h1>"#, html).map(strip), !h1.isEmpty { it.title = h1 }
         if let o = first(#"<div class="film-titles">.*?<div class="orig">(.*?)</div>"#, html).map(strip), !o.isEmpty { it.orig = o }
-        if let p = first(#"data-poster="([^"]+)""#, html) { it.poster = p }
+        if let p = attr("data-poster", html), !p.isEmpty { it.poster = unescapeHTML(p) }
         var d = KinoDetail(item: it)
 
         // сведения: год, страна, жанр…
@@ -430,7 +439,12 @@ enum KinoParse {
                                             quality: p["quality"] as? String, seasons: bal == "alloha" ? seasons : [:]))
             }
         } else {
-            d.playersNote = html.contains("data-players") ? "не разобрал список плееров" : "на странице нет списка плееров"
+            if let r = html.range(of: "data-players") {
+                let snippet = html[r.lowerBound...].prefix(160)
+                d.playersNote = "не разобрал список плееров (" + String(snippet) + "…)"
+            } else {
+                d.playersNote = "на странице нет списка плееров"
+            }
             // запасной вариант: любой iframe плеера на странице
             if let src = first(#"<iframe[^>]+src="([^"]+)""#, html), let u = URL(string: src.hasPrefix("//") ? "https:" + src : src) {
                 d.sources.append(KinoSource(balancer: "web", translation: "Плеер сайта", url: u, quality: nil, seasons: [:]))
