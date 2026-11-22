@@ -1880,16 +1880,6 @@ struct KinoPlayerScreen: View {
                 }
             }
             .aspectRatio(16 / 9, contentMode: .fit)
-            .overlay(alignment: .bottomTrailing) {
-                if let r = vm.stream?.skip, r.contains(vm.time), vm.time > r.lowerBound + 1 {
-                    Button { vm.skipIntro() } label: {
-                        Text("Пропустить заставку").font(.subheadline.weight(.semibold)).foregroundStyle(.black)
-                            .padding(.horizontal, 14).padding(.vertical, 9)
-                            .background(Color.white, in: Capsule())
-                    }
-                    .padding(.trailing, 14).padding(.bottom, 50)
-                }
-            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
