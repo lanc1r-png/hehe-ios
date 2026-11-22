@@ -2179,23 +2179,34 @@ final class SiteFolders: ObservableObject {
 /// Списки на сайте → «Избранное» и значки статусов в «Каталоге». Не чаще раза в полчаса (по свайпу — сразу).
 @MainActor
 enum SiteListSync {
-    private static var running = Set<String>()
+    /// Идущая синхронизация по платформе. Отдельная задача, а не задача экрана: экран может пересоздаться
+    /// (смена платформы) или закрыться — раньше из-за этого синхронизация обрывалась с «cancelled».
+    private static var tasks: [String: Task<Void, Never>] = [:]
     /// Последняя ошибка синхронизации по платформе — покажем в «Избранном»
     static var lastError: [String: String] = [:]
 
     static func syncIfDue(force: Bool = false) async {
-        await RequestGate.inBackground { await sync(LibSite.current, force: force) }
+        let site = LibSite.current
+        if let t = tasks[site.key] { await t.value; return }
+        let t = Task { @MainActor in
+            await RequestGate.inBackground { await sync(site, force: force) }
+        }
+        tasks[site.key] = t
+        await t.value
+        tasks[site.key] = nil
     }
 
     /// Синхронизация конкретной платформы: результат пишется в её хранилища, даже если ты уже переключился
     private static func sync(_ site: LibSite, force: Bool) async {
         let auth = AuthStore.shared
-        guard let t = auth.token, let uid = auth.user?.id, !running.contains(site.key) else { return }
+        guard let t = auth.token, let uid = auth.user?.id else { return }
         let lastKey = "sitelists.last.\(site.key)"
         if !force, let d = UserDefaults.standard.object(forKey: lastKey) as? Date, Date().timeIntervalSince(d) < 1800 { return }
-        running.insert(site.key)
-        defer { running.remove(site.key) }
-        func fail(_ e: Error?) { lastError[site.key] = e.map { "\($0.localizedDescription)" } ?? "неожиданный ответ сайта" }
+        func fail(_ e: Error?) {
+            // отмена — не ошибка сайта: просто повторим в следующий раз
+            if let e, e is CancellationError || (e as? URLError)?.code == .cancelled { return }
+            lastError[site.key] = e.map { "\($0.localizedDescription)" } ?? "неожиданный ответ сайта"
+        }
         let data: Data
         do { data = try await AnimelibAPI.shared.rawData("/bookmarks/folder/\(uid)", token: t, site: site) }
         catch { fail(error); return }
