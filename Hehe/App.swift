@@ -701,6 +701,9 @@ enum APIError: LocalizedError {
         switch self {
         case .badURL: return "Некорректный адрес запроса"
         case .http(let c, let body):
+            if c >= 500 || body.lowercased().contains("<!doctype html") {
+                return "Сайт сейчас не отвечает (ошибка \(c)). Это сбой на стороне сайта, обычно проходит сам — попробуйте позже."
+            }
             // ответ сайта — JSON с \u-кодами: достаём из него читаемые сообщения
             if let d = body.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) {
                 var msgs: [String] = []
