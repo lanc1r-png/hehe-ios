@@ -4153,6 +4153,8 @@ final class HomeViewModel: ObservableObject {
     @Published var error: String?
     private var popularPage = 1
     private var popularHasNext = true
+    /// последняя причина неудачи — показываем под ошибкой, чтобы было понятно, что случилось
+    private var lastFail: String?
 
     var canLoadMorePopular: Bool { popularHasNext && !popular.isEmpty }
 
@@ -4177,7 +4179,10 @@ final class HomeViewModel: ObservableObject {
             }
             return (r.items, r.hasNext)
         }
-        return try? await AnimelibAPI.shared.catalog(filter: f, page: page)
+        do { return try await AnimelibAPI.shared.catalog(filter: f, page: page) } catch {
+            if !(error is CancellationError) { lastFail = error.localizedDescription }
+            return nil
+        }
     }
 
     func load(force: Bool = false) async {
@@ -4221,7 +4226,8 @@ final class HomeViewModel: ObservableObject {
         }
         error = gotAny ? nil : (RateLimitState.shared.until != nil
                                 ? "Сайт просит подождать. Загрузка повторится сама."
-                                : "Не удалось загрузить данные. Проверьте соединение.")
+                                : "Не удалось загрузить данные." + (lastFail.map { "\n\($0)" } ?? " Проверьте соединение."))
+        lastFail = nil
     }
 
     func morePopular() async {
