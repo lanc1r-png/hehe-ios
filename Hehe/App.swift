@@ -1396,13 +1396,21 @@ enum Haptics {
     }
 }
 
-/// Смена платформы: приложение за стеклом размывается и перекрашивается, по центру — карточка с живой иконкой раздела.
+/// Смена платформы: фон плавно размывается и окрашивается, по центру карточка с живой иконкой раздела.
+/// Ход: фон 0–0,2 с → карточка → анимация иконки 0,3 с → карточка уходит вверх → фон проясняется. Всего ≈0,8 с.
 @MainActor
 final class PlatformSwitcher: ObservableObject {
     static let shared = PlatformSwitcher()
     struct Splash: Hashable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
     @Published var splash: Splash?
-    @Published var shown = false
+    /// размытый фон
+    @Published var bg = false
+    /// карточка на экране
+    @Published var card = false
+    /// иконка играет свою анимацию
+    @Published var play = false
+    /// карточка уходит
+    @Published var leaving = false
     private var busy = false
 
     /// Цвет раздела по умолчанию (свой выбор в настройках запоминается отдельно для каждого раздела)
@@ -1416,6 +1424,8 @@ final class PlatformSwitcher: ObservableObject {
         }
     }
 
+    private func wait(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
+
     func switchTo(_ id: String, title: String, site: String, icon: String) {
         let ud = UserDefaults.standard
         let old = ud.string(forKey: "set.platform") ?? "anime"
@@ -1426,75 +1436,106 @@ final class PlatformSwitcher: ObservableObject {
         ud.set(curHex, forKey: "accent.hex.\(old)")
         let newHex = ud.string(forKey: "accent.hex.\(id)") ?? Self.defaultHex(id)
         splash = Splash(id: id, title: title, site: site, icon: icon, hex: newHex)
-        Haptics.soft(0.55)
-        withAnimation(.easeOut(duration: 0.18)) { shown = true }
+        play = false; leaving = false; card = false
+        Haptics.soft(0.5)
+        withAnimation(.easeOut(duration: 0.22)) { bg = true }
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 180_000_000)
-            // экраны перестраиваются за стеклом
+            await wait(70)
+            withAnimation(.spring(response: 0.26, dampingFraction: 0.72)) { card = true }
+            await wait(130)
+            // экраны перестраиваются за стеклом, пока играет иконка
             ud.set(newHex, forKey: "accent.hex")
             ud.set(id, forKey: "set.platform")
-            try? await Task.sleep(nanoseconds: 140_000_000)
-            Haptics.rigid(0.75)   // в такт «приземлению» иконки
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            withAnimation(.easeIn(duration: 0.2)) { shown = false }
-            try? await Task.sleep(nanoseconds: 220_000_000)
-            splash = nil
+            play = true
+            await wait(170)
+            Haptics.rigid(0.75)   // иконка «встала на место»
+            await wait(160)
+            // сначала уходит карточка, потом проясняется фон — без «призрака» надписи
+            withAnimation(.easeIn(duration: 0.16)) { leaving = true }
+            await wait(120)
+            withAnimation(.easeInOut(duration: 0.24)) { bg = false }
+            await wait(260)
+            splash = nil; card = false; play = false; leaving = false
             busy = false
         }
     }
 }
 
-/// Иконка раздела со своей короткой анимацией
+/// Иконка раздела со своей короткой анимацией (запускается, когда карточка уже видна)
 struct LivePlatformIcon: View {
     let id: String
     let icon: String
     let color: Color
-    @State private var go = false
-    @State private var wiggle = false
+    let play: Bool
+    @State private var flicker = false
 
     var body: some View {
         ZStack {
-            // волна от иконки
-            Circle()
-                .stroke(color.opacity(0.6), lineWidth: 2)
-                .scaleEffect(go ? 1.55 : 0.7)
-                .opacity(go ? 0 : 0.9)
+            // две волны от иконки
+            ForEach(0..<2) { i in
+                Circle()
+                    .stroke(color.opacity(0.55), lineWidth: 2.5)
+                    .scaleEffect(play ? 1.9 : 0.9)
+                    .opacity(play ? 0 : 0.85)
+                    .animation(.easeOut(duration: 0.55).delay(Double(i) * 0.14), value: play)
+            }
             Circle()
                 .fill(LinearGradient(colors: [color, Color(uiColor: Theme.mix(UIColor(color), .black, 0.3))],
                                      startPoint: .topLeading, endPoint: .bottomTrailing))
-                .shadow(color: color.opacity(0.55), radius: 12, y: 5)
-                .scaleEffect(go ? 1 : 0.6)
+                .shadow(color: color.opacity(0.55), radius: 14, y: 6)
+                .scaleEffect(play ? 1 : 0.82)
+                .animation(.spring(response: 0.3, dampingFraction: 0.55), value: play)
             symbol
         }
-        .frame(width: 78, height: 78)
-        .onAppear {
-            withAnimation(.spring(response: 0.34, dampingFraction: 0.58)) { go = true }
-            if id == "hentai" {
-                withAnimation(.easeInOut(duration: 0.12).repeatCount(4, autoreverses: true).delay(0.08)) { wiggle = true }
+        .frame(width: 100, height: 100)
+        .onChange(of: play) { on in
+            if on && id == "hentai" {
+                withAnimation(.easeInOut(duration: 0.1).repeatCount(5, autoreverses: true).delay(0.12)) { flicker = true }
             }
         }
     }
 
     @ViewBuilder private var symbol: some View {
-        let img = Image(systemName: icon).font(.system(size: 32, weight: .semibold)).foregroundStyle(.white)
         switch id {
         case "manga":
-            // книжки «падают» на полку
-            img.offset(y: go ? 0 : -34).opacity(go ? 1 : 0)
+            // книжки падают на полку по одной
+            HStack(alignment: .bottom, spacing: 4) {
+                ForEach(0..<3) { i in
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(.white)
+                        .frame(width: i == 1 ? 12 : 10, height: [34, 42, 36][i])
+                        .rotationEffect(.degrees(i == 2 ? 10 : 0), anchor: .bottomLeading)
+                        .offset(y: play ? 0 : -56)
+                        .opacity(play ? 1 : 0)
+                        .animation(.spring(response: 0.26, dampingFraction: 0.6).delay(Double(i) * 0.07), value: play)
+                }
+            }
+            .offset(y: 2)
         case "ranobe":
-            // страница перелистывается
-            img.rotation3DEffect(.degrees(go ? 0 : 100), axis: (x: 0, y: 1, z: 0), anchor: .leading, perspective: 0.6)
+            // книга перелистывается целиком
+            Image(systemName: icon).font(.system(size: 42, weight: .semibold)).foregroundStyle(.white)
+                .rotation3DEffect(.degrees(play ? 0 : -180), axis: (x: 0, y: 1, z: 0), perspective: 0.5)
+                .animation(.spring(response: 0.42, dampingFraction: 0.7), value: play)
         case "hentai":
-            // огонёк колышется
-            img.scaleEffect(x: wiggle ? 0.92 : 1, y: wiggle ? 1.1 : 1, anchor: .bottom)
-                .rotationEffect(.degrees(wiggle ? 5 : -3), anchor: .bottom)
-                .scaleEffect(go ? 1 : 0.4)
+            // огонёк вспыхивает и колышется
+            Image(systemName: icon).font(.system(size: 42, weight: .semibold)).foregroundStyle(.white)
+                .scaleEffect(x: flicker ? 0.9 : 1, y: flicker ? 1.12 : 1, anchor: .bottom)
+                .rotationEffect(.degrees(flicker ? 6 : -4), anchor: .bottom)
+                .scaleEffect(play ? 1 : 0.3, anchor: .bottom)
+                .animation(.spring(response: 0.3, dampingFraction: 0.45), value: play)
         case "kino":
             // плёнка въезжает с поворотом
-            img.rotationEffect(.degrees(go ? 0 : -40)).offset(x: go ? 0 : -26).opacity(go ? 1 : 0)
+            Image(systemName: icon).font(.system(size: 40, weight: .semibold)).foregroundStyle(.white)
+                .rotationEffect(.degrees(play ? 0 : -90))
+                .offset(x: play ? 0 : -40)
+                .opacity(play ? 1 : 0)
+                .animation(.spring(response: 0.36, dampingFraction: 0.62), value: play)
         default:
             // ▶ «нажимается»
-            img.scaleEffect(go ? 1 : 1.5).opacity(go ? 1 : 0)
+            Image(systemName: icon).font(.system(size: 42, weight: .semibold)).foregroundStyle(.white)
+                .scaleEffect(play ? 1 : 1.7)
+                .opacity(play ? 1 : 0)
+                .animation(.spring(response: 0.3, dampingFraction: 0.5), value: play)
         }
     }
 }
@@ -1506,25 +1547,43 @@ struct PlatformSplashView: View {
         if let sp = sw.splash {
             let c = Color(hex: sp.hex)
             ZStack {
-                // приложение за стеклом размывается и окрашивается цветом раздела
+                // размытие нарастает в два слоя, а не включается разом
                 Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
-                c.opacity(0.28).ignoresSafeArea()
-                VStack(spacing: 12) {
-                    LivePlatformIcon(id: sp.id, icon: sp.icon, color: c)
+                    .opacity(sw.bg ? 1 : 0)
+                Rectangle().fill(.regularMaterial).ignoresSafeArea()
+                    .opacity(sw.bg ? 0.85 : 0)
+                    .animation(.easeOut(duration: 0.3).delay(sw.bg ? 0.08 : 0), value: sw.bg)
+                c.opacity(sw.bg ? 0.24 : 0).ignoresSafeArea()
+                // цвет раздела проходит по фону волной
+                GeometryReader { g in
+                    LinearGradient(colors: [.clear, c.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom)
+                        .frame(height: g.size.height * 0.6)
+                        .offset(y: sw.play ? g.size.height : -g.size.height * 0.6)
+                        .animation(.easeInOut(duration: 0.6), value: sw.play)
+                }
+                .ignoresSafeArea()
+                .opacity(sw.bg ? 1 : 0)
+
+                VStack(spacing: 16) {
+                    LivePlatformIcon(id: sp.id, icon: sp.icon, color: c, play: sw.play)
                         .id(sp)
-                    VStack(spacing: 2) {
-                        Text(sp.title).font(.title2.bold()).foregroundStyle(.primary)
-                        Text(sp.site).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                    VStack(spacing: 3) {
+                        Text(sp.title).font(.title.bold()).foregroundStyle(.primary)
+                        Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                     }
                 }
-                .frame(width: 184, height: 184)
-                .glassShape(RoundedRectangle(cornerRadius: 38, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 38, style: .continuous).stroke(Color.white.opacity(0.22), lineWidth: 0.6))
-                .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
-                .scaleEffect(sw.shown ? 1 : 0.86)
+                .frame(width: 240, height: 240)
+                .glassShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 48, style: .continuous).stroke(Color.white.opacity(0.22), lineWidth: 0.6))
+                .shadow(color: c.opacity(0.25), radius: 30, y: 12)
+                // лёгкое «дыхание» пока играет иконка
+                .scaleEffect(sw.play && !sw.leaving ? 1.03 : 1)
+                .animation(.easeInOut(duration: 0.35), value: sw.play)
+                .scaleEffect(sw.card ? (sw.leaving ? 1.08 : 1) : 0.72)
+                .offset(y: sw.leaving ? -40 : 0)
+                .opacity(sw.card && !sw.leaving ? 1 : 0)
             }
-            .opacity(sw.shown ? 1 : 0)
-            .allowsHitTesting(sw.shown)
+            .allowsHitTesting(sw.bg)
         }
     }
 }
