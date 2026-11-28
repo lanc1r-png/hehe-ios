@@ -1387,6 +1387,104 @@ enum Haptics {
     static func select() { if on { UISelectionFeedbackGenerator().selectionChanged() } }
     static func success() { if on { UINotificationFeedbackGenerator().notificationOccurred(.success) } }
     static func bump() { if on { UIImpactFeedbackGenerator(style: .medium).impactOccurred() } }
+    /// Мягкий удар заданной силы — для анимаций (смена платформы)
+    static func soft(_ intensity: CGFloat = 0.7) {
+        if on { UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: intensity) }
+    }
+    static func rigid(_ intensity: CGFloat = 0.8) {
+        if on { UIImpactFeedbackGenerator(style: .rigid).impactOccurred(intensity: intensity) }
+    }
+}
+
+/// Смена платформы: заставка цвета раздела прячет перестройку экранов, у каждого раздела свой цвет.
+@MainActor
+final class PlatformSwitcher: ObservableObject {
+    static let shared = PlatformSwitcher()
+    struct Splash: Equatable { let title: String; let site: String; let icon: String; let hex: String }
+    @Published var splash: Splash?
+    @Published var shown = false
+    private var busy = false
+
+    /// Цвет раздела по умолчанию (свой выбор в настройках запоминается отдельно для каждого раздела)
+    static func defaultHex(_ id: String) -> String {
+        switch id {
+        case "ranobe": return "5BD16A"
+        case "manga": return "4F9DFF"
+        case "hentai": return "FF6FA8"
+        case "kino": return "FF9F43"
+        default: return Theme.defaultAccentHex
+        }
+    }
+
+    func switchTo(_ id: String, title: String, site: String, icon: String) {
+        let ud = UserDefaults.standard
+        let old = ud.string(forKey: "set.platform") ?? "anime"
+        guard old != id, !busy else { return }
+        busy = true
+        // запоминаем цвет уходящего раздела и берём цвет нового
+        let curHex = ud.string(forKey: "accent.hex") ?? Theme.defaultAccentHex
+        ud.set(curHex, forKey: "accent.hex.\(old)")
+        let newHex = ud.string(forKey: "accent.hex.\(id)") ?? Self.defaultHex(id)
+        splash = Splash(title: title, site: site, icon: icon, hex: newHex)
+        Haptics.soft(0.6)
+        withAnimation(.easeOut(duration: 0.28)) { shown = true }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 320_000_000)
+            // экраны перестраиваются под заставкой — снаружи этого не видно
+            ud.set(newHex, forKey: "accent.hex")
+            ud.set(id, forKey: "set.platform")
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            Haptics.rigid(0.7)
+            withAnimation(.easeInOut(duration: 0.4)) { shown = false }
+            try? await Task.sleep(nanoseconds: 420_000_000)
+            splash = nil
+            busy = false
+        }
+    }
+}
+
+struct PlatformSplashView: View {
+    @ObservedObject var sw = PlatformSwitcher.shared
+    @State private var pop = false
+
+    var body: some View {
+        if let sp = sw.splash {
+            let c = Color(hex: sp.hex)
+            ZStack {
+                LinearGradient(colors: [c, Color(uiColor: Theme.mix(UIColor(c), .black, 0.55))],
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .ignoresSafeArea()
+                VStack(spacing: 18) {
+                    Image(systemName: sp.icon)
+                        .font(.system(size: 46, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 104, height: 104)
+                        .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                        .shadow(color: .black.opacity(0.25), radius: 16, y: 8)
+                        .scaleEffect(pop ? 1 : 0.6)
+                        .rotationEffect(.degrees(pop ? 0 : -12))
+                    VStack(spacing: 4) {
+                        Text(sp.title).font(.largeTitle.bold()).foregroundStyle(.white)
+                        Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.white.opacity(0.75))
+                    }
+                    .offset(y: pop ? 0 : 14)
+                    .opacity(pop ? 1 : 0)
+                }
+                .scaleEffect(sw.shown ? 1 : 1.08)
+            }
+            .opacity(sw.shown ? 1 : 0)
+            .allowsHitTesting(sw.shown)
+            .onAppear {
+                pop = false
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.62).delay(0.05)) { pop = true }
+            }
+            .onChange(of: sp) { _ in
+                pop = false
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.62).delay(0.05)) { pop = true }
+            }
+        }
+    }
 }
 
 /// Адрес тайтла на сайте (для «Поделиться»).
@@ -3504,10 +3602,8 @@ struct SettingsView: View {
 
     private func choosePlatform(_ id: String) {
         guard platform != id else { return }
-        Haptics.bump()
-        let name = platforms.first { $0.0 == id }?.1 ?? ""
-        AppRouter.shared.toast = "Платформа: \(name)"
-        withAnimation(.easeInOut(duration: 0.3)) { platform = id }
+        let p = platforms.first { $0.0 == id }
+        PlatformSwitcher.shared.switchTo(id, title: p?.1 ?? "", site: p?.2 ?? "", icon: platformIcon(id))
     }
 
     private func card<Content: View>(_ title: String, icon: String = "gearshape.fill", tint: Color = Theme.accent,
@@ -5405,6 +5501,7 @@ struct RootView: View {
             }
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: router.toast)
+        .overlay { PlatformSplashView() }
     }
 }
 
