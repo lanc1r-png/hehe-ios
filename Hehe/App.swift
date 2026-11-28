@@ -1396,16 +1396,14 @@ enum Haptics {
     }
 }
 
-/// Смена платформы: фон плавно размывается и окрашивается, по центру карточка с живой иконкой раздела.
-/// Ход: фон 0–0,2 с → карточка → анимация иконки 0,3 с → карточка уходит вверх → фон проясняется. Всего ≈0,8 с.
+/// Смена платформы. Поверх окна кладётся системный снимок экрана (только в памяти, никуда не сохраняется),
+/// под ним приложение перестраивается, затем снимок растворяется, а по центру всплывает карточка с живой иконкой.
+/// Всё рисуется прямо в окне — снимок встаёт пиксель в пиксель, без сдвигов. Всего ≈0,6 с.
 @MainActor
 final class PlatformSwitcher: ObservableObject {
     static let shared = PlatformSwitcher()
     struct Splash: Hashable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
     @Published var splash: Splash?
-    /// Снимок экрана до переключения: под ним приложение перестраивается, потом он растворяется
-    @Published var shot: UIImage?
-    @Published var shotVisible = false
     /// карточка на экране
     @Published var card = false
     /// иконка играет свою анимацию
@@ -1413,6 +1411,8 @@ final class PlatformSwitcher: ObservableObject {
     /// карточка уходит
     @Published var leaving = false
     private var busy = false
+    private var snap: UIView?
+    private var host: UIViewController?
 
     /// Цвет раздела по умолчанию (свой выбор в настройках запоминается отдельно для каждого раздела)
     static func defaultHex(_ id: String) -> String {
@@ -1427,13 +1427,6 @@ final class PlatformSwitcher: ObservableObject {
 
     private func wait(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
 
-    private static func snapshot() -> UIImage? {
-        guard let w = UIApplication.shared.connectedScenes
-            .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else { return nil }
-        let r = UIGraphicsImageRenderer(bounds: w.bounds)
-        return r.image { _ in _ = w.drawHierarchy(in: w.bounds, afterScreenUpdates: false) }
-    }
-
     func switchTo(_ id: String, title: String, site: String, icon: String) {
         let ud = UserDefaults.standard
         let old = ud.string(forKey: "set.platform") ?? "anime"
@@ -1443,31 +1436,92 @@ final class PlatformSwitcher: ObservableObject {
         let curHex = ud.string(forKey: "accent.hex") ?? Theme.defaultAccentHex
         ud.set(curHex, forKey: "accent.hex.\(old)")
         let newHex = ud.string(forKey: "accent.hex.\(id)") ?? Self.defaultHex(id)
-        // снимок кладётся без анимации — выглядит ровно как экран сейчас
-        shot = Self.snapshot()
-        shotVisible = shot != nil
+        Haptics.soft(0.5)
+
+        let window = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+        // 1. снимок экрана как он есть — системный, ровно на своё место
+        if let w = window, let v = w.snapshotView(afterScreenUpdates: false) {
+            v.frame = w.bounds
+            v.isUserInteractionEnabled = true   // нажатия во время перехода не проходят
+            w.addSubview(v)
+            snap = v
+        }
+        // 2. приложение перестраивается сразу, под снимком — пока ничего не анимируется, рывков нет
+        ud.set(newHex, forKey: "accent.hex")
+        ud.set(id, forKey: "set.platform")
+
+        // 3. карточка — отдельным слоем поверх снимка
         play = false; leaving = false; card = false
         splash = Splash(id: id, title: title, site: site, icon: icon, hex: newHex)
-        Haptics.soft(0.5)
+        if let w = window {
+            let h = UIHostingController(rootView: PlatformCardOverlay())
+            h.view.backgroundColor = .clear
+            h.view.frame = w.bounds
+            h.view.isUserInteractionEnabled = false
+            w.addSubview(h.view)
+            host = h
+        }
+
         Task { @MainActor in
-            await wait(16)
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.7)) { card = true }
-            await wait(100)
-            // приложение перестраивается под снимком
-            ud.set(newHex, forKey: "accent.hex")
-            ud.set(id, forKey: "set.platform")
+            // даём приложению дорисоваться под снимком
+            await wait(30)
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.74)) { card = true }
+            await wait(50)
             play = true
-            await wait(90)
-            // старый экран плавно перетекает в новый
-            withAnimation(.easeInOut(duration: 0.38)) { shotVisible = false }
-            await wait(90)
+            await wait(70)
+            // старый экран растворяется в новый (анимация системы, не грузит приложение)
+            if let v = snap {
+                UIView.animate(withDuration: 0.26, delay: 0, options: [.curveEaseInOut, .allowUserInteraction]) {
+                    v.alpha = 0
+                } completion: { _ in v.removeFromSuperview() }
+                snap = nil
+            }
+            await wait(110)
             Haptics.rigid(0.75)   // иконка «встала на место»
-            await wait(220)
-            withAnimation(.easeIn(duration: 0.18)) { leaving = true }
-            await wait(200)
-            splash = nil; shot = nil; card = false; play = false; leaving = false
+            await wait(190)
+            withAnimation(.easeIn(duration: 0.15)) { leaving = true }
+            await wait(170)
+            host?.view.removeFromSuperview()
+            host = nil
+            splash = nil; card = false; play = false; leaving = false
             busy = false
         }
+    }
+}
+
+/// Карточка смены платформы: стекло с живой иконкой и мягким свечением цвета раздела
+struct PlatformCardOverlay: View {
+    @ObservedObject var sw = PlatformSwitcher.shared
+
+    var body: some View {
+        ZStack {
+            if let sp = sw.splash {
+                let c = Color(hex: sp.hex)
+                let on = sw.card && !sw.leaving
+                RadialGradient(colors: [c.opacity(0.36), c.opacity(0.1), .clear], center: .center, startRadius: 20, endRadius: 250)
+                    .opacity(on ? 1 : 0)
+                    .animation(.easeOut(duration: 0.2), value: on)
+                VStack(spacing: 14) {
+                    LivePlatformIcon(id: sp.id, icon: sp.icon, color: c, play: sw.play)
+                        .id(sp)
+                    VStack(spacing: 3) {
+                        Text(sp.title).font(.title2.bold()).foregroundStyle(.primary)
+                        Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 220, height: 220)
+                .glassShape(RoundedRectangle(cornerRadius: 46, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 46, style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 0.6))
+                .shadow(color: .black.opacity(0.22), radius: 26, y: 12)
+                .scaleEffect(sw.play && !sw.leaving ? 1.03 : 1)
+                .animation(.easeInOut(duration: 0.3), value: sw.play)
+                .scaleEffect(sw.card ? (sw.leaving ? 0.9 : 1) : 0.6)
+                .opacity(on ? 1 : 0)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
     }
 }
 
@@ -1546,51 +1600,6 @@ struct LivePlatformIcon: View {
                 .scaleEffect(play ? 1 : 1.7)
                 .opacity(play ? 1 : 0)
                 .animation(.spring(response: 0.3, dampingFraction: 0.5), value: play)
-        }
-    }
-}
-
-struct PlatformSplashView: View {
-    @ObservedObject var sw = PlatformSwitcher.shared
-
-    var body: some View {
-        if let sp = sw.splash {
-            let c = Color(hex: sp.hex)
-            let cardOn = sw.card && !sw.leaving
-            ZStack {
-                // старый экран поверх нового — растворяется, цвет перетекает без рывка
-                if let img = sw.shot {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .ignoresSafeArea()
-                        .opacity(sw.shotVisible ? 1 : 0)
-                }
-                // мягкое пятно цвета раздела за карточкой — карточка не теряется на пёстром фоне
-                RadialGradient(colors: [c.opacity(0.38), c.opacity(0.12), .clear], center: .center, startRadius: 20, endRadius: 260)
-                    .ignoresSafeArea()
-                    .opacity(cardOn ? 1 : 0)
-                    .animation(.easeOut(duration: 0.25), value: cardOn)
-
-                VStack(spacing: 14) {
-                    LivePlatformIcon(id: sp.id, icon: sp.icon, color: c, play: sw.play)
-                        .id(sp)
-                    VStack(spacing: 3) {
-                        Text(sp.title).font(.title2.bold()).foregroundStyle(.primary)
-                        Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-                    }
-                }
-                .frame(width: 220, height: 220)
-                .glassShape(RoundedRectangle(cornerRadius: 46, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 46, style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 0.6))
-                .shadow(color: .black.opacity(0.22), radius: 28, y: 12)
-                // лёгкое «дыхание» пока играет иконка
-                .scaleEffect(sw.play && !sw.leaving ? 1.03 : 1)
-                .animation(.easeInOut(duration: 0.35), value: sw.play)
-                .scaleEffect(sw.card ? (sw.leaving ? 0.9 : 1) : 0.7)
-                .opacity(cardOn ? 1 : 0)
-            }
-            .allowsHitTesting(true)
         }
     }
 }
@@ -5609,7 +5618,6 @@ struct RootView: View {
             }
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: router.toast)
-        .overlay { PlatformSplashView() }
     }
 }
 
