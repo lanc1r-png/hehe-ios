@@ -1396,11 +1396,11 @@ enum Haptics {
     }
 }
 
-/// Смена платформы: заставка цвета раздела прячет перестройку экранов, у каждого раздела свой цвет.
+/// Смена платформы: приложение за стеклом размывается и перекрашивается, по центру — карточка с живой иконкой раздела.
 @MainActor
 final class PlatformSwitcher: ObservableObject {
     static let shared = PlatformSwitcher()
-    struct Splash: Equatable { let title: String; let site: String; let icon: String; let hex: String }
+    struct Splash: Equatable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
     @Published var splash: Splash?
     @Published var shown = false
     private var busy = false
@@ -1425,64 +1425,106 @@ final class PlatformSwitcher: ObservableObject {
         let curHex = ud.string(forKey: "accent.hex") ?? Theme.defaultAccentHex
         ud.set(curHex, forKey: "accent.hex.\(old)")
         let newHex = ud.string(forKey: "accent.hex.\(id)") ?? Self.defaultHex(id)
-        splash = Splash(title: title, site: site, icon: icon, hex: newHex)
-        Haptics.soft(0.6)
-        withAnimation(.easeOut(duration: 0.28)) { shown = true }
+        splash = Splash(id: id, title: title, site: site, icon: icon, hex: newHex)
+        Haptics.soft(0.55)
+        withAnimation(.easeOut(duration: 0.18)) { shown = true }
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 320_000_000)
-            // экраны перестраиваются под заставкой — снаружи этого не видно
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            // экраны перестраиваются за стеклом
             ud.set(newHex, forKey: "accent.hex")
             ud.set(id, forKey: "set.platform")
-            try? await Task.sleep(nanoseconds: 650_000_000)
-            Haptics.rigid(0.7)
-            withAnimation(.easeInOut(duration: 0.4)) { shown = false }
-            try? await Task.sleep(nanoseconds: 420_000_000)
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            Haptics.rigid(0.75)   // в такт «приземлению» иконки
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            withAnimation(.easeIn(duration: 0.2)) { shown = false }
+            try? await Task.sleep(nanoseconds: 220_000_000)
             splash = nil
             busy = false
         }
     }
 }
 
+/// Иконка раздела со своей короткой анимацией
+struct LivePlatformIcon: View {
+    let id: String
+    let icon: String
+    let color: Color
+    @State private var go = false
+    @State private var wiggle = false
+
+    var body: some View {
+        ZStack {
+            // волна от иконки
+            Circle()
+                .stroke(color.opacity(0.6), lineWidth: 2)
+                .scaleEffect(go ? 1.55 : 0.7)
+                .opacity(go ? 0 : 0.9)
+            Circle()
+                .fill(LinearGradient(colors: [color, Color(uiColor: Theme.mix(UIColor(color), .black, 0.3))],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .shadow(color: color.opacity(0.55), radius: 12, y: 5)
+                .scaleEffect(go ? 1 : 0.6)
+            symbol
+        }
+        .frame(width: 78, height: 78)
+        .onAppear {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.58)) { go = true }
+            if id == "hentai" {
+                withAnimation(.easeInOut(duration: 0.12).repeatCount(4, autoreverses: true).delay(0.08)) { wiggle = true }
+            }
+        }
+    }
+
+    @ViewBuilder private var symbol: some View {
+        let img = Image(systemName: icon).font(.system(size: 32, weight: .semibold)).foregroundStyle(.white)
+        switch id {
+        case "manga":
+            // книжки «падают» на полку
+            img.offset(y: go ? 0 : -34).opacity(go ? 1 : 0)
+        case "ranobe":
+            // страница перелистывается
+            img.rotation3DEffect(.degrees(go ? 0 : 100), axis: (x: 0, y: 1, z: 0), anchor: .leading, perspective: 0.6)
+        case "hentai":
+            // огонёк колышется
+            img.scaleEffect(x: wiggle ? 0.92 : 1, y: wiggle ? 1.1 : 1, anchor: .bottom)
+                .rotationEffect(.degrees(wiggle ? 5 : -3), anchor: .bottom)
+                .scaleEffect(go ? 1 : 0.4)
+        case "kino":
+            // плёнка въезжает с поворотом
+            img.rotationEffect(.degrees(go ? 0 : -40)).offset(x: go ? 0 : -26).opacity(go ? 1 : 0)
+        default:
+            // ▶ «нажимается»
+            img.scaleEffect(go ? 1 : 1.5).opacity(go ? 1 : 0)
+        }
+    }
+}
+
 struct PlatformSplashView: View {
     @ObservedObject var sw = PlatformSwitcher.shared
-    @State private var pop = false
 
     var body: some View {
         if let sp = sw.splash {
             let c = Color(hex: sp.hex)
             ZStack {
-                LinearGradient(colors: [c, Color(uiColor: Theme.mix(UIColor(c), .black, 0.55))],
-                               startPoint: .topLeading, endPoint: .bottomTrailing)
-                    .ignoresSafeArea()
-                VStack(spacing: 18) {
-                    Image(systemName: sp.icon)
-                        .font(.system(size: 46, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 104, height: 104)
-                        .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 30, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(Color.white.opacity(0.35), lineWidth: 0.8))
-                        .shadow(color: .black.opacity(0.25), radius: 16, y: 8)
-                        .scaleEffect(pop ? 1 : 0.6)
-                        .rotationEffect(.degrees(pop ? 0 : -12))
-                    VStack(spacing: 4) {
-                        Text(sp.title).font(.largeTitle.bold()).foregroundStyle(.white)
-                        Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.white.opacity(0.75))
+                // приложение за стеклом размывается и окрашивается цветом раздела
+                Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
+                c.opacity(0.28).ignoresSafeArea()
+                VStack(spacing: 12) {
+                    LivePlatformIcon(id: sp.id, icon: sp.icon, color: c)
+                        .id(sp)
+                    VStack(spacing: 2) {
+                        Text(sp.title).font(.title2.bold()).foregroundStyle(.primary)
+                        Text(sp.site).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                     }
-                    .offset(y: pop ? 0 : 14)
-                    .opacity(pop ? 1 : 0)
                 }
-                .scaleEffect(sw.shown ? 1 : 1.08)
+                .frame(width: 184, height: 184)
+                .glassShape(RoundedRectangle(cornerRadius: 38, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 38, style: .continuous).stroke(Color.white.opacity(0.22), lineWidth: 0.6))
+                .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
+                .scaleEffect(sw.shown ? 1 : 0.86)
             }
             .opacity(sw.shown ? 1 : 0)
             .allowsHitTesting(sw.shown)
-            .onAppear {
-                pop = false
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.62).delay(0.05)) { pop = true }
-            }
-            .onChange(of: sp) { _ in
-                pop = false
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.62).delay(0.05)) { pop = true }
-            }
         }
     }
 }
