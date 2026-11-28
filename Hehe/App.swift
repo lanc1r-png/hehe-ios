@@ -1403,8 +1403,9 @@ final class PlatformSwitcher: ObservableObject {
     static let shared = PlatformSwitcher()
     struct Splash: Hashable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
     @Published var splash: Splash?
-    /// размытый фон
-    @Published var bg = false
+    /// Снимок экрана до переключения: под ним приложение перестраивается, потом он растворяется
+    @Published var shot: UIImage?
+    @Published var shotVisible = false
     /// карточка на экране
     @Published var card = false
     /// иконка играет свою анимацию
@@ -1426,6 +1427,13 @@ final class PlatformSwitcher: ObservableObject {
 
     private func wait(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
 
+    private static func snapshot() -> UIImage? {
+        guard let w = UIApplication.shared.connectedScenes
+            .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else { return nil }
+        let r = UIGraphicsImageRenderer(bounds: w.bounds)
+        return r.image { _ in _ = w.drawHierarchy(in: w.bounds, afterScreenUpdates: false) }
+    }
+
     func switchTo(_ id: String, title: String, site: String, icon: String) {
         let ud = UserDefaults.standard
         let old = ud.string(forKey: "set.platform") ?? "anime"
@@ -1435,27 +1443,29 @@ final class PlatformSwitcher: ObservableObject {
         let curHex = ud.string(forKey: "accent.hex") ?? Theme.defaultAccentHex
         ud.set(curHex, forKey: "accent.hex.\(old)")
         let newHex = ud.string(forKey: "accent.hex.\(id)") ?? Self.defaultHex(id)
-        splash = Splash(id: id, title: title, site: site, icon: icon, hex: newHex)
+        // снимок кладётся без анимации — выглядит ровно как экран сейчас
+        shot = Self.snapshot()
+        shotVisible = shot != nil
         play = false; leaving = false; card = false
+        splash = Splash(id: id, title: title, site: site, icon: icon, hex: newHex)
         Haptics.soft(0.5)
-        withAnimation(.easeOut(duration: 0.22)) { bg = true }
         Task { @MainActor in
-            await wait(70)
-            withAnimation(.spring(response: 0.26, dampingFraction: 0.72)) { card = true }
-            await wait(130)
-            // экраны перестраиваются за стеклом, пока играет иконка
+            await wait(16)
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.7)) { card = true }
+            await wait(100)
+            // приложение перестраивается под снимком
             ud.set(newHex, forKey: "accent.hex")
             ud.set(id, forKey: "set.platform")
             play = true
-            await wait(170)
+            await wait(90)
+            // старый экран плавно перетекает в новый
+            withAnimation(.easeInOut(duration: 0.38)) { shotVisible = false }
+            await wait(90)
             Haptics.rigid(0.75)   // иконка «встала на место»
-            await wait(160)
-            // сначала уходит карточка, потом проясняется фон — без «призрака» надписи
-            withAnimation(.easeIn(duration: 0.16)) { leaving = true }
-            await wait(120)
-            withAnimation(.easeInOut(duration: 0.24)) { bg = false }
-            await wait(260)
-            splash = nil; card = false; play = false; leaving = false
+            await wait(220)
+            withAnimation(.easeIn(duration: 0.18)) { leaving = true }
+            await wait(200)
+            splash = nil; shot = nil; card = false; play = false; leaving = false
             busy = false
         }
     }
@@ -1546,44 +1556,41 @@ struct PlatformSplashView: View {
     var body: some View {
         if let sp = sw.splash {
             let c = Color(hex: sp.hex)
+            let cardOn = sw.card && !sw.leaving
             ZStack {
-                // размытие нарастает в два слоя, а не включается разом
-                Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
-                    .opacity(sw.bg ? 1 : 0)
-                Rectangle().fill(.regularMaterial).ignoresSafeArea()
-                    .opacity(sw.bg ? 0.85 : 0)
-                    .animation(.easeOut(duration: 0.3).delay(sw.bg ? 0.08 : 0), value: sw.bg)
-                c.opacity(sw.bg ? 0.24 : 0).ignoresSafeArea()
-                // цвет раздела проходит по фону волной
-                GeometryReader { g in
-                    LinearGradient(colors: [.clear, c.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: g.size.height * 0.6)
-                        .offset(y: sw.play ? g.size.height : -g.size.height * 0.6)
-                        .animation(.easeInOut(duration: 0.6), value: sw.play)
+                // старый экран поверх нового — растворяется, цвет перетекает без рывка
+                if let img = sw.shot {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .ignoresSafeArea()
+                        .opacity(sw.shotVisible ? 1 : 0)
                 }
-                .ignoresSafeArea()
-                .opacity(sw.bg ? 1 : 0)
+                // мягкое пятно цвета раздела за карточкой — карточка не теряется на пёстром фоне
+                RadialGradient(colors: [c.opacity(0.38), c.opacity(0.12), .clear], center: .center, startRadius: 20, endRadius: 260)
+                    .ignoresSafeArea()
+                    .opacity(cardOn ? 1 : 0)
+                    .animation(.easeOut(duration: 0.25), value: cardOn)
 
-                VStack(spacing: 16) {
+                VStack(spacing: 14) {
                     LivePlatformIcon(id: sp.id, icon: sp.icon, color: c, play: sw.play)
                         .id(sp)
                     VStack(spacing: 3) {
-                        Text(sp.title).font(.title.bold()).foregroundStyle(.primary)
+                        Text(sp.title).font(.title2.bold()).foregroundStyle(.primary)
                         Text(sp.site).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                     }
                 }
-                .frame(width: 240, height: 240)
-                .glassShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 48, style: .continuous).stroke(Color.white.opacity(0.22), lineWidth: 0.6))
-                .shadow(color: c.opacity(0.25), radius: 30, y: 12)
+                .frame(width: 220, height: 220)
+                .glassShape(RoundedRectangle(cornerRadius: 46, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 46, style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 0.6))
+                .shadow(color: .black.opacity(0.22), radius: 28, y: 12)
                 // лёгкое «дыхание» пока играет иконка
                 .scaleEffect(sw.play && !sw.leaving ? 1.03 : 1)
                 .animation(.easeInOut(duration: 0.35), value: sw.play)
-                .scaleEffect(sw.card ? (sw.leaving ? 1.08 : 1) : 0.72)
-                .offset(y: sw.leaving ? -40 : 0)
-                .opacity(sw.card && !sw.leaving ? 1 : 0)
+                .scaleEffect(sw.card ? (sw.leaving ? 0.9 : 1) : 0.7)
+                .opacity(cardOn ? 1 : 0)
             }
-            .allowsHitTesting(sw.bg)
+            .allowsHitTesting(true)
         }
     }
 }
