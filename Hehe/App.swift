@@ -497,7 +497,7 @@ extension String {
 }
 
 struct Anime: Codable, Identifiable, Hashable {
-    private enum RatingKeys: String, CodingKey { case rating }
+    private enum RatingKeys: String, CodingKey { case rating, rate }
 
     let id: Int
     let name: String?
@@ -570,14 +570,21 @@ struct Anime: Codable, Identifiable, Hashable {
         type = try? c.decode(NamedItem.self, forKey: .type)
         ageRestriction = try? c.decode(NamedItem.self, forKey: .ageRestriction)
         releaseDateString = try? c.decode(String.self, forKey: .releaseDateString)
-        rateVotes = (try? decoder.container(keyedBy: RatingKeys.self))
-            .flatMap { try? $0.decode(RatingBox.self, forKey: .rating) }?.votes
-        if let s = try? c.decode(String.self, forKey: .rateAvg) { rateAvg = s }
-        else if let d = try? c.decode(Double.self, forKey: .rateAvg) { rateAvg = String(format: "%.1f", d) }
-        else if let rc = try? decoder.container(keyedBy: RatingKeys.self),
-                let rb = try? rc.decode(RatingBox.self, forKey: .rating),
-                let av = rb.average { rateAvg = av }
-        else { rateAvg = nil }
+        let rk = try? decoder.container(keyedBy: RatingKeys.self)
+        var votes = rk.flatMap { try? $0.decode(RatingBox.self, forKey: .rating) }?.votes
+        // у манги число оценок может лежать в поле rate
+        if votes == nil, let rk {
+            if let n = try? rk.decode(Int.self, forKey: .rate) { votes = n }
+            else if let sn = try? rk.decode(String.self, forKey: .rate), let n = Int(sn) { votes = n }
+        }
+        rateVotes = votes
+        var ra: String?
+        if let s = try? c.decode(String.self, forKey: .rateAvg) { ra = s }
+        else if let d = try? c.decode(Double.self, forKey: .rateAvg) { ra = String(format: "%.1f", d) }
+        else if let rk, let rb = try? rk.decode(RatingBox.self, forKey: .rating), let av = rb.average { ra = av }
+        // «★ 0» у тайтла без оценок не показываем
+        if let r = ra, let d = Double(r.replacingOccurrences(of: ",", with: ".")), d <= 0 { ra = nil }
+        rateAvg = ra
     }
 }
 
@@ -982,7 +989,7 @@ actor AnimelibAPI {
             for (_, items, next, err) in results {
                 guard let items else { lastError = err; stop = true; break }
                 if batches == 0 { firstRaw += items }
-                out += items.filter { ($0.rateVotes ?? Int.max) >= minVotes }
+                out += items.filter { ($0.rateVotes ?? 0) >= minVotes }
                 hasNext = next
                 if !next { stop = true; break }
             }
@@ -992,7 +999,21 @@ actor AnimelibAPI {
         }
         if out.isEmpty {
             if firstRaw.isEmpty, let e = lastError { throw e }
-            // Фильтр по числу оценок ничего не нашёл: лучше показать список как есть, чем пустой экран.
+            // Сайт не прислал число оценок: берём самые популярные (у них оценок много) и сортируем по рейтингу —
+            // иначе наверху одни «десятки» от пары человек.
+            if startPage == 1, firstRaw.allSatisfy({ $0.rateVotes == nil }) {
+                var f = filter
+                f.sortBy = .views
+                var pool: [Anime] = []
+                var seen = Set<Int>()
+                for pg in 1...3 {
+                    guard let r = try? await catalog(filter: f, page: pg) else { break }
+                    pool += r.items.filter { seen.insert($0.id).inserted }
+                    if !r.hasNext { break }
+                }
+                func val(_ a: Anime) -> Double { Double((a.rateAvg ?? "0").replacingOccurrences(of: ",", with: ".")) ?? 0 }
+                if !pool.isEmpty { return (pool.sorted { val($0) > val($1) }, false, page) }
+            }
             out = firstRaw
         }
         return (out, hasNext, page)
@@ -2435,7 +2456,7 @@ struct NewInFavoritesView: View {
 struct StatusBadge: View {
     let status: ListStatus
     let book: Bool
-    var size: CGFloat = 24
+    var size: CGFloat = 22
     var body: some View {
         Image(systemName: status.badgeIcon(book: book))
             .font(.system(size: size * 0.42, weight: .heavy))
@@ -2454,6 +2475,15 @@ struct StatusBadge: View {
     }
 }
 
+/// Склонение по числу: ruPlural(2, "день", "дня", "дней") → «дня»
+func ruPlural(_ n: Int, _ one: String, _ few: String, _ many: String) -> String {
+    let a = abs(n) % 100, b = a % 10
+    if a > 10 && a < 20 { return many }
+    if b == 1 { return one }
+    if b >= 2 && b <= 4 { return few }
+    return many
+}
+
 /// «12 тыс.», «1,2 млн», «850»
 func fmtVotes(_ n: Int) -> String {
     if n >= 1_000_000 { return String(format: "%.1f млн", Double(n) / 1_000_000).replacingOccurrences(of: ".", with: ",") }
@@ -2469,6 +2499,10 @@ struct FavCard: View {
     var newCount: Int = 0
     var subtitle: String? = nil
     var progress: Double? = nil
+    /// Открыта вкладка этого же статуса: значок ничего не сообщает, делаем его незаметным
+    var muted = false
+    /// ▶ только у начатых тайтлов
+    var canContinue = true
     let onStatus: (ListStatus?) -> Void
     let onContinue: () -> Void
 
@@ -2489,21 +2523,23 @@ struct FavCard: View {
                         }
                     } label: {
                         // стеклянная подложка + цвет статуса из общей палитры
-                        Image(systemName: status?.badgeIcon(book: book) ?? "tag")
+                        Image(systemName: muted ? "ellipsis" : (status?.badgeIcon(book: book) ?? "tag"))
                             .font(.system(size: 11, weight: .heavy))
                             .foregroundStyle(.white)
-                            .frame(width: 28, height: 28)
+                            .frame(width: muted ? 24 : 26, height: muted ? 24 : 26)
                             .background {
                                 ZStack {
                                     Circle().fill(.ultraThinMaterial)
-                                    Circle().fill((status?.color ?? Color.black).opacity(status == nil ? 0.25 : 0.82))
+                                    Circle().fill((muted ? Color.black : (status?.color ?? Color.black))
+                                        .opacity(muted ? 0.35 : (status == nil ? 0.25 : 0.82)))
                                 }
                             }
-                            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.6))
+                            .overlay(Circle().stroke(Color.white.opacity(muted ? 0.2 : 0.35), lineWidth: 0.6))
                             .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
                     }
                     .position(x: 22, y: 22)
 
+                    if canContinue {
                     Button(action: onContinue) {
                         Image(systemName: "play.fill")
                             .font(.caption.weight(.bold))
@@ -2515,6 +2551,7 @@ struct FavCard: View {
                     }
                     .buttonStyle(.plain)
                     .position(x: geo.size.width - 22, y: geo.size.width * 1.5 - 22)
+                    }
                 }
             }
         }
@@ -2746,7 +2783,9 @@ struct FavoritesView: View {
                     LazyVGrid(columns: columns, spacing: 18) {
                         ForEach(visible) { anime in
                             FavCard(anime: anime, status: meta.status(anime), book: book, newCount: meta.newCount(anime),
-                                    subtitle: cardSubtitle(anime), progress: cardProgress(anime),
+                                    subtitle: cardSubtitle(anime) ?? "Не начато", progress: cardProgress(anime),
+                                    muted: filter != nil && filter == meta.status(anime),
+                                    canContinue: history.items.contains { $0.anime.id == anime.id },
                                     onStatus: { st in
                                         meta.setStatus(anime, st)
                                         Haptics.select()
@@ -3455,11 +3494,11 @@ struct SettingsView: View {
 
     private var platformHint: String {
         switch platform {
-        case "ranobe": return "Ранобэ: читалка с темами и шрифтами, скачивание глав для чтения без сети."
-        case "manga": return "Манга: страницы или лента, комментарии к главам, прогресс чтения."
-        case "hentai": return "HentaiLib (18+): та же читалка, что у манги; избранное и история отдельные."
-        case "kino": return "Кино: фильмы, сериалы, мультфильмы и аниме с kinomig.tv — родной плеер без рекламы, выбор озвучки, своё избранное."
-        default: return "Аниме: плеер с озвучкой и субтитрами, комментарии к сериям, автопереход."
+        case "ranobe": return "Читалка с темами и шрифтами, главы без сети"
+        case "manga": return "Страницы или лента, комментарии к главам"
+        case "hentai": return "18+, отдельные избранное и история"
+        case "kino": return "Фильмы и сериалы с kinomig.tv, родной плеер"
+        default: return "Плеер с озвучкой и субтитрами, автопереход"
         }
     }
 
@@ -3499,10 +3538,10 @@ struct SettingsView: View {
             .padding(.leading, 6)
     }
 
+    /// Версия — внизу экрана, здесь только сайт
     private var heroSubtitle: String {
-        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
         let pl = platforms.first { $0.0 == platform }?.2 ?? "AnimeLib"
-        return "Версия \(v) · \(pl)"
+        return auth.user == nil ? pl + " · вход не выполнен" : pl
     }
 
     private var hero: some View {
@@ -3530,9 +3569,11 @@ struct SettingsView: View {
                 }
                 Spacer(minLength: 0)
             }
+            if !offline.allEntries.isEmpty {
             HStack(spacing: 8) {
                 heroStat("arrow.down.circle.fill", "\(offline.allEntries.count)", "скачано")
                 heroStat("internaldrive.fill", offline.totalBytes == 0 ? "0 МБ" : fmtBytes(offline.totalBytes), "занято")
+            }
             }
         }
         .padding(16)
@@ -3683,6 +3724,7 @@ struct SettingsView: View {
                     Button { choosePlatform(pl.0) } label: {
                         VStack(spacing: 4) {
                             Image(systemName: platformIcon(pl.0)).font(.system(size: 19, weight: .semibold))
+                                .frame(height: 24)
                             Text(pl.1).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                         }
                         .foregroundStyle(on ? Color.white : Color.primary)
@@ -3699,7 +3741,8 @@ struct SettingsView: View {
             .background(Theme.card, in: RoundedRectangle(cornerRadius: 27, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 27, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
             Text(platformHint.noHyphens)
-                .font(.footnote).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(.secondary)
+                .lineLimit(1).minimumScaleFactor(0.85)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
         }
@@ -4166,7 +4209,7 @@ final class HomeViewModel: ObservableObject {
         f.sortBy = sort
         if sort == .rating {
             // «Лучшее» меняется редко: сутки берём из памяти телефона, а обновляем в фоне
-            let key = "home.top.\(LibSite.current.key)"
+            let key = "home.top2.\(LibSite.current.key)"
             if page == 1, let d = UserDefaults.standard.object(forKey: key + ".at") as? Date,
                Date().timeIntervalSince(d) < 86400,
                let data = UserDefaults.standard.data(forKey: key),
@@ -4258,14 +4301,7 @@ extension View {
     func statusBarBlur(opacity: Double = 1) -> some View {
         overlay(alignment: .top) {
             GeometryReader { g in
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                    .frame(height: g.safeAreaInsets.top + 14)
-                    .mask(LinearGradient(stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black, location: 0.75),
-                        .init(color: .clear, location: 1)
-                    ], startPoint: .top, endPoint: .bottom))
+                StatusBarFill(height: g.safeAreaInsets.top)
             }
             .ignoresSafeArea(edges: .top)
             .opacity(opacity)
@@ -4277,16 +4313,26 @@ extension View {
 struct TopBlur: View {
     let inset: CGFloat
     var body: some View {
-        Rectangle()
-            .fill(.ultraThinMaterial)
-            .frame(height: inset + 14)
-            .mask(LinearGradient(stops: [
-                .init(color: .black, location: 0),
-                .init(color: .black, location: 0.75),
-                .init(color: .clear, location: 1)
-            ], startPoint: .top, endPoint: .bottom))
-            .allowsHitTesting(false)
+        StatusBarFill(height: inset)
             .offset(y: -inset)
+    }
+}
+
+/// Полоса под часами: плотное размытие и лёгкое затемнение фоном, чтобы текст под ней не читался поверх часов.
+struct StatusBarFill: View {
+    let height: CGFloat
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.regularMaterial)
+            Color(uiColor: .systemBackground).opacity(0.35)
+        }
+        .frame(height: height + 22)
+        .mask(LinearGradient(stops: [
+            .init(color: .black, location: 0),
+            .init(color: .black, location: 0.7),
+            .init(color: .clear, location: 1)
+        ], startPoint: .top, endPoint: .bottom))
+        .allowsHitTesting(false)
     }
 }
 
@@ -4358,33 +4404,42 @@ struct UpdateMark: View {
 /// Сколько глав/серий и когда вышла последняя — для подписи в «Свежих главах». Один запрос на тайтл, с кэшем.
 @MainActor
 final class FreshInfo: ObservableObject {
+    struct Info { var count: Int?; var date: Date?; var num: String? }
     static let shared = FreshInfo()
-    @Published private(set) var items: [String: (count: Int?, date: Date?)] = [:]
+    @Published private(set) var items: [String: Info] = [:]
     private var loading = Set<String>()
     private func key(_ a: Anime) -> String { "\(LibSite.current.key)-\(a.id)" }
-    func get(_ a: Anime) -> (count: Int?, date: Date?)? { items[key(a)] }
-    private struct Saved: Codable { var count: Int?; var date: Date?; var at: Date }
+    func get(_ a: Anime) -> Info? { items[key(a)] }
+    private struct Saved: Codable { var count: Int?; var date: Date?; var num: String?; var at: Date }
     private var disk: [String: Saved] = {
-        guard let d = UserDefaults.standard.data(forKey: "freshinfo.v1"),
+        guard let d = UserDefaults.standard.data(forKey: "freshinfo.v2"),
               let v = try? JSONDecoder().decode([String: Saved].self, from: d) else { return [:] }
-        return v.filter { Date().timeIntervalSince($0.value.at) < 86400 }
+        return v.filter { Date().timeIntervalSince($0.value.at) < 6 * 3600 }
     }()
 
     func load(_ a: Anime) async {
         let k = key(a)
         guard items[k] == nil, !loading.contains(k) else { return }
-        if let s = disk[k], Date().timeIntervalSince(s.at) < 86400 {
-            items[k] = (s.count, s.date)
+        if let s = disk[k], Date().timeIntervalSince(s.at) < 6 * 3600 {
+            items[k] = Info(count: s.count, date: s.date, num: s.num)
             return
         }
         loading.insert(k)
         let r = await RequestGate.inBackground { await AnimelibAPI.shared.updateInfo(slug: a.slugUrl) }
+        var v = Info(count: r.count, date: r.date.flatMap(parseLibDate), num: nil)
+        // манга и ранобэ: номер и дата последней главы — из списка глав
+        if LibSite.current.isBook, let slug = a.slugUrl, !slug.isEmpty,
+           let list = try? await RequestGate.inBackground({ try await NovelService.chapters(slug: slug) }),
+           let last = list.last {
+            v.num = last.number
+            if let d = list.compactMap({ $0.date }).max() { v.date = d }
+            if v.count == nil { v.count = list.count }
+        }
         loading.remove(k)
-        let v = (count: r.count, date: r.date.flatMap(parseLibDate))
         items[k] = v
-        if v.count != nil || v.date != nil {
-            disk[k] = Saved(count: v.count, date: v.date, at: Date())
-            if let d = try? JSONEncoder().encode(disk) { UserDefaults.standard.set(d, forKey: "freshinfo.v1") }
+        if v.count != nil || v.date != nil || v.num != nil {
+            disk[k] = Saved(count: v.count, date: v.date, num: v.num, at: Date())
+            if let d = try? JSONEncoder().encode(disk) { UserDefaults.standard.set(d, forKey: "freshinfo.v2") }
         }
     }
 }
@@ -4396,16 +4451,21 @@ struct PosterCard: View {
     var mark: String? = nil
     /// Подпись под названием: тип и что вышло («Манхва · 87 гл. · сегодня»)
     var showFresh = false
+    /// Число оценок под названием (в «Лучшем по рейтингу»)
+    var showVotes = false
     @ObservedObject private var fresh = FreshInfo.shared
 
     private var subtitle: String {
         var parts: [String] = []
-        if let t = anime.type?.title, !t.isEmpty { parts.append(t) }
+        let book = LibSite.current.isBook
         if showFresh, let f = fresh.get(anime) {
-            let book = LibSite.current.isBook
-            if let n = f.count, n > 0 { parts.append(book ? "\(n) гл." : "\(n) эп.") }
+            // в «Свежих главах» главное — что вышло и когда
+            if book, let n = f.num, !n.isEmpty { parts.append("Гл. \(n)") }
+            else if let n = f.count, n > 0 { parts.append(book ? "\(n) гл." : "\(n) эп.") }
             if let d = f.date { parts.append(ChapterAge.ago(d)) }
         }
+        if parts.isEmpty, let t = anime.type?.title, !t.isEmpty { parts.append(t) }
+        if showVotes, let v = anime.rateVotes, v > 0 { parts.append("\(fmtVotes(v)) оц.") }
         return parts.joined(separator: " · ")
     }
 
@@ -4528,13 +4588,15 @@ struct AnimeRow: View {
 /// Первое место списка «Сейчас смотрят/читают»: крупная карточка с размытым фоном из обложки.
 struct PopularHero: View {
     let anime: Anime
+    @State private var tint: Color?
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             BlurredCover(url: anime.posterURL, radius: 28, scale: 1.4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(LinearGradient(colors: [.black.opacity(0.30), .black.opacity(0.72)],
-                                        startPoint: .top, endPoint: .bottom))
+                // окрашиваем цветом обложки, как «Выбор дня», а не серым затемнением
+                .overlay(LinearGradient(colors: [(tint ?? Theme.accent).opacity(0.5), .black.opacity(0.62)],
+                                        startPoint: .topLeading, endPoint: .bottomTrailing))
             HStack(alignment: .bottom, spacing: 16) {
                 RemoteImage(url: anime.posterURL, maxPixel: 720)
                     .frame(width: 112, height: 168)
@@ -4566,6 +4628,7 @@ struct PopularHero: View {
         .frame(maxWidth: .infinity)
         .frame(height: 200)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .task(id: anime.id) { tint = await CoverTint.color(anime.posterURL ?? anime.imageURL) }
     }
 }
 
@@ -4624,9 +4687,12 @@ struct RatingBadge: View {
     /// Маленькая — для обложек в сетке и лентах
     var compact = false
     var body: some View {
-        Label(text, systemImage: "star.fill")
+        HStack(spacing: 4) {
+            // звезда цветом акцента — как в списках без плашки
+            Image(systemName: "star.fill").foregroundStyle(Theme.accent)
+            Text(text).foregroundStyle(.white).monospacedDigit()
+        }
             .font(compact ? .caption2.bold() : .caption.bold())
-            .foregroundStyle(.white)
             .padding(.horizontal, compact ? 8 : 9).padding(.vertical, 4)
             .background(Color.black.opacity(opacity), in: Capsule())
             .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
@@ -4691,6 +4757,19 @@ struct BlurredCover: View {
 struct TodayHero: View {
     let anime: Anime
     @Environment(\.colorScheme) private var scheme
+    @ObservedObject private var fresh = FreshInfo.shared
+    /// Строка в пустом месте карточки: описание, а без него — тип, сколько глав и когда обновлялось
+    private var blurb: String {
+        if let s = anime.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { return s }
+        var parts: [String] = []
+        if let t = anime.type?.title, !t.isEmpty { parts.append(t) }
+        let book = LibSite.current.isBook
+        if let f = fresh.get(anime) {
+            if let n = f.count, n > 0 { parts.append(book ? "\(n) гл." : "\(n) эп.") }
+            if let d = f.date { parts.append("обновлено " + ChapterAge.ago(d)) }
+        } else if !book, let n = anime.episodesCount, n > 0 { parts.append("\(n) эп.") }
+        return parts.joined(separator: " · ")
+    }
     private var todayMeta: String {
         let g = (anime.genres ?? []).map { $0.title }.filter { !$0.isEmpty }.prefix(2)
         if !g.isEmpty { return g.joined(separator: " · ") }
@@ -4746,6 +4825,13 @@ struct TodayHero: View {
                         if !todayMeta.isEmpty { Text(todayMeta).foregroundStyle(fg.opacity(0.75)).lineLimit(1) }
                     }
                     .font(.footnote.weight(.semibold))
+                    if !blurb.isEmpty {
+                        Text(blurb.noHyphens)
+                            .font(.caption)
+                            .foregroundStyle(fg.opacity(0.7))
+                            .lineLimit(3)
+                            .multilineTextAlignment(.leading)
+                    }
                     Spacer(minLength: 0)
                     HStack(spacing: 8) {
                         // ▶ и для чтения: книга — это значок статуса «Читаю»
@@ -4770,7 +4856,11 @@ struct TodayHero: View {
         .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.6))
         .shadow(color: c.opacity(dark ? 0.35 : 0.18), radius: 16, y: 8)
         .padding(.horizontal, 14)
-        .task(id: anime.id) { tint = await CoverTint.color(anime.posterURL ?? anime.imageURL) }
+        .task(id: anime.id) {
+            async let t = CoverTint.color(anime.posterURL ?? anime.imageURL)
+            await fresh.load(anime)
+            tint = await t
+        }
     }
 }
 
@@ -4813,8 +4903,10 @@ struct ContinueHero: View {
                     .background(Theme.accent, in: Capsule())
                     .lineLimit(1)
                 if let frac {
-                    HStack(spacing: 8) {
-                        // тонкая полоска прогресса цветом акцента
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(progressText ?? "").font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.accent)
+                            .lineLimit(1)
+                        // тонкая полоска прогресса цветом акцента, во всю ширину текста
                         GeometryReader { g in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(Color.primary.opacity(0.12))
@@ -4824,12 +4916,10 @@ struct ContinueHero: View {
                             }
                         }
                         .frame(height: 4)
-                        Text(progressText ?? "").font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.accent)
-                            .lineLimit(1).fixedSize()
                     }
                 }
             }
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: book ? "book.fill" : "play.fill")
                 .font(.headline.weight(.bold))
                 .foregroundStyle(.white)
@@ -4929,7 +5019,7 @@ struct HomeView: View {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(Array(list.enumerated()), id: \.element.id) { i, a in
                     TitleLink(anime: a) {
-                        PosterCard(anime: a, width: 128)
+                        PosterCard(anime: a, width: 128, showVotes: true)
                             .overlay(alignment: .topLeading) {
                                 Text("\(i + 1)")
                                     .font(.system(size: 15, weight: .heavy, design: .rounded))
@@ -4967,7 +5057,8 @@ struct HomeView: View {
     /// «Выбор дня»: из лучших и популярных, один и тот же в течение суток.
     private var todayPick: Anime? {
         var seen = Set<Int>()
-        let pool = (vm.top.prefix(12) + vm.popular.prefix(10)).filter { seen.insert($0.id).inserted }
+        let solid = vm.top.filter { ($0.rateVotes ?? 0) >= 300 }.prefix(10)
+        let pool = (Array(vm.popular.prefix(15)) + solid).filter { seen.insert($0.id).inserted }
         guard !pool.isEmpty else { return nil }
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
         return pool[day % pool.count]
@@ -5053,7 +5144,8 @@ struct HomeView: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 12) {
                                         ForEach(list) { h in
-                                            ZStack(alignment: .topTrailing) {
+                                            // крестик — на углу обложки, подальше от кнопки «Читать»
+                                            ZStack(alignment: .topLeading) {
                                                 Button { openContinue(h.anime) } label: { ContinueHero(item: h) }
                                                     .buttonStyle(.pressable)
                                                 Button {
@@ -5063,9 +5155,10 @@ struct HomeView: View {
                                                     Image(systemName: "xmark")
                                                         .font(.system(size: 11, weight: .bold))
                                                         .foregroundStyle(.white)
-                                                        .frame(width: 26, height: 26)
-                                                        .background(Color.black.opacity(0.45), in: Circle())
-                                                        .padding(10)
+                                                        .frame(width: 24, height: 24)
+                                                        .background(Color.black.opacity(0.55), in: Circle())
+                                                        .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 0.6))
+                                                        .padding(4)
                                                 }
                                                 .buttonStyle(.plain)
                                             }
@@ -5617,6 +5710,82 @@ struct CatalogView: View {
         .buttonStyle(.pressable)
     }
 
+    private struct ActiveItem: Identifiable {
+        let id: String
+        let title: String
+        let remove: () -> Void
+    }
+
+    /// Что сейчас выбрано в фильтрах — чипами с крестиком
+    private var activeItems: [ActiveItem] {
+        func name(_ list: [NamedItem], _ id: Int, _ fallback: String) -> String {
+            let t = list.first { $0.id == id }?.title ?? ""
+            return t.isEmpty ? fallback : t
+        }
+        var out: [ActiveItem] = []
+        let f = vm.filter, o = vm.options
+        for id in f.types.sorted() { out.append(.init(id: "t\(id)", title: name(o.types, id, "Тип")) { vm.filter.types.remove(id) }) }
+        for id in f.statuses.sorted() { out.append(.init(id: "s\(id)", title: name(o.statuses, id, "Статус")) { vm.filter.statuses.remove(id) }) }
+        for id in f.genres.sorted() { out.append(.init(id: "g\(id)", title: name(o.genres, id, "Жанр")) { vm.filter.genres.remove(id) }) }
+        for id in f.tags.sorted() { out.append(.init(id: "k\(id)", title: name(o.tags, id, "Тег")) { vm.filter.tags.remove(id) }) }
+        return out
+    }
+
+    /// Строка под поиском: текущая сортировка (меню) и выбранные фильтры
+    private var activeRow: some View {
+        let book = LibSite.current.isBook
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Menu {
+                    ForEach(CatalogFilter.SortOption.allCases) { so in
+                        Button {
+                            vm.filter.sortBy = so
+                            Task { await vm.reload() }
+                        } label: {
+                            if so == vm.filter.sortBy { Label(so.label(book), systemImage: "checkmark") } else { Text(so.label(book)) }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.arrow.down").font(.caption.weight(.bold))
+                        Text(vm.filter.sortBy.label(book))
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Theme.chip, in: Capsule())
+                }
+                ForEach(activeItems) { it in
+                    Button {
+                        Haptics.select()
+                        it.remove()
+                        Task { await vm.reload() }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(it.title).lineLimit(1)
+                            Image(systemName: "xmark").font(.caption2.weight(.bold))
+                        }
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Theme.accent, in: Capsule())
+                    }
+                    .buttonStyle(.pressable)
+                }
+                if activeItems.count > 1 {
+                    Button("Сбросить") {
+                        Haptics.select()
+                        vm.resetFilters()
+                        Task { await vm.reload() }
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Theme.accent)
+                }
+            }
+        }
+        .task { if vm.filter.activeCount > 0 { await vm.loadOptionsIfNeeded() } }
+    }
+
     var body: some View {
         NavigationStack {
             GeometryReader { geo in
@@ -5650,6 +5819,7 @@ struct CatalogView: View {
                             }
                         }
                     }
+                    activeRow
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, geo.safeAreaInsets.top + 4)
@@ -5684,15 +5854,7 @@ struct CatalogView: View {
             .ignoresSafeArea(edges: .top)
             .overlay(alignment: .top) {
                 // мягкое размытие под строкой состояния: обложки заезжают под неё, как в системных приложениях
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                    .frame(height: geo.safeAreaInsets.top + 14)
-                    .mask(LinearGradient(stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black, location: 0.75),
-                        .init(color: .clear, location: 1)
-                    ], startPoint: .top, endPoint: .bottom))
-                    .allowsHitTesting(false)
+                StatusBarFill(height: geo.safeAreaInsets.top)
                     .offset(y: -geo.safeAreaInsets.top)
             }
             }
@@ -5769,7 +5931,7 @@ struct AnimeCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(anime.cardTitle)
                     .font(.footnote.weight(.semibold))
-                    .lineLimit(2)
+                    .lineLimit(2, reservesSpace: true)
                     .multilineTextAlignment(.leading)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
@@ -8751,7 +8913,7 @@ struct FriendsView: View {
             VStack(spacing: 12) {
                 if !all.isEmpty {
                     HStack(spacing: 10) {
-                        statTile("person.2.fill", "\(all.count)", "друзей", Theme.accent)
+                        statTile("person.2.fill", "\(all.count)", ruPlural(all.count, "друг", "друга", "друзей"), Theme.accent)
                         statTile("dot.radiowaves.left.and.right", "\(onlineCount)", "в сети", .green)
                     }
                     HStack(spacing: 8) {
@@ -8877,7 +9039,7 @@ struct FriendProfileView: View {
                 HStack(spacing: 8) {
                     if let st = friend.streak { stat("flame.fill", .orange, "Серия: \(st) дн.") }
                     if let lv = friend.level { stat("star.fill", .yellow, "Уровень \(lv)") }
-                    if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) тайтлов") }
+                    if vm.totalTitles > 0 { stat("rectangle.stack.fill", Theme.accent, "\(vm.totalTitles) " + ruPlural(vm.totalTitles, "тайтл", "тайтла", "тайтлов")) }
                 }
                 Button {
                     Haptics.tap()
@@ -9780,6 +9942,13 @@ struct ProfileView: View {
                                     .frame(height: 120)
                                     .allowsHitTesting(false)
                             }
+                            .overlay(alignment: .bottom) {
+                                // плавный переход к фону страницы: аватарка и ник не теряются на пёстрой картинке
+                                LinearGradient(colors: [.clear, Color(uiColor: .systemBackground).opacity(0.55)],
+                                               startPoint: .top, endPoint: .bottom)
+                                    .frame(height: g.size.height * 0.55 + extra)
+                                    .allowsHitTesting(false)
+                            }
                             .mask(LinearGradient(stops: [.init(color: .black, location: 0),
                                                          .init(color: .black, location: 0.5),
                                                          .init(color: .black.opacity(0.6), location: 0.7),
@@ -9849,9 +10018,9 @@ struct ProfileView: View {
 
             // Статистика: цифра крупно, подпись под ней
             let items: [(String, Color, String, String)] = [
-                u.streak.map { ("flame.fill", Color.orange, "\($0)", "дней подряд") },
+                u.streak.map { ("flame.fill", Color.orange, "\($0)", ruPlural($0, "день", "дня", "дней") + " подряд") },
                 u.level.map { ("star.fill", Color.yellow, "\($0)", "уровень") },
-                vm.totalTitles > 0 ? (LibSite.current.isBook ? "books.vertical.fill" : "film.stack.fill", Theme.accent, "\(vm.totalTitles)", "тайтлов") : nil,
+                vm.totalTitles > 0 ? (LibSite.current.isBook ? "books.vertical.fill" : "film.stack.fill", Theme.accent, "\(vm.totalTitles)", ruPlural(vm.totalTitles, "тайтл", "тайтла", "тайтлов")) : nil,
                 doneFolder.map { ("trophy.fill", Color(red: 1, green: 0.76, blue: 0.3), "\($0.count ?? 0)", "завершено") }
             ].compactMap { $0 }
             if !items.isEmpty {
@@ -10035,7 +10204,7 @@ struct ProfileView: View {
                     } else if online > 0 {
                         Text("\(list.count) · \(online) в сети").font(.caption).foregroundStyle(Color.green)
                     } else {
-                        Text("\(list.count) друзей").font(.caption).foregroundStyle(.secondary)
+                        Text("\(list.count) " + ruPlural(list.count, "друг", "друга", "друзей")).font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
@@ -10155,7 +10324,8 @@ struct ProfileView: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Библиотека").font(.title3.bold())
                 Spacer()
-                Text("\(total) в статусах").font(.subheadline).foregroundStyle(.secondary)
+                Text(vm.totalTitles > total ? "\(total) из \(vm.totalTitles) в статусах" : "\(total) в статусах")
+                    .font(.subheadline).foregroundStyle(.secondary)
             }
             if total > 0 {
                 shareBar(statusFolders.filter { ($0.0.count ?? 0) > 0 }.map { ($0.1.color, $0.0.count ?? 0) })
@@ -10184,7 +10354,8 @@ struct ProfileView: View {
             }
             if !custom.isEmpty {
                 Divider().opacity(0.5)
-                FlowLayout(spacing: 8) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
                     ForEach(custom) { f in
                         Button {
                             Haptics.select()
@@ -10208,6 +10379,7 @@ struct ProfileView: View {
                             Button { styleFolder = f } label: { Label("Цвет и эмодзи списка", systemImage: "paintpalette") }
                         }
                     }
+                }
                 }
             }
         }
