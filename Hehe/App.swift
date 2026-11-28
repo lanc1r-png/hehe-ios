@@ -1400,7 +1400,7 @@ enum Haptics {
 @MainActor
 final class PlatformSwitcher: ObservableObject {
     static let shared = PlatformSwitcher()
-    struct Splash: Equatable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
+    struct Splash: Hashable { let id: String; let title: String; let site: String; let icon: String; let hex: String }
     @Published var splash: Splash?
     @Published var shown = false
     private var busy = false
